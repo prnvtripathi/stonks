@@ -234,3 +234,62 @@ Implementation fixes committed as `cb1c5c4 fix: support artifact manifests and c
 - Production R2 clients should provide a usage method or be paired with an
   injected usage provider; absent telemetry is represented as zero usage and does
   not invent a provider limit.
+
+## Fix round 3/5
+
+### Finding addressed
+
+Migrated `legacy-*` checkpoints are now reconciled when an incoming canonical
+artifact ID is unavailable. Lookup first honors an exact canonical ID; otherwise
+it matches exactly one legacy row by source/date/checksum. A matching row is
+skipped as already processed, a changed checksum is a blocking
+`BackfillIntegrityError`, and multiple matching legacy rows are rejected as
+ambiguous rather than guessed.
+
+### Fix-round RED
+
+Command:
+
+```text
+PYTHONPATH=pipeline .venv/bin/pytest pipeline/tests/integration/test_backfill.py -q
+```
+
+Initial result before the fallback:
+
+```text
+2 failed, 7 passed
+```
+
+The matching migrated retry reprocessed (`completed=1, skipped=0`) and changed
+checksum did not raise the required blocking error.
+
+### Fix-round GREEN and final verification
+
+```text
+PYTHONPATH=pipeline .venv/bin/pytest pipeline/tests/integration/test_backfill.py -q
+9 passed in 0.10s
+```
+
+```text
+PYTHONPATH=pipeline .venv/bin/pytest -q
+140 passed in 0.24s
+```
+
+```text
+PYTHONPATH=pipeline .venv/bin/ruff check pipeline
+All checks passed!
+
+PYTHONPATH=pipeline .venv/bin/mypy pipeline
+Success: no issues found in 51 source files
+```
+
+Implementation committed as `6b2602b fix: reconcile legacy artifact checkpoints safely`.
+
+### Fix-round self-review
+
+- Exact canonical IDs remain authoritative and still detect checksum drift through
+  the existing post-lookup check.
+- Legacy fallback is checksum-based only when canonical lookup misses, and does
+  not collapse distinct canonical artifacts on the same source/date.
+- Multiple legacy rows matching the same checksum produce a blocking ambiguity;
+  no legacy state is silently overwritten or marked successful.
