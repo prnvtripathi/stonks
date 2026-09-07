@@ -26,15 +26,23 @@ manifest, gated by the reconciliation and storage-budget checks in
 2. Resolve run parameters (mode, date/range, manifest path, reconciliation
    thresholds) from either the schedule defaults or `workflow_dispatch`
    inputs.
-3. Invoke the existing `market-pipeline` CLI (`daily` or `backfill`). This
+3. **Restore `market.db` from the previous run's cache** (`actions/cache/restore`,
+   key `market-db-${{ github.run_id }}` with `restore-keys: market-db-`, so
+   the most recently saved entry is used). This GitHub Actions runner is
+   ephemeral -- without this step every run would start from an empty
+   database and look like a first-ever run to the CLI. See "Coverage
+   baseline persistence" below for why this matters.
+4. Invoke the existing `market-pipeline` CLI (`daily` or `backfill`). This
    repository does not run automated NSE fetch (see
    `docs/operations/source-policy.md` -- NSE's Terms of Use currently
    disallow it), so the CLI is always invoked against a pre-fetched artifact
    manifest, exactly as it is in local/manual use. Producing that manifest
    (AMFI NAV automation, or committed/uploaded official artifacts for other
    sources) is outside this workflow; supply its path via `manifest_path`.
-4. The CLI itself now runs a **reconciliation and budget safety gate** after
-   the backfill/daily job completes and before printing its result:
+5. The CLI itself now runs the backfill/daily job with `strict_coverage`
+   disabled -- a source missing some or all of its requested dates does not
+   abort the run before reconciliation gets to see it -- and then runs a
+   **reconciliation and budget safety gate** before printing its result:
    - `reconcile(previous=<baseline>, candidate=<completed count>, ...)` from
      `validation/reconcile.py` compares the new run's completed-artifact
      count against a known-good baseline. **The default blocking threshold is
@@ -47,24 +55,59 @@ manifest, gated by the reconciliation and storage-budget checks in
      silently truncated.
    - Each requested source is independently evaluated as `complete`,
      `delayed`, `failed`, or `not_expected`, derived from the backfill job's
-     own missing-date accounting. A `failed` source (100% of requested dates
-     missing for that source) blocks publication; `delayed`/`not_expected`
+     own missing-date accounting: `failed` means every requested date is
+     missing for that source, `delayed` means some (but not all) dates are
+     missing. A `failed` source blocks publication; `delayed`/`not_expected`
      are reported but do not block on their own, since one source's expected
      absence or lag must never mask another source's problem.
    - `monitoring/budgets.py` reports the D1 database's storage usage/limit
      ratio; a budget at or past its hard limit (`exceeded`) also blocks.
    - The combined verdict is `evaluate_pre_promotion(...)`, surfaced in the
      CLI's JSON output as `safe_to_promote` and `blocking_reasons`, and as the
-     process exit code: `0` = safe, `3` = blocking failure, `2` = input error
-     (bad manifest/missing dates raised before reconciliation even runs).
-5. The workflow redacts the run's JSON output (stripping any key that looks
+     process exit code: `0` = safe, `3` = blocking failure (coverage drop,
+     failed source, or exceeded budget), `2` = input error (unreadable/invalid
+     manifest, or a bad date range) raised before the job or reconciliation
+     even run.
+   - **Only a safe-to-promote (`exit 0`) run is recorded as a future
+     baseline** -- see "Coverage baseline persistence" below.
+6. **Save `market.db`** back to the cache (`actions/cache/save`, same
+   `market-db-${{ github.run_id }}` key, `if: always()` so it runs even if
+   the CLI step failed) so the next scheduled or manual run can read it back.
+7. The workflow redacts the run's JSON output (stripping any key that looks
    like a token/secret/password/authorization/API key) and publishes it both
    as a build artifact (`daily-data-reconciliation-report`, 90-day retention)
    and as the job's step summary.
-6. If the CLI's exit code is non-zero, the workflow step "Stop before
+8. If the CLI's exit code is non-zero, the workflow step "Stop before
    promotion on blocking failure" fails the job with that same exit code.
    **No promotion step runs after this point** -- see the note below on the
    current scope of promotion.
+
+## Coverage baseline persistence
+
+The scheduled (cron) trigger has no `workflow_dispatch` `inputs` context, so
+it can never supply a `--previous-count` value the way a manual run can.
+Relying on that would make the coverage-drop check a permanent no-op for
+every automated run -- exactly the run this check exists to protect.
+
+Instead, `market_pipeline/cli.py` keeps its own small `pipeline_run_history`
+table inside `market.db` (scoped by command and the sorted source list).
+Every invocation that ends up `safe_to_promote: true` appends its completed
+count to that table. When `--previous-count` is **not** supplied, the CLI
+looks up the most recent safe row for the same command/source scope in that
+table and uses its completed count as the baseline; a blocked run is never
+recorded, so a bad candidate can never poison the next comparison. Only when
+the table has no matching row yet (a genuine first-ever run for that
+command/source scope) does the CLI fall back to comparing the candidate
+against itself (ratio 1.0) -- source failures and the budget check still
+protect that bootstrap case.
+
+This is why the workflow restores/saves `market.db` via `actions/cache`
+around the CLI invocation (step 3 and step 6 above): the CLI's own baseline
+bookkeeping only works if the database it reads from actually carries state
+from the previous run. `--previous-count` remains available for manual
+`workflow_dispatch` runs and historical re-runs where an operator wants to
+assert a specific known-good baseline (e.g. after a rollback) rather than
+trust the database's own history.
 
 ## What "blocking failure" means operationally
 
@@ -116,7 +159,7 @@ Use **Actions -> Daily Data Refresh -> Run workflow** and fill in:
 | `date` | Required for `daily`: `YYYY-MM-DD` |
 | `start` / `end` | Required for `backfill`: inclusive `YYYY-MM-DD` range |
 | `manifest_path` | Path (in the checked-out repo) to the pre-fetched artifact manifest JSON |
-| `previous_count` | Known-good baseline completed-artifact count for the coverage check (omit to skip the coverage check, e.g. for a first-ever run) |
+| `previous_count` | Known-good baseline completed-artifact count for the coverage check. Optional: omitting it does not skip the check -- the CLI falls back to the last safe-to-promote run recorded in `market.db` for the same command/source scope (see "Coverage baseline persistence" above), or to a self-consistent ratio of 1.0 only on a genuine first-ever run |
 | `min_coverage_ratio` | Override the default `0.90` threshold if a run has a known, deliberate coverage change |
 
 This is also how you re-run a specific historical date or range -- see

@@ -100,7 +100,7 @@ jobs:
           if [ "${{ github.event_name }}" = "schedule" ]; then
             mode="daily"
             date="$(TZ=Asia/Kolkata date +%Y-%m-%d)"
-            manifest="${MANIFEST_PATH:-manifests/daily.json}"
+            manifest="manifests/daily.json"
           else
             mode="${{ inputs.mode }}"
             date="${{ inputs.date }}"
@@ -113,6 +113,25 @@ jobs:
           echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
           echo "previous_count=${{ inputs.previous_count }}" >> "$GITHUB_OUTPUT"
           echo "min_coverage_ratio=${{ inputs.min_coverage_ratio || '0.90' }}" >> "$GITHUB_OUTPUT"
+
+      # market.db is the CLI's own persistent state (backfill checkpoints and
+      # the pipeline_run_history table the CLI uses to derive a real
+      # coverage-drop baseline -- see market_pipeline/cli.py). It must
+      # survive across job runs on this ephemeral runner, or every run would
+      # look like a first-ever run: the scheduled (cron) trigger has no
+      # `inputs` context to source a --previous-count from, and relies
+      # entirely on the CLI reading its own database's last safe-to-promote
+      # run. `key` is always unique so a new cache entry is written every
+      # run; `restore-keys` falls back to the most recently written entry
+      # with this prefix, which is what makes each run pick up the previous
+      # run's database.
+      - name: Restore market database from previous run
+        uses: actions/cache/restore@v4
+        with:
+          path: market.db
+          key: market-db-${{ github.run_id }}
+          restore-keys: |
+            market-db-
 
       - name: Run market-pipeline refresh
         id: run
@@ -133,6 +152,13 @@ jobs:
           uv run market-pipeline "${args[@]}" > run-report.json 2> run-error.json
           echo "exit_code=$?" >> "$GITHUB_OUTPUT"
           set -e
+
+      - name: Save market database for next run
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: market.db
+          key: market-db-${{ github.run_id }}
 
       - name: Redact and publish operator report
         if: always()
