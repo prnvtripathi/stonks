@@ -138,14 +138,17 @@ export class D1ResearchStore implements ResearchStore {
 }
 
 function parseExplanation(value: unknown): Explanation { if (typeof value !== "string") return { matched: true, text: "", metrics: [] }; try { const parsed: unknown = JSON.parse(value); if (typeof parsed === "object" && parsed !== null && "matched" in parsed && "text" in parsed && "metrics" in parsed && Array.isArray(parsed.metrics)) { const record = parsed as Record<string, unknown>; const metrics = record.metrics as readonly unknown[]; return { matched: Boolean(record.matched), text: String(record.text), metrics: metrics.map(String), ...(Array.isArray(record.clauses) ? { clauses: record.clauses as ExplanationClause[] } : {}), ...(typeof record.momentum === "object" && record.momentum !== null ? { momentum: record.momentum as MomentumBreakdown } : {}) }; } } catch { /* corrupted explanation is represented, not executed */ } return { matched: true, text: "", metrics: [] }; }
-function buildExplanation(source: string, item: InstrumentRow, ast?: Expression): Explanation {
+export function buildExplanation(source: string, item: InstrumentRow, ast?: Expression): Explanation {
   const parsed = ast ?? parseQuery(source).value;
   const values = item.metrics ?? Object.fromEntries((item.metricRows ?? []).map((row) => [row.metric, row.value]));
   const predicates = parsed ? collectPredicates(parsed) : [];
   const metrics = [...new Set(predicates.flatMap((predicate) => predicate.metrics))];
   const clauses: ExplanationClause[] = predicates.map((predicate) => {
     const states = predicate.metrics.map((metric) => item.metricRows?.find((candidate) => candidate.metric === metric)?.state ?? (values[metric] == null ? "missing" : "present"));
-    const result = states.includes("not_applicable") ? "Not applicable" : states.includes("missing") ? "Unavailable" : evaluateQuery(predicate.node, values) === "true" ? "Matched" : "Not matched";
+    // predicate state is derived only from its referenced rows
+    const triState = evaluateQuery(predicate.node, values);
+    const knownMatch = predicate.negated ? triState === "false" : triState === "true";
+    const result = states.includes("not_applicable") ? "Not applicable" : states.includes("missing") ? "Unavailable" : triState === "unknown" ? "Unavailable" : knownMatch ? "Matched" : "Not matched";
     const metric = predicate.metrics[0];
     const row = metric ? item.metricRows?.find((candidate) => candidate.metric === metric) : undefined;
     const fallback = metric ? { value: values[metric] ?? null, state: values[metric] == null ? "missing" as const : "present" as const } : undefined;
@@ -154,11 +157,11 @@ function buildExplanation(source: string, item: InstrumentRow, ast?: Expression)
   const momentum = buildMomentum(item);
   return { matched: evaluateQuery(parsed ?? { kind: "number", value: 0, percent: false, span: { start: 0, end: 0 } }, values) === "true", text: `Matched ${source}${predicates.length ? ` · ${predicates.map((predicate) => predicate.context.join("/")).filter(Boolean).join("; ")}` : ""}`, metrics, clauses, momentum };
 }
-interface Predicate { readonly node: Expression; readonly metrics: readonly string[]; readonly context: readonly string[]; }
-function collectPredicates(node: Expression, context: readonly string[] = []): Predicate[] {
-  if (node.kind === "binary" && [">", ">=", "<", "<=", "=", "!="].includes(node.operator)) return [{ node, metrics: collectMetricIds(node), context }];
-  if (node.kind === "binary" && (node.operator === "and" || node.operator === "or")) return [...collectPredicates(node.left, [...context, node.operator.toUpperCase()]), ...collectPredicates(node.right, [...context, node.operator.toUpperCase()])];
-  if (node.kind === "unary" && node.operator === "not") return collectPredicates(node.operand, [...context, "NOT"]);
+interface Predicate { readonly node: Expression; readonly metrics: readonly string[]; readonly context: readonly string[]; readonly negated: boolean; }
+function collectPredicates(node: Expression, context: readonly string[] = [], negated = false): Predicate[] {
+  if (node.kind === "binary" && [">", ">=", "<", "<=", "=", "!="].includes(node.operator)) return [{ node, metrics: collectMetricIds(node), context, negated }];
+  if (node.kind === "binary" && (node.operator === "and" || node.operator === "or")) return [...collectPredicates(node.left, [...context, node.operator.toUpperCase()], negated), ...collectPredicates(node.right, [...context, node.operator.toUpperCase()], negated)];
+  if (node.kind === "unary" && node.operator === "not") return collectPredicates(node.operand, [...context, "NOT"], !negated);
   return [];
 }
 function collectMetricIds(node: Expression): string[] { if (node.kind === "metric") return [node.id]; if (node.kind === "number") return []; if (node.kind === "unary") return collectMetricIds(node.operand); return [...collectMetricIds(node.left), ...collectMetricIds(node.right)]; }

@@ -76,7 +76,9 @@ export function parseQuery(source: string, catalog?: MetricCatalog): ParseResult
     const token = current();
     if (token.kind === "not" || (token.kind === "operator" && token.lexeme === "-")) {
       consume();
-      const operand = parsePrefix();
+      // NOT applies to the complete comparison that follows (so `NOT
+      // Volume > 5` means `NOT (Volume > 5)`), while AND/OR remain outside it.
+      const operand = token.kind === "not" ? parseExpression(precedence[">"]!) : parsePrefix();
       return operand ? { kind: "unary", operator: token.kind === "not" ? "not" : "-", operand, span: { start: token.span.start, end: operand.span.end } } : null;
     }
     return parsePrimary();

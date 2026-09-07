@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { createApi, createTestAccessVerifier, D1ResearchStore, MemoryResearchStore, verifyAccessRequest, type ApiEnv, type D1Database, type D1Result, type D1Statement } from "./index";
+import { buildExplanation } from "./repositories";
 
 const env: ApiEnv = {
   accessTeamDomain: "https://access.example.com",
@@ -218,6 +219,20 @@ describe("private research API", () => {
       { id: "a-uuid", screenId: "screen-1", datasetId: "dataset-1", effectiveDate: "2026-09-07", completedAt: "2026-09-07T11:00:00.000Z", matchCount: 0, status: "complete", matches: [] },
     ]);
     expect((await store.listRuns("screen-1")).map((run) => run.id)).toEqual(["a-uuid", "z-uuid"]);
+  });
+
+  it("inverts only known predicate outcomes for odd NOT parity", () => {
+    const item = { instrumentId: "ONE", symbol: "ONE", name: "One", assetClass: "equity" as const, active: true, metricRows: [{ metric: "volume", value: 3, state: "present" as const }] };
+    expect(buildExplanation("NOT Volume > 5", item).clauses?.[0]?.result).toBe("Matched");
+    expect(buildExplanation("NOT Volume > 5", { ...item, metricRows: [{ metric: "volume", value: 7, state: "present" as const }] }).clauses?.[0]?.result).toBe("Not matched");
+  });
+
+  it("preserves unknown states through NOT and restores the base result through double NOT", () => {
+    const missing = { instrumentId: "ONE", symbol: "ONE", name: "One", assetClass: "equity" as const, active: true, metricRows: [{ metric: "volume", value: null, state: "missing" as const }] };
+    const notApplicable = { ...missing, metricRows: [{ metric: "volume", value: null, state: "not_applicable" as const }] };
+    expect(buildExplanation("NOT Volume > 5", missing).clauses?.[0]?.result).toBe("Unavailable");
+    expect(buildExplanation("NOT Volume > 5", notApplicable).clauses?.[0]?.result).toBe("Not applicable");
+    expect(buildExplanation("NOT NOT Volume > 5", { ...missing, metricRows: [{ metric: "volume", value: 3, state: "present" as const }] }).clauses?.[0]?.result).toBe("Not matched");
   });
 
   it("surfaces a D1 mutation failure instead of reporting a saved screen", async () => {
