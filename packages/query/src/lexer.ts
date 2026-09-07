@@ -1,5 +1,5 @@
 import type { MetricCatalog } from "@stonks/contracts";
-import type { Span, Token } from "./token";
+import type { Token } from "./token";
 import { diagnostic, type Diagnostic } from "./ast";
 
 const operators = [">=", "<=", "!=", ">", "<", "=", "+", "-", "*", "/"] as const;

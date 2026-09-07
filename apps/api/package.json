@@ -12,7 +12,6 @@
   },
   "scripts": {
     "test": "vitest run --config vitest.config.ts",
-    "lint": "tsc --noEmit",
     "typecheck": "tsc --noEmit"
   }
 }

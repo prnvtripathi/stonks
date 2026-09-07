@@ -39,8 +39,15 @@ jobs:
           uv run ruff check .
           uv run mypy pipeline
           uv run pytest
+      - name: Install Playwright browsers
+        run: pnpm --filter @stonks/web exec playwright install --with-deps chromium
       - name: Node checks
         run: |
           pnpm lint
           pnpm typecheck
           pnpm test
+      # The Playwright journeys previously ran only in deploy.yml, so an E2E
+      # regression could merge to main and surface for the first time during a
+      # production deploy. It is a required check here now.
+      - name: Browser journeys (Playwright)
+        run: pnpm --filter @stonks/web test:e2e

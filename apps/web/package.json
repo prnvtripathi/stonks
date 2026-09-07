@@ -23,7 +23,6 @@
     "build": "vite build",
     "dev": "vite",
     "test:e2e": "playwright test",
-    "lint": "tsc --noEmit",
     "test": "vitest run --config vitest.config.ts",
     "typecheck": "tsc --noEmit"
   }

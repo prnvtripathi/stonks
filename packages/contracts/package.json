@@ -7,7 +7,6 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "lint": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --config vitest.config.ts"
   }

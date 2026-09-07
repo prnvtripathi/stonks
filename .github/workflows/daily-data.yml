@@ -93,6 +93,13 @@ jobs:
       - name: Install Python dependencies
         run: uv sync --locked
 
+      # A scheduled run has no `inputs` context, so it looks for a manifest at
+      # the conventional path. No automated NSE/AMFI fetch is wired (Task 2's
+      # Terms-of-Use ruling), so producing that manifest is an operator step
+      # and the file is frequently absent. An absent manifest is a normal
+      # "nothing to do today", not an incident: the run is skipped cleanly
+      # instead of crashing the CLI with exit 2 and paging the operator every
+      # weekday forever. See docs/operations/daily-run.md.
       - name: Resolve run parameters
         id: params
         run: |
@@ -105,6 +112,20 @@ jobs:
             mode="${{ inputs.mode }}"
             date="${{ inputs.date }}"
             manifest="${{ inputs.manifest_path }}"
+          fi
+          if [ -n "$manifest" ] && [ -r "$manifest" ]; then
+            echo "manifest_present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "manifest_present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No manifest supplied for this run (looked for '''${manifest:-<empty>}'''). No automated source fetch is wired, so this run is skipped rather than failed. Trigger Daily Data Refresh manually with a manifest_path once an artifact manifest has been produced."
+            {
+              echo "# Daily data refresh skipped"
+              echo
+              echo "No artifact manifest was present at \`${manifest:-<empty>}\`."
+              echo "Producing that manifest is an operator step -- no automated NSE/AMFI"
+              echo "fetch is wired (see docs/operations/source-policy.md). Nothing was"
+              echo "published and the last known-good dataset is untouched."
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
           echo "date=$date" >> "$GITHUB_OUTPUT"
@@ -126,6 +147,7 @@ jobs:
       # with this prefix, which is what makes each run pick up the previous
       # run's database.
       - name: Restore market database from previous run
+        if: steps.params.outputs.manifest_present == 'true'
         uses: actions/cache/restore@v4
         with:
           # `raw/` and `history/` hold the immutable artifact bodies and
@@ -143,6 +165,7 @@ jobs:
 
       - name: Run market-pipeline refresh
         id: run
+        if: steps.params.outputs.manifest_present == 'true'
         run: |
           set -euo pipefail
           args=(--db market.db daily)
@@ -162,7 +185,7 @@ jobs:
           set -e
 
       - name: Save market database for next run
-        if: always()
+        if: always() && steps.params.outputs.manifest_present == 'true' 
         uses: actions/cache/save@v4
         with:
           path: |
@@ -172,7 +195,7 @@ jobs:
           key: market-db-${{ github.run_id }}
 
       - name: Redact and publish operator report
-        if: always()
+        if: always() && steps.params.outputs.manifest_present == 'true' 
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -231,7 +254,7 @@ jobs:
           cat summary.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload redacted report artifact
-        if: always()
+        if: always() && steps.params.outputs.manifest_present == 'true' 
         uses: actions/upload-artifact@v4
         with:
           name: daily-data-reconciliation-report
@@ -239,6 +262,7 @@ jobs:
           retention-days: 90
 
       - name: Stop before promotion on blocking failure
+        if: steps.params.outputs.manifest_present == 'true'
         run: |
           set -euo pipefail
           exit_code="${{ steps.run.outputs.exit_code }}"

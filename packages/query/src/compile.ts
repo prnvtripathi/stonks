@@ -33,7 +33,7 @@ export function compileQuery(ast: Expression, catalog: MetricCatalog, options: C
       params.push(id);
       return `(SELECT CASE WHEN m.state = 'present' THEN m.value END FROM latest_metrics AS m WHERE m.dataset_id = i.dataset_id AND m.instrument_id = i.instrument_id AND m.metric = ?)`;
     }
-    return `\"${definition.column}\"`;
+    return `"${definition.column}"`;
   };
   const expression = (node: Expression): string => {
     if (node.kind === "metric") return metric(node.id);
