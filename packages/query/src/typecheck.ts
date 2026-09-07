@@ -24,6 +24,18 @@ const combineQuotient = (left: ValueUnit, right: ValueUnit): ValueUnit | null =>
   return null;
 };
 
+/**
+ * A bare numeric literal (optionally negated) written where a percent value
+ * belongs. Percent metrics are stored as fractions, so `Return over 1day > 3`
+ * silently means "> 300%" -- a 100x screening error. Returning the literal
+ * here lets the checker suggest the `%` the author almost certainly meant.
+ */
+const bareNumberLiteral = (node: Expression): number | null => {
+  if (node.kind === "number") return node.percent ? null : node.value;
+  if (node.kind === "unary" && node.operator === "-") return bareNumberLiteral(node.operand);
+  return null;
+};
+
 const numeric = (node: Expression, catalog: MetricCatalog): MetricDefinition | null => {
   if (node.kind === "metric") return catalog.find((metric) => metric.id === node.id) ?? null;
   return null;
@@ -91,6 +103,12 @@ export function typecheckQuery(ast: QueryAst, catalog: MetricCatalog, classes: r
     if (comparison) {
       if (!isNumber(left) || !isNumber(right)) diagnostics.push({ code: "TYPE_MISMATCH", message: "Comparisons require numeric expressions.", span: node.span });
       else if (!isCompatible(left.unit, right.unit)) diagnostics.push({ code: "UNIT_MISMATCH", message: `Cannot compare ${left.unit} with ${right.unit}; use a compatible unit.`, span: node.span });
+      else {
+        const percentSide = left.unit === "percent" ? right : right.unit === "percent" ? left : null;
+        const literalNode = left.unit === "percent" ? node.right : node.left;
+        const literal = percentSide?.kind === "number" && percentSide.unit === "scalar" ? bareNumberLiteral(literalNode) : null;
+        if (literal !== null) diagnostics.push({ code: "UNIT_MISMATCH", message: `Percent values are fractions, so ${literal} means ${literal * 100}%. Add a % suffix to compare against a percentage.`, span: literalNode.span, suggestions: [`${Math.abs(literal)}%`] });
+      }
       return left.kind === "invalid" || right.kind === "invalid" ? { kind: "invalid" } : { kind: "boolean" };
     }
     if (!isNumber(left) || !isNumber(right)) {

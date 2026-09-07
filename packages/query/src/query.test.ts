@@ -34,11 +34,11 @@ describe("safe screener language", () => {
   });
 
   it("compiles only checked fields and binds literals", () => {
-    const parsed = parseQuery("Return over 1day > 3 AND Volume > Volume 1week average * 1.5");
+    const parsed = parseQuery("Return over 1day > 3% AND Volume > Volume 1week average * 1.5");
     const checked = typecheckQuery(parsed.value!, DEFAULT_METRIC_CATALOG, ["equity"]);
     expect(checked.valid).toBe(true);
     const compiled = compileQuery(checked.ast, DEFAULT_METRIC_CATALOG);
-    expect(compiled.params).toEqual([3, 1.5]);
+    expect(compiled.params).toEqual([0.03, 1.5]);
     expect(compiled.whereSql).toContain("IS TRUE");
     expect(compiled.whereSql).not.toMatch(/Return over|Volume 1week/);
     expect(compiled.referencedMetricIds).toEqual(["return_1d", "volume", "volume_1w_avg"]);
@@ -54,6 +54,27 @@ describe("safe screener language", () => {
     expect(valid.diagnostics).toEqual([]);
     expect(compileQuery(valid.ast, DEFAULT_METRIC_CATALOG).params).toEqual([0.03]);
     expect(evaluateQuery(valid.ast, { return_1d: 0.03 })).toBe("false");
+  });
+
+  it("requires the percent suffix when comparing a percent metric to a bare number", () => {
+    // Percent metrics are stored as fractions, so a bare `3` means 300%.
+    // Accepting it silently is a 100x screening error with no diagnostic.
+    const checked = typecheckQuery(parseQuery("Return over 1day > 3").value!, DEFAULT_METRIC_CATALOG, ["equity"]);
+    expect(checked.valid).toBe(false);
+    const mismatch = checked.diagnostics.find((diagnostic) => diagnostic.code === "UNIT_MISMATCH");
+    expect(mismatch).toBeDefined();
+    expect(mismatch?.suggestions).toContain("3%");
+
+    // A negated literal is the same mistake and gets the same suggestion.
+    const negated = typecheckQuery(parseQuery("Maximum Drawdown 1year < -20").value!, DEFAULT_METRIC_CATALOG, ["equity"]);
+    expect(negated.valid).toBe(false);
+    expect(negated.diagnostics.find((diagnostic) => diagnostic.code === "UNIT_MISMATCH")?.suggestions).toContain("20%");
+
+    // Dimensionless metrics keep accepting bare thresholds.
+    expect(typecheckQuery(parseQuery("Volume > 500000").value!, DEFAULT_METRIC_CATALOG, ["equity"]).valid).toBe(true);
+    expect(typecheckQuery(parseQuery("RS Rating > 90").value!, DEFAULT_METRIC_CATALOG, ["equity"]).valid).toBe(true);
+    // And a percent-to-percent comparison remains valid.
+    expect(typecheckQuery(parseQuery("Return over 1day > Return over 1week").value!, DEFAULT_METRIC_CATALOG, ["equity"]).valid).toBe(true);
   });
 
   it("rejects unknown fields with a suggestion", () => {
