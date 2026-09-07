@@ -56,7 +56,7 @@ export class MemoryResearchStore implements ResearchStore {
     const previousIds = new Set(previous?.matches.filter((match) => !match.exited).map((match) => match.instrumentId) ?? []);
     const currentIds = new Set(matches.map((match) => match.instrumentId));
     const currentMatches: RunMatch[] = matches.map((item, index) => ({ instrumentId: item.instrumentId, rank: index + 1, score: item.metrics?.momentum_score ?? null, explanation: { matched: true, text: `Matched ${screen.source}`, metrics: Object.keys(item.metrics ?? {}) }, entered: !previousIds.has(item.instrumentId), exited: false }));
-    const exitedMatches: RunMatch[] = previous?.matches.filter((match) => !currentIds.has(match.instrumentId)).map((match) => ({ ...match, rank: 0, explanation: { ...match.explanation, matched: false }, entered: false, exited: true })) ?? [];
+    const exitedMatches: RunMatch[] = previous?.matches.filter((match) => !match.exited && !currentIds.has(match.instrumentId)).map((match) => ({ ...match, rank: 0, explanation: { ...match.explanation, matched: false }, entered: false, exited: true })) ?? [];
     const detail: RunDetail = { id: crypto.randomUUID(), screenId: screen.id, datasetId, effectiveDate, matchCount: matches.length, status: "complete", matches: [...currentMatches, ...exitedMatches] };
     this.runs.set(`${datasetId}:${screen.id}`, [detail, ...(this.runs.get(`${datasetId}:${screen.id}`) ?? [])]);
     return detail;
@@ -97,7 +97,7 @@ export class D1ResearchStore implements ResearchStore {
     const priorIds = new Set(prior?.matches.filter((match) => !match.exited).map((match) => match.instrumentId) ?? []);
     const currentIds = new Set(rows.results.map((row) => row.instrument_id));
     const currentMatches: RunMatch[] = rows.results.map((row, index) => ({ instrumentId: row.instrument_id, rank: index + 1, score: row.score == null ? null : Number(row.score), explanation: { matched: true, text: `Matched ${screen.source}`, metrics: compiled.referencedMetricIds }, entered: !priorIds.has(row.instrument_id), exited: false }));
-    const exitedMatches: RunMatch[] = prior?.matches.filter((match) => !currentIds.has(match.instrumentId)).map((match) => ({ ...match, rank: 0, explanation: { ...match.explanation, matched: false }, entered: false, exited: true })) ?? [];
+    const exitedMatches: RunMatch[] = prior?.matches.filter((match) => !match.exited && !currentIds.has(match.instrumentId)).map((match) => ({ ...match, rank: 0, explanation: { ...match.explanation, matched: false }, entered: false, exited: true })) ?? [];
     const matches: RunMatch[] = [...currentMatches, ...exitedMatches];
     const runId = crypto.randomUUID();
     const matchStatements = matches.map((match, index) => this.db.prepare("INSERT INTO screen_matches (dataset_id, run_id, ordinal, instrument_id, score, explanation_json, entered, exited) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").bind(datasetId, runId, index + 1, match.instrumentId, match.score, JSON.stringify(match.explanation), match.entered ? 1 : 0, match.exited ? 1 : 0));

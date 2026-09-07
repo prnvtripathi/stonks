@@ -122,6 +122,19 @@ describe("private research API", () => {
     expect((await store.listRuns(screen.id)).map((run) => run.effectiveDate)).toEqual(["2026-03-01", "2026-02-01", "2026-01-01"]);
   });
 
+  it("does not repeat an exit after an instrument remains absent", async () => {
+    const store = new MemoryResearchStore("dataset-1");
+    store.instruments.set("one", { instrumentId: "one", symbol: "ONE", name: "One", assetClass: "equity", active: true, metrics: { volume: 10 } });
+    const screen = await store.createScreen({ name: "Volume", source: "Volume > 1", languageVersion: "v1", createdAt: "2026-01-01", updatedAt: "2026-01-01" });
+    await store.runScreen("dataset-1", screen, "2026-01-01");
+    store.instruments.set("one", { instrumentId: "one", symbol: "ONE", name: "One", assetClass: "equity", active: false, metrics: { volume: 10 } });
+    const second = await store.runScreen("dataset-1", screen, "2026-01-02");
+    const third = await store.runScreen("dataset-1", screen, "2026-01-03");
+
+    expect(second.matches.map((match) => ({ instrumentId: match.instrumentId, exited: match.exited, rank: match.rank }))).toEqual([{ instrumentId: "one", exited: true, rank: 0 }]);
+    expect(third.matches).toEqual([]);
+  });
+
   it("rejects missing mutation origin, unknown fields, invalid pagination, and oversized bytes", async () => {
     const api = testApi();
     const bearer = await api.issueTestToken({ email: "owner@example.com" });
@@ -179,6 +192,41 @@ describe("private research API", () => {
     ]);
   });
 
+  it("does not repeat a persisted exit after an instrument remains absent", async () => {
+    const state: {
+      present: boolean;
+      runs: { runId: string; screenId: string; datasetId: string; effectiveDate: string; resultCount: number; status: string }[];
+      matches: { datasetId: string; runId: string; ordinal: number; instrumentId: string; score: number | null; explanation: string; entered: number; exited: number }[];
+    } = { present: true, runs: [], matches: [] };
+    class HistoryStatement implements D1Statement {
+      private values: unknown[] = [];
+      public constructor(private readonly sql: string) {}
+      bind(...values: unknown[]): D1Statement { this.values = values; return this; }
+      async first<T extends Record<string, unknown> = Record<string, unknown>>(): Promise<T | null> { return null; }
+      async all<T extends Record<string, unknown> = Record<string, unknown>>(): Promise<{ results: readonly T[] }> {
+        if (this.sql.includes("FROM instruments AS i")) return { results: (state.present ? [{ instrument_id: "one", score: 10 }] : []) as unknown as readonly T[] };
+        if (this.sql.includes("FROM screen_runs")) return { results: [...state.runs].sort((left, right) => right.effectiveDate.localeCompare(left.effectiveDate) || right.runId.localeCompare(left.runId)).map((run) => ({ run_id: run.runId, screen_id: run.screenId, dataset_id: run.datasetId, effective_date: run.effectiveDate, result_count: run.resultCount, status: run.status })) as unknown as readonly T[] };
+        if (this.sql.includes("FROM screen_matches")) return { results: state.matches.filter((match) => match.runId === String(this.values[1])).map((match) => ({ instrument_id: match.instrumentId, ordinal: match.ordinal, score: match.score, explanation_json: match.explanation, entered: match.entered, exited: match.exited })) as unknown as readonly T[] };
+        return { results: [] };
+      }
+      async run(): Promise<D1Result> {
+        if (this.sql.includes("INSERT INTO screen_matches")) state.matches.push({ datasetId: String(this.values[0]), runId: String(this.values[1]), ordinal: Number(this.values[2]), instrumentId: String(this.values[3]), score: this.values[4] == null ? null : Number(this.values[4]), explanation: String(this.values[5]), entered: Number(this.values[6]), exited: Number(this.values[7]) });
+        if (this.sql.includes("INSERT INTO screen_runs")) state.runs.push({ datasetId: String(this.values[0]), runId: String(this.values[1]), screenId: String(this.values[2]), effectiveDate: String(this.values[3]), resultCount: Number(this.values[4]), status: "complete" });
+        return { success: true };
+      }
+    }
+    const db: D1Database = { prepare: (sql) => new HistoryStatement(sql) };
+    const store = new D1ResearchStore(db);
+    const screen = { id: "screen-1", name: "x", source: "Volume > 1", languageVersion: "v1", createdAt: "2026-01-01", updatedAt: "2026-01-01" } as const;
+    await store.runScreen("dataset-1", screen, "2026-01-01");
+    state.present = false;
+    const second = await store.runScreen("dataset-1", screen, "2026-01-02");
+    const third = await store.runScreen("dataset-1", screen, "2026-01-03");
+
+    expect(second.matches.map((match) => ({ instrumentId: match.instrumentId, exited: match.exited, rank: match.rank }))).toEqual([{ instrumentId: "one", exited: true, rank: 0 }]);
+    expect(third.matches).toEqual([]);
+  });
+
   it("rejects a match-write failure without leaving a complete run", async () => {
     const statements: string[] = [];
     class FailingMatchStatement implements D1Statement {
@@ -227,6 +275,7 @@ describe("private research API", () => {
       await sign("kid-1", { iss: "https://other.example.com" }),
       await sign("kid-1", { aud: "wrong-audience" }),
       await sign("kid-1", { exp: Math.floor(Date.now() / 1000) - 1 }),
+      await sign("kid-1", { email: "other@example.com" }),
     ]) {
       await expect(verifyAccessRequest(new Request("https://dashboard.example.com/api/v1/status", { headers: { "Cf-Access-Jwt-Assertion": invalidToken } }), envWithKeys)).rejects.toThrow();
     }
