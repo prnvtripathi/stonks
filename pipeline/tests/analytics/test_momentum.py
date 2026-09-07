@@ -24,7 +24,7 @@ def test_equity_momentum_uses_all_approved_weights() -> None:
 
     assert result.score == Decimal("1")
     assert result.coverage == Decimal("1")
-    assert result.formula_version
+    assert result.formula_version == "momentum-v2-cohort"
     assert result.normalized_components == values
 
 
@@ -74,6 +74,32 @@ def test_batch_keeps_equity_and_etf_cohorts_separate() -> None:
     assert results["etf"].normalized_components["three_month_performance"] == Decimal("0.5")
 
 
+def test_batch_normalizes_equities_only_within_the_same_effective_date() -> None:
+    results = momentum_scores(
+        [
+            {**_equity("old", "100"), "effective_date": "2026-09-06"},
+            {**_equity("low", "0.01"), "effective_date": "2026-09-07"},
+            {**_equity("high", "0.02"), "effective_date": "2026-09-07"},
+        ]
+    )
+
+    assert results["low"].normalized_components["three_month_performance"] == Decimal("0")
+    assert results["high"].normalized_components["three_month_performance"] == Decimal("1")
+
+
+def test_batch_normalizes_etfs_only_within_the_same_effective_date() -> None:
+    results = momentum_scores(
+        [
+            {**_equity("old", "100", "etf"), "effective_date": "2026-09-06"},
+            {**_equity("low", "0.01", "etf"), "effective_date": "2026-09-07"},
+            {**_equity("high", "0.02", "etf"), "effective_date": "2026-09-07"},
+        ]
+    )
+
+    assert results["low"].normalized_components["three_month_performance"] == Decimal("0")
+    assert results["high"].normalized_components["three_month_performance"] == Decimal("1")
+
+
 def test_batch_uses_explicit_mf_categories_and_ignores_spoofed_cohort() -> None:
     def record(identifier: str, category: str, value: str) -> dict[str, object]:
         return {
@@ -95,6 +121,35 @@ def test_batch_uses_explicit_mf_categories_and_ignores_spoofed_cohort() -> None:
 
     assert results["a"].cohort == "mutual_fund:large"
     assert results["b"].cohort == "mutual_fund:small"
+
+
+def test_batch_normalizes_mfs_only_within_category_and_effective_date() -> None:
+    def record(identifier: str, category: str, value: str, day: str) -> dict[str, object]:
+        return {
+            "identifier": identifier,
+            "asset_class": "mutual_fund",
+            "category": category,
+            "effective_date": day,
+            "components": {
+                "three_month_return": Decimal(value),
+                "six_month_return": Decimal(value),
+                "twelve_month_return": Decimal(value),
+                "category_rank": Decimal("1"),
+                "volatility": Decimal("0.1"),
+                "max_drawdown": Decimal("-0.1"),
+            },
+        }
+
+    results = momentum_scores(
+        [
+            record("old", "large", "100", "2026-09-06"),
+            record("low", "large", "0.01", "2026-09-07"),
+            record("high", "large", "0.02", "2026-09-07"),
+        ]
+    )
+
+    assert results["low"].normalized_components["three_month_return"] == Decimal("0")
+    assert results["high"].normalized_components["three_month_return"] == Decimal("1")
 
 
 def test_batch_inverts_volatility_and_drawdown() -> None:
@@ -134,6 +189,7 @@ def test_batch_rejects_out_of_domain_normalized_values_and_missing_history() -> 
     del incomplete_components["weighted_12m_rs_percentile"]
     result = momentum_scores([incomplete])["new"]
     assert result.score is None
+    assert result.formula_version == "momentum-v2-cohort"
 
 
 def test_missing_equity_component_is_insufficient() -> None:

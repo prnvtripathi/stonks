@@ -10,7 +10,7 @@ from typing import Any
 
 from market_pipeline.analytics._utils import as_date, as_decimal
 
-FORMULA_VERSION = "momentum-v1"
+FORMULA_VERSION = "momentum-v2-cohort"
 EQUITY_WEIGHTS = {
     "weighted_12m_rs_percentile": Decimal("0.35"),
     "six_month_performance": Decimal("0.20"),
@@ -197,19 +197,22 @@ def momentum_scores(records: Iterable[Mapping[str, Any]]) -> dict[str, MomentumS
     """Normalize raw records inside separate typed cohorts and calculate scores."""
 
     parsed = [_record_parts(record) for record in records]
-    groups: dict[tuple[str, str | None], list[tuple[int, tuple[str, str, str | None, Mapping[str, Any], date | None, bool], dict[str, Decimal]]]] = {}
+    groups: dict[
+        tuple[str, str | None, date | None],
+        list[tuple[int, tuple[str, str, str | None, Mapping[str, Any], date | None, bool], dict[str, Decimal]]],
+    ] = {}
     for index, item in enumerate(parsed):
-        _, asset_class, category, components, _, _ = item
+        _, asset_class, category, components, effective, _ = item
         raw = _decimal_components(components)
         weights = MF_WEIGHTS if asset_class == "mutual_fund" else EQUITY_WEIGHTS
         canonical = {
             key: value for key in weights if (value := _lookup(raw, key)) is not None
         }
-        group = (asset_class, category if asset_class == "mutual_fund" else None)
+        group = (asset_class, category if asset_class == "mutual_fund" else None, effective)
         groups.setdefault(group, []).append((index, item, canonical))
 
     results: dict[str, MomentumScore] = {}
-    for (asset_class, category), members in groups.items():
+    for (asset_class, category, _), members in groups.items():
         weights = MF_WEIGHTS if asset_class == "mutual_fund" else EQUITY_WEIGHTS
         normalized_by_index: dict[int, dict[str, Decimal | None]] = {
             index: {key: None for key in weights} for index, _, _ in members
