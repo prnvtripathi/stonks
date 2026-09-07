@@ -16,8 +16,12 @@ from typing import Any, Sequence
 from market_pipeline.domain.models import FetchedArtifact, SourceArtifact
 from market_pipeline.jobs.backfill import BackfillJob, CoverageError
 from market_pipeline.jobs.daily import run_daily
+from market_pipeline.jobs.publish import publish_checkpointed_dataset
 from market_pipeline.monitoring.budgets import budget_report
+from market_pipeline.sources.registry import SourcePolicyError
 from market_pipeline.storage.d1_publisher import D1Publisher
+from market_pipeline.storage.history_store import LocalHistoryStore
+from market_pipeline.storage.raw_store import LocalRawStore
 from market_pipeline.validation.reconcile import (
     SourceObservation,
     evaluate_pre_promotion,
@@ -36,6 +40,20 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="market-pipeline")
     parser.add_argument("--db", default="market.db", help="local SQLite database path")
     parser.add_argument("--d1-budget-limit-bytes", type=int, help="optional D1 storage budget")
+    parser.add_argument(
+        "--history-store",
+        help=(
+            "root directory for immutable yearly history and chart objects; "
+            "defaults to a 'history' directory beside --db"
+        ),
+    )
+    parser.add_argument(
+        "--raw-store",
+        help=(
+            "root directory for the immutable raw-artifact store; "
+            "defaults to a 'raw' directory beside --db"
+        ),
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
     for command in ("backfill", "daily"):
         sub = subparsers.add_parser(command)
@@ -155,6 +173,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps({"error": str(exc)}, sort_keys=True), file=sys.stderr)
         return 2
     connection = sqlite3.connect(args.db)
+    # Raw artifacts are persisted immutably (URL, retrieval time, effective
+    # date, checksum, adapter version, terms reference) *before* they are
+    # normalized, and the publication stage re-reads them from here. Without a
+    # raw store the pipeline would have no auditable record and no history to
+    # compute a twelve-month return from.
+    raw_root = Path(args.raw_store) if args.raw_store else Path(args.db).resolve().parent / "raw"
+    raw_store = LocalRawStore(raw_root)
+    history_root = Path(args.history_store) if args.history_store else Path(args.db).resolve().parent / "history"
+    history_store = LocalHistoryStore(history_root)
     publisher = D1Publisher(connection, budget_limit_bytes=args.d1_budget_limit_bytes)
     publisher.initialize_schema()
     _ensure_run_history_table(connection)
@@ -179,10 +206,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         # evaluate_pre_promotion), so every configured source gets an
         # independent freshness verdict instead of one aborting the whole run.
         if args.command == "daily":
-            result = run_daily(connection, fetcher, sources, effective_date=start, strict_coverage=False, budget_sources=(publisher,))
+            result = run_daily(connection, fetcher, sources, effective_date=start, raw_store=raw_store, strict_coverage=False, budget_sources=(publisher,))
         else:
-            result = BackfillJob(connection, sources, fetcher, strict_coverage=False, budget_sources=(publisher,)).run(start, end)
-    except (CoverageError, ValueError, RuntimeError) as exc:
+            result = BackfillJob(connection, sources, fetcher, raw_store=raw_store, strict_coverage=False, budget_sources=(publisher,)).run(start, end)
+    except (CoverageError, SourcePolicyError, ValueError, RuntimeError) as exc:
         connection.close()
         print(json.dumps({"error": str(exc)}, sort_keys=True), file=sys.stderr)
         return 2
@@ -234,6 +261,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     # poison the next run's comparison point.
     _record_run_history(connection, args.command, sources, result.completed, safe_to_promote)
 
+    # Normalization -> analytics -> stage/promote. This only runs after the
+    # Task 13 gate says the candidate is safe; a blocked run leaves the last
+    # known-good dataset active and untouched.
+    publication = publish_checkpointed_dataset(
+        connection,
+        publisher,
+        raw_store,
+        sources,
+        effective_date=result.end,
+        safe_to_promote=safe_to_promote,
+        blocking_reasons=blocking_reasons,
+        history_store=history_store,
+    )
+
     print(json.dumps({
         "start": result.start.isoformat(),
         "end": result.end.isoformat(),
@@ -249,13 +290,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         "budget": storage_report.as_dict(),
         "safe_to_promote": safe_to_promote,
         "blocking_reasons": list(blocking_reasons),
+        "publication": publication.as_dict(),
     }, sort_keys=True))
     connection.close()
     if not safe_to_promote:
-        # This CLI does not itself call D1Publisher.promote; this exit code is
-        # the enforcement point a future publish step, or the daily-data
-        # workflow, must treat as "do not promote this candidate".
+        # Reconciliation/budget blocked the candidate: nothing was staged or
+        # promoted, so the previously active dataset remains the served one.
         return 3
+    if not publication.promoted:
+        # The gate passed but the dataset could not be built or staged. That is
+        # a real failure to surface, and still leaves the last known-good
+        # dataset active.
+        return 4
     return 0
 
 

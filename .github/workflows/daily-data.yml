@@ -128,7 +128,15 @@ jobs:
       - name: Restore market database from previous run
         uses: actions/cache/restore@v4
         with:
-          path: market.db
+          # `raw/` and `history/` hold the immutable artifact bodies and
+          # published history objects. The publication stage re-reads `raw/`
+          # to rebuild the three-year NAV series a twelve-month return needs,
+          # so losing it would silently reduce every run to one session of
+          # history.
+          path: |
+            market.db
+            raw
+            history
           key: market-db-${{ github.run_id }}
           restore-keys: |
             market-db-
@@ -157,7 +165,10 @@ jobs:
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: market.db
+          path: |
+            market.db
+            raw
+            history
           key: market-db-${{ github.run_id }}
 
       - name: Redact and publish operator report
@@ -198,8 +209,12 @@ jobs:
           if isinstance(run_report, dict):
               reconciliation = run_report.get("reconciliation", {})
               budget = run_report.get("budget", {})
+              publication = run_report.get("publication") or {}
               summary_lines += [
                   f"- **Safe to promote:** {run_report.get('safe_to_promote')}",
+                  f"- **Promoted dataset:** {publication.get('dataset_id')}"
+                  f" (promoted={publication.get('promoted')}, {publication.get('instrument_count')} instruments)",
+                  f"- **Publication note:** {publication.get('reason') or 'none'}",
                   f"- **Coverage ratio:** {reconciliation.get('coverage_ratio')}"
                   f" (min {reconciliation.get('min_coverage_ratio')})",
                   f"- **Storage budget:** {budget.get('ratio')} of limit"

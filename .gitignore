@@ -17,6 +17,12 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
+# Pipeline local state (CLI database, immutable raw artifacts, history objects)
+market.db
+raw/
+history/
+*.egg-info/
+
 # Local environment
 .env
 .env.*

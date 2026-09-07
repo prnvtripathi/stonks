@@ -9,6 +9,46 @@ from typing import Any
 
 from market_pipeline.cli import main
 
+TERMS_URL = "https://www.amfiindia.com/terms-and-conditions"
+SOURCE_URL = "https://www.amfiindia.com/spages/NAVAll.txt"
+
+
+def _nav_report(effective_date: str, nav: str = "100.5") -> bytes:
+    """A minimal but genuinely parseable official AMFI NAV report.
+
+    The CLI now persists artifacts to the immutable raw store and normalizes
+    them before publication, so integration fixtures must carry real
+    provenance (canonical terms URL, approved source URL) and a real body.
+    """
+
+    day = datetime.fromisoformat(effective_date).strftime("%d-%b-%Y")
+    return (
+        "Scheme Code;ISIN Div Payout/ ISIN Growth;ISIN Div Reinvestment;"
+        "Scheme Name;Net Asset Value;Date\n"
+        "\n"
+        "Alpha Asset Management Mutual Fund\n"
+        "\n"
+        "Open Ended Schemes(Equity Scheme - Large Cap Fund)\n"
+        f"119551;INF119551AA1;INF119551AB9;Alpha Bluechip Fund - Direct Plan - Growth;{nav};{day}\n"
+    ).encode("utf-8")
+
+
+def _artifact(effective_date: str, nav: str = "100.5") -> dict[str, Any]:
+    body = _nav_report(effective_date, nav)
+    return {
+        "artifact": {
+            "source_id": "amfi-nav",
+            "source_url": SOURCE_URL,
+            "retrieved_at": datetime.now(UTC).isoformat(),
+            "effective_date": effective_date,
+            "checksum": hashlib.sha256(body).hexdigest(),
+            "adapter_version": "v1",
+            "terms_url": TERMS_URL,
+            "filename": "NAVAll.txt",
+        },
+        "body_base64": base64.b64encode(body).decode(),
+    }
+
 
 def test_daily_without_committed_artifact_input_is_nonzero(capsys: Any) -> None:
     result = main(["daily", "--date", "2026-09-01"])
@@ -35,21 +75,8 @@ def test_daily_with_empty_manifest_reports_source_failed_and_blocks_promotion(tm
 
 
 def test_real_manifest_deserializes_and_runs_daily(tmp_path: Path, capsys: Any) -> None:
-    body = b"official artifact"
     manifest = tmp_path / "manifest.json"
-    manifest.write_text(json.dumps({"artifacts": [{
-        "artifact": {
-            "source_id": "amfi-nav",
-            "source_url": "https://www.amfiindia.com/spages/NAVAll.txt",
-            "retrieved_at": datetime.now(UTC).isoformat(),
-            "effective_date": "2026-09-01",
-            "checksum": hashlib.sha256(body).hexdigest(),
-            "adapter_version": "v1",
-            "terms_url": "https://www.amfiindia.com/terms.html",
-            "filename": "nav.txt",
-        },
-        "body_base64": base64.b64encode(body).decode(),
-    }]}))
+    manifest.write_text(json.dumps({"artifacts": [_artifact("2026-09-01")]}))
     result = main(["--db", str(tmp_path / "market.db"), "daily", "--date", "2026-09-01", "--manifest", str(manifest)])
     assert result == 0
     assert json.loads(capsys.readouterr().out)["completed"] == 1
@@ -74,21 +101,8 @@ def test_backfill_source_missing_only_some_dates_is_delayed_not_failed_and_does_
     # as "delayed" (partial lag), never "failed" (which is reserved for a
     # source missing on every requested date), and delayed alone must not
     # block promotion.
-    body = b"official artifact"
     manifest = tmp_path / "manifest.json"
-    manifest.write_text(json.dumps({"artifacts": [{
-        "artifact": {
-            "source_id": "amfi-nav",
-            "source_url": "https://www.amfiindia.com/spages/NAVAll.txt",
-            "retrieved_at": datetime.now(UTC).isoformat(),
-            "effective_date": "2026-09-01",
-            "checksum": hashlib.sha256(body).hexdigest(),
-            "adapter_version": "v1",
-            "terms_url": "https://www.amfiindia.com/terms.html",
-            "filename": "nav.txt",
-        },
-        "body_base64": base64.b64encode(body).decode(),
-    }]}))
+    manifest.write_text(json.dumps({"artifacts": [_artifact("2026-09-01")]}))
     result = main([
         "--db", str(tmp_path / "market.db"),
         "backfill", "--start", "2026-09-01", "--end", "2026-09-02",
@@ -110,21 +124,8 @@ def test_explicit_sources_replace_default() -> None:
 
 
 def test_successful_run_reports_publishable_reconciliation(tmp_path: Path, capsys: Any) -> None:
-    body = b"official artifact"
     manifest = tmp_path / "manifest.json"
-    manifest.write_text(json.dumps({"artifacts": [{
-        "artifact": {
-            "source_id": "amfi-nav",
-            "source_url": "https://www.amfiindia.com/spages/NAVAll.txt",
-            "retrieved_at": datetime.now(UTC).isoformat(),
-            "effective_date": "2026-09-01",
-            "checksum": hashlib.sha256(body).hexdigest(),
-            "adapter_version": "v1",
-            "terms_url": "https://www.amfiindia.com/terms.html",
-            "filename": "nav.txt",
-        },
-        "body_base64": base64.b64encode(body).decode(),
-    }]}))
+    manifest.write_text(json.dumps({"artifacts": [_artifact("2026-09-01")]}))
     result = main(["--db", str(tmp_path / "market.db"), "daily", "--date", "2026-09-01", "--manifest", str(manifest)])
     payload = json.loads(capsys.readouterr().out)
     assert result == 0
@@ -134,21 +135,8 @@ def test_successful_run_reports_publishable_reconciliation(tmp_path: Path, capsy
 
 
 def test_coverage_drop_against_previous_count_blocks_promotion(tmp_path: Path, capsys: Any) -> None:
-    body = b"official artifact"
     manifest = tmp_path / "manifest.json"
-    manifest.write_text(json.dumps({"artifacts": [{
-        "artifact": {
-            "source_id": "amfi-nav",
-            "source_url": "https://www.amfiindia.com/spages/NAVAll.txt",
-            "retrieved_at": datetime.now(UTC).isoformat(),
-            "effective_date": "2026-09-01",
-            "checksum": hashlib.sha256(body).hexdigest(),
-            "adapter_version": "v1",
-            "terms_url": "https://www.amfiindia.com/terms.html",
-            "filename": "nav.txt",
-        },
-        "body_base64": base64.b64encode(body).decode(),
-    }]}))
+    manifest.write_text(json.dumps({"artifacts": [_artifact("2026-09-01")]}))
     result = main([
         "--db", str(tmp_path / "market.db"),
         "daily", "--date", "2026-09-01", "--manifest", str(manifest),
@@ -162,21 +150,8 @@ def test_coverage_drop_against_previous_count_blocks_promotion(tmp_path: Path, c
 
 
 def _manifest_with_one_artifact(tmp_path: Path, name: str, effective_date: str) -> Path:
-    body = f"official artifact {name}".encode()
     manifest = tmp_path / name
-    manifest.write_text(json.dumps({"artifacts": [{
-        "artifact": {
-            "source_id": "amfi-nav",
-            "source_url": "https://www.amfiindia.com/spages/NAVAll.txt",
-            "retrieved_at": datetime.now(UTC).isoformat(),
-            "effective_date": effective_date,
-            "checksum": hashlib.sha256(body).hexdigest(),
-            "adapter_version": "v1",
-            "terms_url": "https://www.amfiindia.com/terms.html",
-            "filename": "nav.txt",
-        },
-        "body_base64": base64.b64encode(body).decode(),
-    }]}))
+    manifest.write_text(json.dumps({"artifacts": [_artifact(effective_date)]}))
     return manifest
 
 
