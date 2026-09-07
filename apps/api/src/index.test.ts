@@ -145,10 +145,11 @@ describe("private research API", () => {
   });
 
   it("verifies a production-style RS256 Access assertion and refreshes an unknown kid", async () => {
-    const keyPair = await crypto.subtle.generateKey({ name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, true, ["sign", "verify"]);
+    const rsaKeyParams = { name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" } as const;
+    const keyPair = await crypto.subtle.generateKey(rsaKeyParams, true, ["sign", "verify"]);
     const publicJwk = await crypto.subtle.exportKey("jwk", keyPair.publicKey);
     const encode = (value: unknown) => btoa(String.fromCharCode(...new TextEncoder().encode(JSON.stringify(value)))).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
-    const secondKeyPair = await crypto.subtle.generateKey({ name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, true, ["sign", "verify"]);
+    const secondKeyPair = await crypto.subtle.generateKey(rsaKeyParams, true, ["sign", "verify"]);
     const secondPublicJwk = await crypto.subtle.exportKey("jwk", secondKeyPair.publicKey);
     const sign = async (kid: string, email = "owner@example.com", exp = Math.floor(Date.now() / 1000) + 300, signingKey = keyPair.privateKey) => {
       const header = encode({ alg: "RS256", typ: "JWT", kid });
