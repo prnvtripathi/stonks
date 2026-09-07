@@ -71,6 +71,10 @@ class Instrument(BaseModel):
     symbol: str | None = None
     name: str | None = None
     active: bool = True
+    # Provider-native values are retained for source reconciliation/audit. They
+    # do not participate in the stable UUID identity.
+    raw_series: str | None = None
+    raw_type: str | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -101,6 +105,8 @@ class Instrument(BaseModel):
         symbol: str | None = None,
         name: str | None = None,
         active: bool = True,
+        raw_series: str | None = None,
+        raw_type: str | None = None,
     ) -> Instrument:
         return cls.model_validate(
             {
@@ -110,6 +116,8 @@ class Instrument(BaseModel):
                 "symbol": symbol,
                 "name": name,
                 "active": active,
+                "raw_series": raw_series,
+                "raw_type": raw_type,
             }
         )
 

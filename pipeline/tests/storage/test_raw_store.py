@@ -124,6 +124,13 @@ def test_local_store_rejects_keys_that_escape_the_root(tmp_path: Path) -> None:
         LocalRawStore(tmp_path).put(artifact, b"a")
 
 
+@pytest.mark.parametrize("filename", ["report.metadata.json", "report.commit.json"])
+def test_local_store_rejects_reserved_sidecar_filenames(tmp_path: Path, filename: str) -> None:
+    artifact = make_artifact(b"a", filename)
+    with pytest.raises(ImmutableRawStoreError):
+        LocalRawStore(tmp_path).put(artifact, b"a")
+
+
 def test_local_store_rejects_unsafe_source_segments(tmp_path: Path) -> None:
     artifact = make_artifact(b"a")
     artifact = artifact.model_copy(update={"source_id": "../../outside"})

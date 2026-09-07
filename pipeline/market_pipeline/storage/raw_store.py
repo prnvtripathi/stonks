@@ -33,6 +33,8 @@ def _object_key(artifact: SourceArtifact) -> str:
         raise ImmutableRawStoreError("artifact filename must be a simple filename")
     if not re.fullmatch(r"[a-zA-Z0-9._-]+", filename):
         raise ImmutableRawStoreError("artifact filename contains unsupported characters")
+    if filename.endswith((".metadata.json", ".commit.json")):
+        raise ImmutableRawStoreError("artifact filename uses a reserved sidecar suffix")
     return (
         f"raw/{artifact.source_id}/{artifact.effective_date.isoformat()}"
         f"/{artifact.checksum.lower()}/{filename}"
