@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import worker from "./index";
 import { createApi, createTestAccessVerifier, D1ResearchStore, MemoryResearchStore, verifyAccessRequest, type ApiEnv, type D1Database, type D1Result, type D1Statement } from "./index";
 import { buildExplanation } from "./repositories";
 
@@ -16,6 +17,35 @@ async function token(email = "owner@example.com", overrides: Partial<{ exp: numb
 }
 
 const testApi = () => createApi({ env, store: new MemoryResearchStore(), accessVerifier: createTestAccessVerifier("test-secret"), testAccessSecret: "test-secret" });
+
+const workerBindings: Record<string, unknown> = {
+  ACCESS_TEAM_DOMAIN: "access.example.com",
+  ACCESS_AUD: "audience",
+  ACCESS_ALLOWED_EMAILS: "owner@example.com",
+  ALLOWED_ORIGIN: "https://dashboard.example.com",
+  MAX_BODY_BYTES: 16_384,
+};
+
+describe("worker bindings", () => {
+  it("returns 503 instead of serving fabricated data when the D1 binding is missing", async () => {
+    const response = await worker.fetch(request("/api/v1/status"), { ...workerBindings });
+    expect(response.status).toBe(503);
+    expect((await response.json() as { error: { code: string } }).error.code).toBe("DATA_STORE_IS_NOT_CONFIGURED");
+    expect(response.headers.get("Content-Security-Policy")).toBe("default-src 'none'; frame-ancestors 'none'");
+  });
+
+  it("returns 503 when the D1 binding is present but not a D1 database", async () => {
+    const response = await worker.fetch(request("/api/v1/status"), { ...workerBindings, DB: { notPrepare: true } });
+    expect(response.status).toBe(503);
+  });
+
+  it("serves the real D1-backed store when the binding is valid", async () => {
+    const response = await worker.fetch(request("/api/v1/status"), { ...workerBindings, DB: { prepare: () => ({}) } });
+    // Anonymous, so Access rejects it -- but it is a 401, not a 503, which
+    // proves the store was constructed from the real binding.
+    expect(response.status).toBe(401);
+  });
+});
 
 function fakeRows<T extends Record<string, unknown>>(rows: readonly Record<string, unknown>[]): readonly T[] {
   return rows as unknown as readonly T[];

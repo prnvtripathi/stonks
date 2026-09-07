@@ -45,12 +45,34 @@ export function createApi(dependencies: ApiDependencies): Api {
 }
 
 export type WorkerBindings = ApiEnv & { DB?: unknown; CHARTS?: { get(key: string): Promise<{ body: ReadableStream<Uint8Array>; httpMetadata?: { contentType?: string; contentEncoding?: string } } | null> } };
+
+/** Raised when a required Cloudflare binding is absent or the wrong shape. */
+export class MissingBindingError extends Error {}
+
+/**
+ * Build the production Worker. A missing or malformed `DB` binding is a
+ * deployment fault, not a fallback: serving `MemoryResearchStore` here would
+ * quietly answer with a fabricated dataset ID and effective date, which is
+ * indistinguishable from real data to a caller. Fail closed instead; the
+ * in-memory store is reachable only through `createTestWorker`.
+ */
 export function createWorker(env: WorkerBindings): Api {
-  const store = env.DB && typeof (env.DB as { prepare?: unknown }).prepare === "function" ? new D1ResearchStore(env.DB as never, env.CHARTS ? { get: async (key) => { const object = await env.CHARTS!.get(key); if (!object) return null; return { body: object.body, ...(object.httpMetadata?.contentType ? { contentType: object.httpMetadata.contentType } : {}), ...(object.httpMetadata?.contentEncoding ? { contentEncoding: object.httpMetadata.contentEncoding } : {}) }; } } : undefined) : new MemoryResearchStore(env.activeDatasetId ?? "dataset-1");
+  if (!env.DB || typeof (env.DB as { prepare?: unknown }).prepare !== "function") throw new MissingBindingError("Data store is not configured");
+  const store = new D1ResearchStore(env.DB as never, env.CHARTS ? { get: async (key) => { const object = await env.CHARTS!.get(key); if (!object) return null; return { body: object.body, ...(object.httpMetadata?.contentType ? { contentType: object.httpMetadata.contentType } : {}), ...(object.httpMetadata?.contentEncoding ? { contentEncoding: object.httpMetadata.contentEncoding } : {}) }; } } : undefined);
   return createApi({ env, store });
 }
 
-export default { fetch(request: Request, bindings: Record<string, unknown>): Promise<Response> { return createWorker({ ...readApiEnv(bindings), ...bindings } as WorkerBindings).fetch(request); } };
+/** Test-only entry point: the same routing over an explicit in-memory store. */
+export function createTestWorker(env: WorkerBindings, store: ResearchStore = new MemoryResearchStore(env.activeDatasetId ?? "dataset-1")): Api {
+  return createApi({ env, store });
+}
+
+export default { fetch(request: Request, bindings: Record<string, unknown>): Promise<Response> {
+  let api: Api;
+  try { api = createWorker({ ...readApiEnv(bindings), ...bindings } as WorkerBindings); }
+  catch (cause) { if (cause instanceof MissingBindingError) return Promise.resolve(withSecurityHeaders(error(503, cause.message))); throw cause; }
+  return api.fetch(request);
+} };
 
 async function handle(request: Request, env: ApiEnv, store: ResearchStore, now: () => Date, accessVerifier: AccessVerifier): Promise<Response> {
   const origin = request.headers.get("Origin");

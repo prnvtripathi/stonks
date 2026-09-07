@@ -40,8 +40,11 @@ describe("deployed API shape: anonymous access", () => {
   beforeAll(async () => {
     // The exact shape of bindings Cloudflare would inject for this Worker
     // (see apps/api/wrangler.jsonc `vars` plus the `ACCESS_ALLOWED_EMAILS`
-    // secret) -- no DB/CHARTS bindings, so `createWorker()` falls back to
-    // `MemoryResearchStore`, same as the previous version of this test.
+    // secret). `DB` is a minimal stub with the one method `createWorker()`
+    // probes: a real deploy without a `DB` binding now fails closed with 503
+    // rather than silently serving a fabricated in-memory dataset, and this
+    // test is about anonymous *authentication* denial, so it must present a
+    // configured Worker.
     const bindings: Record<string, unknown> = {
       ACCESS_TEAM_DOMAIN: "access.example.com",
       ACCESS_AUD: "audience",
@@ -49,6 +52,7 @@ describe("deployed API shape: anonymous access", () => {
       ALLOWED_ORIGIN: "https://dashboard.example.com",
       MAX_BODY_BYTES: 16_384,
       activeDatasetId: "dataset-1",
+      DB: { prepare: () => ({}) },
     };
 
     server = createServer((req, res) => {
