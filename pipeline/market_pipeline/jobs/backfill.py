@@ -118,12 +118,38 @@ class BackfillJob:
         self.budget_sources = tuple(budget_sources)
         _ensure_checkpoint_table(database)
 
-    def _checkpoint(self, source_id: str, effective_date: date, artifact_id: str) -> tuple[str, str | None] | None:
+    def _checkpoint(
+        self,
+        source_id: str,
+        effective_date: date,
+        artifact_id: str,
+        checksum: str,
+    ) -> tuple[str, str | None] | None:
         row = self.database.execute(
             "SELECT checksum, object_key FROM backfill_checkpoints WHERE source_id=? AND effective_date=? AND artifact_id=?",
             (source_id, effective_date.isoformat(), artifact_id),
         ).fetchone()
-        return None if row is None else (str(row[0]), row[1])
+        if row is not None:
+            return str(row[0]), row[1]
+        # A pre-0002 row cannot be mapped to the canonical artifact ID because
+        # old checkpoints did not retain filename/identity. Match only a single
+        # legacy row by checksum; never guess when multiple legacy objects exist.
+        legacy = self.database.execute(
+            "SELECT checksum, object_key FROM backfill_checkpoints WHERE source_id=? AND effective_date=? AND artifact_id LIKE 'legacy-%'",
+            (source_id, effective_date.isoformat()),
+        ).fetchall()
+        matches = [item for item in legacy if str(item[0]).lower() == checksum.lower()]
+        if len(matches) == 1:
+            return str(matches[0][0]), matches[0][1]
+        if legacy:
+            if len(matches) > 1:
+                raise BackfillIntegrityError(
+                    f"{source_id}/{effective_date}: ambiguous legacy artifact checkpoint"
+                )
+            raise BackfillIntegrityError(
+                f"{source_id}/{effective_date}: artifact checksum conflicts with legacy checkpoint"
+            )
+        return None
 
     @staticmethod
     def _coerce_artifact(value: FetchedArtifact | SourceArtifact | tuple[SourceArtifact, bytes]) -> tuple[SourceArtifact, bytes | None]:
@@ -186,7 +212,7 @@ class BackfillJob:
                     if body is not None and sha256(body).hexdigest() != checksum:
                         raise BackfillIntegrityError(f"{source}/{current.isoformat()}: checksum mismatch")
                     artifact_id = str(artifact.artifact_id)
-                    prior = self._checkpoint(source, current, artifact_id)
+                    prior = self._checkpoint(source, current, artifact_id, checksum)
                     if prior is not None and prior[0].lower() == checksum:
                         skipped += 1
                         continue

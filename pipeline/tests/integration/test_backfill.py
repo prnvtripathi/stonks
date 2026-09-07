@@ -114,3 +114,32 @@ def test_legacy_checkpoint_schema_is_upgraded_without_losing_rows() -> None:
     assert row[:2] == ("amfi-nav", "2026-09-01")
     assert row[2].startswith("legacy-")
     assert row[3:] == ("abc", "raw/key")
+
+
+def test_matching_retry_skips_migrated_legacy_checkpoint() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.execute("CREATE TABLE backfill_checkpoints (source_id TEXT NOT NULL, effective_date TEXT NOT NULL, checksum TEXT NOT NULL, object_key TEXT, completed_at TEXT NOT NULL, PRIMARY KEY(source_id,effective_date))")
+    body = b"legacy body"
+    checksum = hashlib.sha256(body).hexdigest()
+    connection.execute("INSERT INTO backfill_checkpoints VALUES (?,?,?,?,?)", ("amfi-nav", "2026-09-01", checksum, "raw/legacy", "2026-09-02T00:00:00Z"))
+    artifact = SourceArtifact(
+        source_id="amfi-nav", source_url="https://www.amfiindia.com/spages/NAVAll.txt",
+        retrieved_at=datetime.now(UTC), effective_date=date(2026, 9, 1), checksum=checksum,
+        adapter_version="v1", terms_url="https://www.amfiindia.com/terms.html", filename="nav.txt",
+    )
+    result = BackfillJob(connection, ["amfi-nav"], lambda _source, _date: [(artifact, body)]).run(date(2026, 9, 1), date(2026, 9, 1))
+    assert (result.completed, result.skipped) == (0, 1)
+
+
+def test_changed_checksum_cannot_bypass_migrated_legacy_checkpoint() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.execute("CREATE TABLE backfill_checkpoints (source_id TEXT NOT NULL, effective_date TEXT NOT NULL, checksum TEXT NOT NULL, object_key TEXT, completed_at TEXT NOT NULL, PRIMARY KEY(source_id,effective_date))")
+    old_body, new_body = b"old", b"new"
+    connection.execute("INSERT INTO backfill_checkpoints VALUES (?,?,?,?,?)", ("amfi-nav", "2026-09-01", hashlib.sha256(old_body).hexdigest(), "raw/legacy", "2026-09-02T00:00:00Z"))
+    artifact = SourceArtifact(
+        source_id="amfi-nav", source_url="https://www.amfiindia.com/spages/NAVAll.txt",
+        retrieved_at=datetime.now(UTC), effective_date=date(2026, 9, 1), checksum=hashlib.sha256(new_body).hexdigest(),
+        adapter_version="v1", terms_url="https://www.amfiindia.com/terms.html", filename="nav.txt",
+    )
+    with pytest.raises(BackfillIntegrityError):
+        BackfillJob(connection, ["amfi-nav"], lambda _source, _date: [(artifact, new_body)]).run(date(2026, 9, 1), date(2026, 9, 1))
