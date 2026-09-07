@@ -142,6 +142,19 @@ def _raw_value(row: Mapping[str, str], column: str | None) -> str:
     return row.get(column or "", "")
 
 
+def _validated_master_rows(rows: Iterable[NseParsedRow]) -> list[NseParsedRow]:
+    """Reject duplicate symbols consistently for parsed and injected masters."""
+
+    validated: list[NseParsedRow] = []
+    seen: set[str] = set()
+    for row in rows:
+        if row.symbol in seen:
+            raise NseRowError(f"security master contains duplicate symbol: {row.symbol}")
+        seen.add(row.symbol)
+        validated.append(row)
+    return validated
+
+
 def parse_nse_security_master(body: bytes | str) -> list[NseParsedRow]:
     """Parse an NSE security-master CSV while retaining native fields."""
 
@@ -259,7 +272,7 @@ def normalize_nse_rows(
         master_rows = (
             parse_nse_security_master(security_master)
             if isinstance(security_master, (bytes, str))
-            else list(security_master)
+            else _validated_master_rows(security_master)
         )
         master_by_symbol = {row.symbol: row for row in master_rows if row.symbol}
     instruments: list[Instrument] = []

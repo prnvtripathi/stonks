@@ -69,6 +69,48 @@ UV_CACHE_DIR=/private/tmp/stonks-uv-cache uv run mypy pipeline
 Success: no issues found in 17 source files
 ```
 
+## Fix round 2/5
+
+### Finding addressed
+
+Iterable security-master inputs now receive the same deterministic duplicate-symbol
+validation as byte/string inputs. The normalizer validates before constructing its
+symbol map, eliminating last-row-wins behavior.
+
+### RED
+
+The new iterable duplicate regression initially failed:
+
+```text
+UV_CACHE_DIR=/private/tmp/stonks-uv-cache uv run pytest pipeline/tests/normalization/test_nse.py -q
+.......F.                                                                [100%]
+1 failed, 8 passed in 0.11s
+```
+
+### GREEN and final verification
+
+```text
+UV_CACHE_DIR=/private/tmp/stonks-uv-cache uv run pytest pipeline/tests/normalization/test_nse.py -q
+.........                                                                [100%]
+9 passed in 0.11s
+```
+
+```text
+UV_CACHE_DIR=/private/tmp/stonks-uv-cache uv run pytest -q
+..............................................                           [100%]
+46 passed in 0.13s
+```
+
+```text
+UV_CACHE_DIR=/private/tmp/stonks-uv-cache uv run ruff check pipeline/market_pipeline pipeline/tests
+All checks passed!
+```
+
+```text
+UV_CACHE_DIR=/private/tmp/stonks-uv-cache uv run mypy pipeline
+Success: no issues found in 17 source files
+```
+
 ## Self-review and concerns
 
 - The adapter's public fetch is still fail-closed by the existing registry and

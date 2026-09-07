@@ -1,7 +1,12 @@
 from pathlib import Path
 
+import pytest
 from market_pipeline.domain.models import AssetClass
-from market_pipeline.normalization.nse import normalize_nse_rows
+from market_pipeline.normalization.nse import (
+    NseRowError,
+    normalize_nse_rows,
+    parse_nse_security_master,
+)
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "nse" / "mixed_bhavcopy.csv"
 
@@ -85,6 +90,16 @@ def test_empty_required_fields_are_rejected() -> None:
     assert batch.instruments == ()
     assert "date" in batch.rejected_rows[0].reason
     assert "closing" in batch.rejected_rows[0].reason
+
+
+def test_iterable_security_master_duplicate_symbols_fail_schema_validation() -> None:
+    master = parse_nse_security_master(
+        b"SYMBOL,SERIES,NAME OF COMPANY,ISIN NUMBER\nINFY,EQ,Infosys,INE009A01021\n"
+    )
+    bhavcopy = b"SYMBOL,SERIES,CLOSE,TIMESTAMP\nINFY,EQ,1510,07-Sep-2026\n"
+
+    with pytest.raises(NseRowError, match="duplicate"):
+        normalize_nse_rows(bhavcopy, security_master=[master[0], master[0]])
 
 
 def test_mixed_report_dates_are_rejected() -> None:
