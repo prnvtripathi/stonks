@@ -13,12 +13,12 @@ import io
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 from typing import Final
 
-from market_pipeline.domain.models import FetchedArtifact, SourceArtifact
+from market_pipeline.domain.models import FetchedArtifact
 from market_pipeline.sources.base import SourceAdapter
 from market_pipeline.sources.registry import assert_artifact_policy, get_source_policy
 
@@ -317,43 +317,33 @@ class _AmfiNavImplementation:
     adapter_version = "1.0.0"
     policy = get_source_policy("amfi-nav")
 
-    def __init__(self, provider: Callable[[date], bytes | FetchedArtifact] | None) -> None:
+    def __init__(self, provider: Callable[[date], FetchedArtifact] | None) -> None:
         self.provider = provider
 
     def _fetch(self, effective_date: date) -> list[FetchedArtifact]:
         if self.provider is None:
             raise AmfiNavError("AMFI NAV requires an injected official artifact provider")
         supplied = self.provider(effective_date)
-        if isinstance(supplied, FetchedArtifact):
-            artifact = supplied.artifact
-            assert_artifact_policy(
-                source_id=self.source_id,
-                source_url=artifact.source_url,
-                terms_url=artifact.terms_url,
-            )
-            if artifact.effective_date != effective_date:
-                raise AmfiNavError("AMFI artifact effective date does not match requested date")
-            parse_amfi_nav(supplied.body, expected_date=effective_date)
-            return [supplied]
-        body = supplied
-        parse_amfi_nav(body, expected_date=effective_date)
-        artifact = SourceArtifact(
+        if not isinstance(supplied, FetchedArtifact):
+            raise AmfiNavError("AMFI provider must return a provenance-bearing artifact")
+        artifact = supplied.artifact
+        assert_artifact_policy(
             source_id=self.source_id,
-            source_url=self.policy.source_url,
-            retrieved_at=datetime.now(timezone.utc),
-            effective_date=effective_date,
-            checksum=sha256(body).hexdigest(),
-            adapter_version=self.adapter_version,
-            terms_url=self.policy.terms_url,
-            filename=f"amfi-nav-{effective_date.isoformat()}.txt",
+            source_url=artifact.source_url,
+            terms_url=artifact.terms_url,
         )
-        return [FetchedArtifact(artifact=artifact, body=body)]
+        if artifact.effective_date != effective_date:
+            raise AmfiNavError("AMFI artifact effective date does not match requested date")
+        if artifact.checksum.lower() != sha256(supplied.body).hexdigest():
+            raise AmfiNavError("AMFI artifact checksum does not match its body")
+        parse_amfi_nav(supplied.body, expected_date=effective_date)
+        return [supplied]
 
 
 class AmfiNavAdapter(SourceAdapter):
     """Policy-gated AMFI adapter using an injected official download provider."""
 
-    def __init__(self, provider: Callable[[date], bytes | FetchedArtifact] | None = None) -> None:
+    def __init__(self, provider: Callable[[date], FetchedArtifact] | None = None) -> None:
         super().__init__(_AmfiNavImplementation(provider))
 
 

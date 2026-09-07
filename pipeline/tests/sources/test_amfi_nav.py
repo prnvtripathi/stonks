@@ -1,15 +1,39 @@
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
+from market_pipeline.domain.models import FetchedArtifact, SourceArtifact
 from market_pipeline.sources.amfi_nav import (
     AmfiNavAdapter,
     AmfiNavError,
     parse_amfi_nav,
 )
+from market_pipeline.sources.registry import SourcePolicyError
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "amfi" / "nav_all.txt"
+
+
+def _artifact(
+    body: bytes,
+    *,
+    effective_date: date = date(2026, 9, 7),
+    source_url: str = "https://www.amfiindia.com/net-asset-value/nav-download",
+    checksum: str | None = None,
+) -> FetchedArtifact:
+    return FetchedArtifact(
+        artifact=SourceArtifact(
+            source_id="amfi-nav",
+            source_url=source_url,
+            retrieved_at=datetime.now(timezone.utc),
+            effective_date=effective_date,
+            checksum=checksum or sha256(body).hexdigest(),
+            adapter_version="1.0.0",
+            terms_url="https://www.amfiindia.com/terms-and-conditions",
+        ),
+        body=body,
+    )
 
 
 def test_preserves_scheme_identity_and_nav() -> None:
@@ -73,12 +97,44 @@ def test_conflicting_duplicate_codes_fail_deterministically() -> None:
 
 
 def test_adapter_fetch_is_policy_governed_and_preserves_artifact_provenance() -> None:
-    adapter = AmfiNavAdapter(lambda _: FIXTURE.read_bytes())
+    adapter = AmfiNavAdapter(lambda _: _artifact(FIXTURE.read_bytes()))
     result = adapter.fetch(date(2026, 9, 7))
     assert len(result) == 1
     assert result[0].artifact.source_id == "amfi-nav"
     assert result[0].artifact.effective_date == date(2026, 9, 7)
     assert result[0].artifact.source_url.startswith("https://www.amfiindia.com/")
+
+
+def test_adapter_rejects_raw_bytes_without_provenance() -> None:
+    adapter = AmfiNavAdapter(lambda _: FIXTURE.read_bytes())  # type: ignore[arg-type,return-value]
+    with pytest.raises(AmfiNavError, match="provenance"):
+        adapter.fetch(date(2026, 9, 7))
+
+
+def test_adapter_rejects_deceptive_artifact_url() -> None:
+    adapter = AmfiNavAdapter(
+        lambda _: _artifact(FIXTURE.read_bytes(), source_url="https://www.amfiindia.com.evil.test/nav")
+    )
+    with pytest.raises(SourcePolicyError, match="official|canonical|source"):
+        adapter.fetch(date(2026, 9, 7))
+
+
+def test_adapter_rejects_artifact_date_or_checksum_mismatch() -> None:
+    with pytest.raises(AmfiNavError, match="effective date"):
+        AmfiNavAdapter(lambda _: _artifact(FIXTURE.read_bytes(), effective_date=date(2026, 9, 6))).fetch(
+            date(2026, 9, 7)
+        )
+    with pytest.raises(AmfiNavError, match="checksum"):
+        AmfiNavAdapter(lambda _: _artifact(FIXTURE.read_bytes(), checksum="0" * 64)).fetch(
+            date(2026, 9, 7)
+        )
+
+
+@pytest.mark.parametrize("nav", [b"N.A.", b""])
+def test_non_present_nav_is_rejected(nav: bytes) -> None:
+    body = b"Scheme Code;Scheme Name;Net Asset Value;Date\n120503;Fund;" + nav + b";07-Sep-2026\n"
+    with pytest.raises(AmfiNavError, match="NAV"):
+        parse_amfi_nav(body)
 
 
 def test_adapter_without_provider_fails_closed() -> None:

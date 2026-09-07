@@ -253,6 +253,11 @@ def normalize_amfi_schemes(
         _validate_date(correction, effective_date)
         prior = current.get(correction.scheme_code) or latest.get(correction.scheme_code)
         if prior is not None:
+            if correction.nav_date != prior.nav_date:
+                raise ValueError(
+                    f"AMFI correction date {correction.nav_date.isoformat()} does not match "
+                    f"prior record date {prior.nav_date.isoformat()}"
+                )
             correction = correction.model_copy(update={"supersedes_id": prior.record_id})
             superseded.append(prior.record_id)
         current[correction.scheme_code] = correction

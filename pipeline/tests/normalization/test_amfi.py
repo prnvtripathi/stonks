@@ -2,6 +2,7 @@ from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
 from market_pipeline.normalization.amfi import normalize_amfi_schemes
 from market_pipeline.sources.amfi_nav import parse_amfi_nav
 
@@ -44,6 +45,19 @@ def test_correction_supersedes_original_with_lineage() -> None:
     assert batch.active()[0].nav == Decimal("42.9999")
     assert batch.active()[0].supersedes_id == original.record_id
     assert original.record_id in batch.superseded_ids
+
+
+def test_correction_must_have_same_nav_date_as_prior_record() -> None:
+    original = normalize_amfi_schemes(parse_amfi_nav(FIXTURE.read_bytes())).schemes[0]
+    corrected = parse_amfi_nav(
+        b"Scheme Code;Scheme Name;Net Asset Value;Date\n120503;Acme Fund;42.9999;06-Sep-2026\n"
+    )[0]
+    with pytest.raises(ValueError, match="correction.*date|date.*correction"):
+        normalize_amfi_schemes([original], corrections=[corrected])
+    with pytest.raises(ValueError, match="date"):
+        normalize_amfi_schemes(
+            [original], effective_date=date(2026, 9, 6), corrections=[corrected]
+        )
 
 
 def test_absence_requires_configurable_consecutive_files_before_inactive() -> None:
