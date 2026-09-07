@@ -27,3 +27,9 @@ def test_equity_rating_uses_last_price_on_or_before_effective_date() -> None:
     ratings = equity_rs_rating({"A": {"prices": prices}}, effective_date=start + timedelta(days=252))
 
     assert ratings == {"A": 50}
+
+
+def test_equity_rating_accepts_stable_record_sequences() -> None:
+    ratings = equity_rs_rating([("A", Decimal(".1")), ("B", Decimal(".2"))])
+
+    assert ratings == {"A": 1, "B": 99}

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from decimal import ROUND_HALF_EVEN, Decimal
 from typing import Any
 
@@ -37,6 +37,10 @@ def _score(value: Any) -> Decimal | None:
 
 
 def _weighted_from_prices(value: Any, effective_date: Any = None) -> Decimal | None:
+    if isinstance(value, Mapping) and "quarter_returns" in value:
+        quarter_values = [_score(item) for item in value["quarter_returns"]]
+        if len(quarter_values) == 4 and all(item is not None for item in quarter_values):
+            return weighted_rs_score([item for item in quarter_values if item is not None])
     points = coerce_points(value)
     if effective_date is not None:
         end = endpoint_index(points, effective_date)
@@ -58,7 +62,7 @@ def _weighted_from_prices(value: Any, effective_date: Any = None) -> Decimal | N
 
 
 def equity_rs_rating(
-    values: Mapping[str, Any],
+    values: Mapping[str, Any] | Iterable[tuple[str, Any]],
     *,
     asset_classes: Mapping[str, str] | None = None,
     effective_date: Any = None,
@@ -70,7 +74,8 @@ def equity_rs_rating(
     """
 
     scores: list[tuple[str, Decimal]] = []
-    for identifier, raw in values.items():
+    items = values.items() if isinstance(values, Mapping) else values
+    for identifier, raw in items:
         if asset_classes is not None and asset_classes.get(identifier, "equity").lower() != "equity":
             continue
         if isinstance(raw, Mapping) and str(raw.get("asset_class", "equity")).lower() != "equity":
