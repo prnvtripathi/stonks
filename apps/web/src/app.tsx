@@ -28,7 +28,10 @@ function metricFragment(value: string, caret: number): { readonly start: number;
   return { start: safeCaret - match[1].length, end: safeCaret, text: match[1] };
 }
 
-export function App({ api = createApiClient() }: AppProps) {
+export function App({ api }: AppProps) {
+  const defaultApiRef = useRef<DashboardApi | undefined>(undefined);
+  if (!defaultApiRef.current) defaultApiRef.current = createApiClient();
+  const resolvedApi = api ?? defaultApiRef.current;
   const [view, setView] = useState<View>("overview");
   const [status, setStatus] = useState<StatusDto>(fallbackStatus);
   const [metrics, setMetrics] = useState<readonly MetricDefinition[]>(DEFAULT_METRIC_CATALOG);
@@ -47,23 +50,23 @@ export function App({ api = createApiClient() }: AppProps) {
   const loadWorkspace = useCallback(async () => {
     setLoading(true); setLoadError(null);
     try {
-      const [nextStatus, nextMetrics, nextScreens] = await Promise.all([api.getStatus(), api.getMetrics(), api.getScreens()]);
+      const [nextStatus, nextMetrics, nextScreens] = await Promise.all([resolvedApi.getStatus(), resolvedApi.getMetrics(), resolvedApi.getScreens()]);
       setStatus(nextStatus); setMetrics(nextMetrics); setScreens(nextScreens.data);
     } catch {
       setLoadError("Unable to load the research workspace. Check your connection and retry.");
     } finally { setLoading(false); }
-  }, [api]);
+  }, [resolvedApi]);
   useEffect(() => { void loadWorkspace(); }, [loadWorkspace]);
   useEffect(() => {
-    if (!screens.length || !api.getRuns) { setHistoryLoading(false); return; }
+    if (!screens.length || !resolvedApi.getRuns) { setHistoryLoading(false); return; }
     let active = true;
     setHistoryLoading(true);
     setHistoryError(null);
-    Promise.all(screens.map(async (screen) => { const result = await api.getRuns!(screen.id); return [screen.id, result.runs[0]] as const; })).then((entries) => {
+    Promise.all(screens.map(async (screen) => { const result = await resolvedApi.getRuns!(screen.id); return [screen.id, result.runs[0]] as const; })).then((entries) => {
       if (active) setRuns((current) => ({ ...current, ...Object.fromEntries(entries) }));
     }).catch(() => { if (active) setHistoryError("Unable to load one or more screen histories."); }).finally(() => { if (active) setHistoryLoading(false); });
     return () => { active = false; };
-  }, [api, screens]);
+  }, [resolvedApi, screens]);
   useEffect(() => {
     if (!dirty) return;
     const beforeUnload = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ""; };
@@ -76,7 +79,7 @@ export function App({ api = createApiClient() }: AppProps) {
   const confirmLeave = () => { setShowGuard(false); setDirty(false); setView("overview"); };
   const onSaved = (screen: SavedScreen) => { setScreens((current) => [screen, ...current.filter((item) => item.id !== screen.id)]); setEditing(screen); setDirty(false); };
   const onRun = async (screen: SavedScreen) => {
-    try { const run = await api.runScreen(screen.id); setRuns((current) => ({ ...current, [screen.id]: run })); setActionError(null); }
+    try { const run = await resolvedApi.runScreen(screen.id); setRuns((current) => ({ ...current, [screen.id]: run })); setActionError(null); }
     catch { setActionError(`Unable to run ${screen.name}. Your saved screen is unchanged.`); }
   };
 
@@ -94,7 +97,7 @@ export function App({ api = createApiClient() }: AppProps) {
 
     <main id="main-content" tabIndex={-1} aria-hidden={showGuard ? true : undefined}>
       <div className="page-frame">
-        {view === "overview" ? <Overview status={status} screens={screens} runs={runs} loading={loading} historyLoading={historyLoading} loadError={loadError} historyError={historyError} actionError={actionError} onRetry={() => void loadWorkspace()} onNew={() => openEditor("new")} onEdit={(screen) => openEditor("edit", screen)} onDuplicate={(screen) => openEditor("duplicate", screen)} onRun={onRun} /> : <ScreenEditor {...(editing ? { initialScreen: editing } : {})} metrics={metrics} mode={editorMode} api={api} onDirtyChange={setDirty} onSaved={onSaved} onRun={onRun} onBack={openOverview} />}
+        {view === "overview" ? <Overview status={status} screens={screens} runs={runs} loading={loading} historyLoading={historyLoading} loadError={loadError} historyError={historyError} actionError={actionError} onRetry={() => void loadWorkspace()} onNew={() => openEditor("new")} onEdit={(screen) => openEditor("edit", screen)} onDuplicate={(screen) => openEditor("duplicate", screen)} onRun={onRun} /> : <ScreenEditor {...(editing ? { initialScreen: editing } : {})} metrics={metrics} mode={editorMode} api={resolvedApi} onDirtyChange={setDirty} onSaved={onSaved} onRun={onRun} onBack={openOverview} />}
       </div>
     </main>
     <div aria-hidden={showGuard ? true : undefined}><Disclosure effectiveDate={status.effectiveDate} /></div>

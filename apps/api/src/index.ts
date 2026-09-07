@@ -31,11 +31,15 @@ export function createWorker(env: WorkerBindings): Api {
 export default { fetch(request: Request, bindings: Record<string, unknown>): Promise<Response> { return createWorker({ ...readApiEnv(bindings), ...bindings } as WorkerBindings).fetch(request); } };
 
 async function handle(request: Request, env: ApiEnv, store: ResearchStore, now: () => Date, accessVerifier: AccessVerifier): Promise<Response> {
-  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: { Allow: "GET, POST, PUT, OPTIONS" } });
   const origin = request.headers.get("Origin");
   if (origin && origin !== env.allowedOrigin) return error(403, "Origin is not allowed");
   const url = new URL(request.url);
   const path = url.pathname.replace(/\/$/, "");
+  if (request.method === "OPTIONS") {
+    const preflightMethods = allowedMethodsFor(path);
+    if (!preflightMethods) return error(404, "Not found");
+    return new Response(null, { status: 204, headers: { Allow: `${preflightMethods.join(", ")}, OPTIONS` } });
+  }
   try { await accessVerifier(request, env); } catch (cause) { return cause instanceof AccessError ? error(cause.status, cause.message) : error(401, "Unauthenticated"); }
   const allowedMethods = allowedMethodsFor(path);
   if (!allowedMethods) return error(404, "Not found");

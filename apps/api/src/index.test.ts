@@ -46,6 +46,9 @@ describe("private research API", () => {
   it("enforces origin, methods, content type, body size, and schema guards", async () => {
     const api = testApi();
     const auth = { Authorization: `Bearer ${await token()}` };
+    expect((await api.fetch(request("/api/v1/status", { method: "OPTIONS" }))).headers.get("Allow")).toBe("GET, OPTIONS");
+    expect((await api.fetch(request("/api/v1/screens", { method: "OPTIONS" }))).headers.get("Allow")).toBe("GET, POST, OPTIONS");
+    expect((await api.fetch(request("/api/v1/screens/screen-1", { method: "OPTIONS" }))).headers.get("Allow")).toBe("GET, PUT, OPTIONS");
     expect((await api.fetch(request("/api/v1/status", { headers: { ...auth, Origin: "https://evil.example" } }))).status).toBe(403);
     const statusMethod = await api.fetch(request("/api/v1/status", { method: "POST", headers: auth }));
     expect(statusMethod.status).toBe(405);

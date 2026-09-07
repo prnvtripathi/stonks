@@ -104,4 +104,24 @@ describe("dashboard shell", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(/unable to load/i);
     expect(screen.getByRole("button", { name: /retry/i })).toBeVisible();
   });
+
+  it("keeps the default API client stable across state renders", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = new URL(String(input), "https://dashboard.example.com").pathname;
+      if (path.endsWith("/status")) return Response.json(status);
+      if (path.endsWith("/metrics")) return Response.json({ metrics });
+      return Response.json({ data: [], pagination: { limit: 50, offset: 0, total: 0 } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      render(<App />);
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+      const paths = fetchMock.mock.calls.map(([input]) => new URL(String(input), "https://dashboard.example.com").pathname);
+      expect(paths.filter((path) => path.endsWith("/status"))).toHaveLength(1);
+      expect(paths.filter((path) => path.endsWith("/metrics"))).toHaveLength(1);
+      expect(paths.filter((path) => path.endsWith("/screens"))).toHaveLength(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });
