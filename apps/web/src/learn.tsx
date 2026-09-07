@@ -1,15 +1,25 @@
 import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
-import type { GlossaryEntry } from "@stonks/contracts";
+import { DEFAULT_GLOSSARY_ENTRIES, type GlossaryEntry } from "@stonks/contracts";
 
 const formatReviewedAt = (value: string): string => new Intl.DateTimeFormat("en-IN", { day: "2-digit", month: "short", year: "numeric" }).format(new Date(`${value}T00:00:00Z`)).replace("Sept", "Sep");
 const assetLabel = { equity: "NSE equity", etf: "NSE ETF", mutual_fund: "AMFI mutual fund" } as const;
 
-export function LearnView({ entries, initialSlug }: { readonly entries: readonly GlossaryEntry[]; readonly initialSlug?: string | undefined }) {
+export interface LearnGlossaryApi { getGlossary?(): Promise<{ readonly data: readonly GlossaryEntry[] }>; }
+
+export function LearnView({ entries, api, initialSlug }: { readonly entries?: readonly GlossaryEntry[]; readonly api?: LearnGlossaryApi; readonly initialSlug?: string | undefined }) {
   const [query, setQuery] = useState("");
   const [selectedSlug, setSelectedSlug] = useState(initialSlug ?? "");
+  const [remoteEntries, setRemoteEntries] = useState<readonly GlossaryEntry[] | null>(null);
+  useEffect(() => {
+    if (entries || !api?.getGlossary) return undefined;
+    let active = true;
+    api.getGlossary().then((page) => { if (active) setRemoteEntries(page.data); }).catch(() => undefined);
+    return () => { active = false; };
+  }, [api, entries]);
+  const resolvedEntries = entries ?? remoteEntries ?? DEFAULT_GLOSSARY_ENTRIES;
   const normalized = query.trim().toLocaleLowerCase("en-IN");
-  const filtered = useMemo(() => entries.filter((entry) => !normalized || [entry.term, entry.slug, ...entry.aliases, entry.summary].some((field) => field.toLocaleLowerCase("en-IN").includes(normalized))), [entries, normalized]);
-  const selected = entries.find((entry) => entry.slug === selectedSlug);
+  const filtered = useMemo(() => resolvedEntries.filter((entry) => !normalized || [entry.term, entry.slug, ...entry.aliases, entry.summary].some((field) => field.toLocaleLowerCase("en-IN").includes(normalized))), [resolvedEntries, normalized]);
+  const selected = resolvedEntries.find((entry) => entry.slug === selectedSlug);
   return <section className="learn-view" aria-labelledby="learn-title">
     <div className="hero-row"><div><p className="eyebrow">REFERENCE / REVIEWED CONTENT</p><h1 id="learn-title">Learn the language</h1><p className="lede">Short, source-linked explanations for the metrics used in this private research workspace.</p></div></div>
     <div className="learn-search"><label className="field-label" htmlFor="learn-searchbox">Search Learn</label><input id="learn-searchbox" className="text-input" type="search" role="searchbox" aria-label="Search Learn" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search a term or alias" /></div>

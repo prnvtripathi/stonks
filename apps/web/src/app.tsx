@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import type { MetricDefinition, SavedScreen } from "@stonks/contracts";
-import { DEFAULT_GLOSSARY_ENTRIES, DEFAULT_METRIC_CATALOG } from "@stonks/contracts";
+import { DEFAULT_METRIC_CATALOG } from "@stonks/contracts";
 import { parseQuery, typecheckQuery } from "@stonks/query";
 import { createApiClient, type DashboardApi, type ScreenRunSummary, type StatusDto } from "./api";
 import { InstrumentView, ScreenResultsView } from "./research";
@@ -113,7 +113,7 @@ export function App({ api }: AppProps) {
 
     <main id="main-content" tabIndex={-1} aria-hidden={showGuard ? true : undefined}>
       <div className="page-frame">
-        {view === "overview" ? <Overview status={status} screens={screens} runs={runs} loading={loading} historyLoading={historyLoading} loadError={loadError} historyError={historyError} actionError={actionError} onRetry={() => void loadWorkspace()} onNew={() => openEditor("new")} onEdit={(screen) => openEditor("edit", screen)} onDuplicate={(screen) => openEditor("duplicate", screen)} onRun={onRun} onResults={(screen) => navigate(`/screens/${encodeURIComponent(screen.id)}`, "results", screen.id)} /> : view === "editor" ? <ScreenEditor {...(editing ? { initialScreen: editing } : {})} metrics={metrics} mode={editorMode} api={resolvedApi} onDirtyChange={setDirty} onSaved={onSaved} onRun={onRun} onBack={openOverview} /> : view === "results" ? <ScreenResultsView screenId={resolvedScreenId} api={resolvedApi} onBack={openOverview} onOpenInstrument={openInstrument} /> : view === "learn" ? <LearnView entries={DEFAULT_GLOSSARY_ENTRIES} initialSlug={routeId || undefined} /> : <InstrumentView instrumentId={routeId} api={resolvedApi} onBack={backFromInstrument} />}
+        {view === "overview" ? <Overview status={status} screens={screens} runs={runs} loading={loading} historyLoading={historyLoading} loadError={loadError} historyError={historyError} actionError={actionError} onRetry={() => void loadWorkspace()} onNew={() => openEditor("new")} onEdit={(screen) => openEditor("edit", screen)} onDuplicate={(screen) => openEditor("duplicate", screen)} onRun={onRun} onResults={(screen) => navigate(`/screens/${encodeURIComponent(screen.id)}`, "results", screen.id)} /> : view === "editor" ? <ScreenEditor {...(editing ? { initialScreen: editing } : {})} metrics={metrics} mode={editorMode} api={resolvedApi} onDirtyChange={setDirty} onSaved={onSaved} onRun={onRun} onBack={openOverview} /> : view === "results" ? <ScreenResultsView screenId={resolvedScreenId} api={resolvedApi} onBack={openOverview} onOpenInstrument={openInstrument} /> : view === "learn" ? <LearnView api={resolvedApi} initialSlug={routeId || undefined} /> : <InstrumentView instrumentId={routeId} api={resolvedApi} onBack={backFromInstrument} />}
       </div>
     </main>
     <div aria-hidden={showGuard ? true : undefined}><Disclosure effectiveDate={status.effectiveDate} /></div>

@@ -91,11 +91,11 @@ export function validateGlossaryEntries(values: readonly unknown[]): readonly Gl
   const entries = values.map(parseGlossaryEntry);
   const slugs = new Set<string>(); const terms = new Set<string>(); const aliases = new Set<string>();
   for (const entry of entries) {
-    const slug = entry.slug.toLocaleLowerCase("en-US"); const term = entry.term.toLocaleLowerCase("en-US");
+    const slug = entry.slug.toLocaleLowerCase("en-IN"); const term = entry.term.toLocaleLowerCase("en-IN");
     if (slugs.has(slug)) throw new Error(`Duplicate glossary slug: ${entry.slug}`);
     if (terms.has(term)) throw new Error(`Duplicate glossary term: ${entry.term}`);
     slugs.add(slug); terms.add(term);
-    for (const alias of entry.aliases) { const normalized = alias.toLocaleLowerCase("en-US"); if (aliases.has(normalized)) throw new Error(`Duplicate glossary alias: ${alias}`); aliases.add(normalized); }
+    for (const alias of entry.aliases) { const normalized = alias.toLocaleLowerCase("en-IN"); if (aliases.has(normalized)) throw new Error(`Duplicate glossary alias: ${alias}`); aliases.add(normalized); }
   }
   return entries;
 }

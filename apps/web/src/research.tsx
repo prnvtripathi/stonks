@@ -7,7 +7,7 @@ const assetLabel: Record<AssetClass, string> = { equity: "NSE equity", etf: "NSE
 const percentMetrics = new Set(["return_1d", "return_1w", "return_1m", "return_3m", "return_6m", "return_12m", "volatility_1y", "max_drawdown_1y", "benchmark_rs_3m", "benchmark_rs_6m", "benchmark_rs_12m"]);
 const unitForMetric = (metric: string): string | undefined => percentMetrics.has(metric) ? "percent" : undefined;
 const glossaryForMetric = (metric: string) => {
-  const slug = metric.startsWith("return_") ? "return" : metric === "volume" ? "volume" : metric === "volume_1w_avg" ? "average-volume" : metric === "market_cap" ? "market-cap" : metric === "rs_rating" ? "relative-strength-rating" : metric === "volatility_1y" ? "volatility" : metric === "max_drawdown_1y" ? "drawdown" : undefined;
+  const slug = metric.startsWith("return_") ? "return" : metric === "volume" ? "volume" : metric === "volume_1w_avg" ? "average-volume" : metric === "market_cap" ? "market-cap" : metric === "rs_rating" ? "relative-strength-rating" : metric === "volatility_1y" ? "volatility" : metric === "max_drawdown_1y" ? "drawdown" : metric === "benchmark_rs_3m" || metric === "benchmark_rs_6m" || metric === "benchmark_rs_12m" ? "relative-strength-benchmark" : undefined;
   return slug ? DEFAULT_GLOSSARY_ENTRIES.find((entry) => entry.slug === slug) : undefined;
 };
 function MetricTerm({ metric, children }: { readonly metric: string; readonly children: ReactNode }) { const entry = glossaryForMetric(metric); return entry ? <TermPopover entry={entry}>{children}</TermPopover> : children; }

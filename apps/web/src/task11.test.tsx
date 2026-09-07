@@ -92,6 +92,14 @@ describe("Task 11 research views", () => {
     expect(screen.getByText("24.5%")) .toBeVisible();
   });
 
+  it("wires benchmark RS metrics to the relative-strength-benchmark glossary entry", () => {
+    render(<InstrumentResearch instrument={{ ...equity, metricRows: [...equity.metricRows!, { metric: "benchmark_rs_3m", value: 4.2, state: "present", effectiveDate: "2026-09-04" }] }} />);
+    const [trigger] = screen.getAllByRole("button", { name: /learn about relative strength versus benchmark/i });
+    fireEvent.click(trigger!);
+    const dialog = screen.getByRole("dialog", { name: /relative strength versus benchmark/i });
+    expect(within(dialog).getByText(/compares an asset’s return with a chosen benchmark/i)).toBeVisible();
+  });
+
   it("sends server sort and pagination parameters", async () => {
     const fetcher = vi.fn(async (_input: RequestInfo | URL) => Response.json({ screen: {}, run: { matches: [] }, pagination: { limit: 25, offset: 25, total: 30 } }));
     const api = createApiClient({ baseUrl: "https://dashboard.example", fetcher });
