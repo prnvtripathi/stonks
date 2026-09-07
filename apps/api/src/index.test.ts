@@ -16,6 +16,10 @@ async function token(email = "owner@example.com", overrides: Partial<{ exp: numb
 
 const testApi = () => createApi({ env, store: new MemoryResearchStore(), accessVerifier: createTestAccessVerifier("test-secret"), testAccessSecret: "test-secret" });
 
+function fakeRows<T extends Record<string, unknown>>(rows: readonly Record<string, unknown>[]): readonly T[] {
+  return rows as unknown as readonly T[];
+}
+
 function request(path: string, init: RequestInit = {}): Request {
   return new Request(`https://dashboard.example.com${path}`, init);
 }
@@ -129,9 +133,9 @@ describe("private research API", () => {
       bind(..._values: unknown[]): D1Statement { return this; }
       async first<T extends Record<string, unknown> = Record<string, unknown>>(): Promise<T | null> { return null; }
       async all<T extends Record<string, unknown> = Record<string, unknown>>(): Promise<{ results: readonly T[] }> {
-        if (this.sql.includes("SELECT screen_id")) return { results: [{ screen_id: "screen-1", name: "x", expression: "Volume > 1", created_at: "2026-01-01", updated_at: "2026-01-01" }] as T[] };
+        if (this.sql.includes("SELECT screen_id")) return { results: fakeRows<T>([{ screen_id: "screen-1", name: "x", expression: "Volume > 1", created_at: "2026-01-01", updated_at: "2026-01-01" }]) };
         if (this.sql.includes("SELECT run_id")) return { results: [] };
-        if (this.sql.includes("SELECT i.instrument_id")) return { results: [{ instrument_id: "one", score: 1 }, { instrument_id: "two", score: 2 }] as T[] };
+        if (this.sql.includes("SELECT i.instrument_id")) return { results: fakeRows<T>([{ instrument_id: "one", score: 1 }, { instrument_id: "two", score: 2 }]) };
         return { results: [] };
       }
       async run(): Promise<D1Result> { statements.push(this.sql); return { success: this.sql.includes("screen_matches") ? false : true }; }
