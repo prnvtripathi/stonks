@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
@@ -27,6 +27,71 @@ MF_WEIGHTS = {
     "inverse_volatility": Decimal("0.075"),
     "inverse_max_drawdown": Decimal("0.075"),
 }
+_ALIASES = {
+    "weighted_12m_rs_percentile": ("weighted_12m_rs_percentile", "weighted_12m_rs", "rs_percentile"),
+    "six_month_performance": ("six_month_performance", "six_month_return", "return_6m"),
+    "three_month_performance": ("three_month_performance", "three_month_return", "return_3m"),
+    "trend_strength": ("trend_strength", "trend", "ma_trend"),
+    "proximity_to_52_week_high": ("proximity_to_52_week_high", "high_proximity", "52_week_high_proximity"),
+    "volume_confirmation": ("volume_confirmation", "volume", "volume_ratio"),
+    "three_month_return": ("three_month_return", "three_month_performance", "return_3m"),
+    "six_month_return": ("six_month_return", "six_month_performance", "return_6m"),
+    "twelve_month_return": ("twelve_month_return", "twelve_month_performance", "return_12m"),
+    "category_rank": ("category_rank", "category_relative_rank", "category_percentile"),
+    "inverse_volatility": ("inverse_volatility",),
+    "inverse_max_drawdown": ("inverse_max_drawdown",),
+}
+
+
+def _asset_class(value: Any) -> str:
+    name = value.value if hasattr(value, "value") else str(value)
+    normalized = name.lower().replace("-", "_")
+    if normalized not in {"equity", "etf", "mutual_fund"}:
+        raise ValueError(f"unsupported asset class: {name}")
+    return normalized
+
+
+@dataclass(frozen=True)
+class NormalizedMomentumInput:
+    """Validated unit-interval components used by the composite calculator."""
+
+    components: Mapping[str, Decimal]
+    asset_class: str
+    category: str | None = None
+
+    def __post_init__(self) -> None:
+        _asset_class(self.asset_class)
+        for key, value in self.components.items():
+            if value < Decimal(0) or value > Decimal(1):
+                raise ValueError(f"normalized component {key} must be in 0..1")
+
+    @classmethod
+    def from_mapping(
+        cls,
+        components: Mapping[str, Any],
+        *,
+        asset_class: Any = "equity",
+        category: str | None = None,
+    ) -> NormalizedMomentumInput:
+        normalized_asset_class = _asset_class(asset_class)
+        weights = MF_WEIGHTS if normalized_asset_class == "mutual_fund" else EQUITY_WEIGHTS
+        converted: dict[str, Decimal] = {}
+        for key in weights:
+            if key not in components:
+                continue
+            value = as_decimal(components[key])
+            if value is None or value < Decimal(0) or value > Decimal(1):
+                raise ValueError(f"normalized component {key} must be in 0..1")
+            converted[key] = value
+        return cls(converted, normalized_asset_class, category)
+
+    @property
+    def cohort(self) -> str:
+        if self.asset_class == "mutual_fund":
+            if self.category is None:
+                raise ValueError("mutual-fund normalized input requires an explicit category")
+            return f"mutual_fund:{self.category}"
+        return self.asset_class
 
 
 @dataclass(frozen=True)
@@ -45,90 +110,134 @@ class MomentumScore:
 
 
 def _decimal_components(values: Mapping[str, Any]) -> dict[str, Decimal]:
-    result: dict[str, Decimal] = {}
-    for key, value in values.items():
-        decimal_value = as_decimal(value)
-        if decimal_value is not None:
-            result[key] = decimal_value
-    return result
-
-
-def _normalise(value: Decimal) -> Decimal:
-    # Direct callers commonly provide percentages (0..100), while pipeline
-    # callers may already provide unit values. Support both representations.
-    result = value / Decimal(100) if value > 1 or value < -1 else value
-    return max(Decimal(0), min(Decimal(1), result))
+    return {
+        key: decimal_value
+        for key, value in values.items()
+        if (decimal_value := as_decimal(value)) is not None
+    }
 
 
 def _lookup(raw: Mapping[str, Decimal], key: str) -> Decimal | None:
-    aliases = {
-        "weighted_12m_rs_percentile": ("weighted_12m_rs_percentile", "weighted_12m_rs", "rs_percentile"),
-        "six_month_performance": ("six_month_performance", "six_month_return", "return_6m"),
-        "three_month_performance": ("three_month_performance", "three_month_return", "return_3m"),
-        "trend_strength": ("trend_strength", "trend", "ma_trend"),
-        "proximity_to_52_week_high": ("proximity_to_52_week_high", "high_proximity", "52_week_high_proximity"),
-        "volume_confirmation": ("volume_confirmation", "volume", "volume_ratio"),
-        "three_month_return": ("three_month_return", "three_month_performance", "return_3m"),
-        "six_month_return": ("six_month_return", "six_month_performance", "return_6m"),
-        "twelve_month_return": ("twelve_month_return", "twelve_month_performance", "return_12m"),
-        "category_rank": ("category_rank", "category_relative_rank", "category_percentile"),
-        "inverse_volatility": ("inverse_volatility",),
-        "inverse_max_drawdown": ("inverse_max_drawdown",),
-    }
-    for alias in aliases[key]:
+    for alias in _ALIASES[key]:
         if alias in raw:
             return raw[alias]
     if key == "inverse_volatility" and "volatility" in raw:
-        return Decimal(1) - _normalise(raw["volatility"])
+        return -raw["volatility"]
     if key == "inverse_max_drawdown" and "max_drawdown" in raw:
-        return Decimal(1) - _normalise(abs(raw["max_drawdown"]))
+        return -abs(raw["max_drawdown"])
     return None
 
 
-def momentum_score(
-    components: Mapping[str, Any],
-    *,
-    asset_class: str = "equity",
-    category: str | None = None,
-    effective_date: date | str | None = None,
-    cohort: str | None = None,
-) -> MomentumScore:
-    """Calculate a fully covered equity/ETF or mutual-fund momentum score."""
+def _percentile(values: list[Decimal], *, higher_is_better: bool) -> list[Decimal]:
+    indexed = list(enumerate(values))
+    if higher_is_better:
+        indexed.sort(key=lambda item: (-item[1], item[0]))
+    else:
+        indexed.sort(key=lambda item: (item[1], item[0]))
+    count = len(values)
+    if count == 1:
+        ranks = [Decimal("0.5")]
+    elif higher_is_better:
+        ranks = [Decimal(1) - Decimal(index) / Decimal(count - 1) for index in range(count)]
+    else:
+        ranks = [Decimal(index) / Decimal(count - 1) for index in range(count)]
+    output = [Decimal(0)] * count
+    for position, (original, _) in enumerate(indexed):
+        output[original] = ranks[position]
+    return output
 
-    normalized_asset_class = asset_class.value if hasattr(asset_class, "value") else str(asset_class)
-    normalized_asset_class = normalized_asset_class.lower()
-    is_mf = normalized_asset_class in {"mutual_fund", "mutual-fund", "mf"}
-    weights = MF_WEIGHTS if is_mf else EQUITY_WEIGHTS
-    raw = _decimal_components(components)
-    selected: dict[str, Decimal] = {}
-    for key in weights:
-        value = _lookup(raw, key)
-        if value is not None:
-            selected[key] = value
-    emitted_raw: dict[str, Decimal | None] = {key: selected.get(key) for key in weights}
-    normalized: dict[str, Decimal | None] = {
-        key: (_normalise(value) if value is not None else None)
-        for key, value in emitted_raw.items()
-    }
-    required = len(weights)
-    coverage = Decimal(len(selected)) / Decimal(required)
-    complete = len(selected) == required
-    if is_mf and ("twelve_month_return" not in selected or category is None):
+
+def _record_parts(record: Mapping[str, Any]) -> tuple[str, str, str | None, Mapping[str, Any], date | None, bool]:
+    identifier_raw = record.get("identifier", record.get("instrument_id", record.get("id", record.get("symbol"))))
+    if identifier_raw is None:
+        raise ValueError("momentum record requires an identifier")
+    asset_class = _asset_class(record.get("asset_class", "equity"))
+    category = record.get("category")
+    if category is not None:
+        category = str(category)
+    component_values = record.get("components", record)
+    if not isinstance(component_values, Mapping):
+        raise ValueError("momentum record components must be a mapping")
+    effective_raw = record.get("effective_date", record.get("date"))
+    effective = as_date(effective_raw) if effective_raw is not None else None
+    complete_history = bool(record.get("history_complete", record.get("has_12_month_history", True)))
+    return str(identifier_raw), asset_class, category, component_values, effective, complete_history
+
+
+def momentum_score(
+    normalized: NormalizedMomentumInput,
+    *,
+    effective_date: date | str | None = None,
+) -> MomentumScore:
+    """Compute a composite from validated, cohort-normalized components."""
+
+    weights = MF_WEIGHTS if normalized.asset_class == "mutual_fund" else EQUITY_WEIGHTS
+    raw_components: dict[str, Decimal | None] = {key: normalized.components.get(key) for key in weights}
+    coverage = Decimal(len(normalized.components)) / Decimal(len(weights))
+    complete = len(normalized.components) == len(weights)
+    if normalized.asset_class == "mutual_fund" and (
+        normalized.category is None or "twelve_month_return" not in normalized.components
+    ):
         complete = False
-    score: Decimal | None = None
+    total = Decimal(0)
     if complete:
-        total = Decimal(0)
         for key, weight in weights.items():
-            value = normalized[key]
-            if value is not None:
-                total += value * weight
-        score = total
-    result_cohort = cohort or (f"mutual_fund:{category}" if is_mf else normalized_asset_class)
+            total += normalized.components[key] * weight
     return MomentumScore(
-        score=score,
-        raw_components=emitted_raw,
-        normalized_components=normalized,
-        cohort=result_cohort,
-        effective_date=as_date(effective_date) if effective_date is not None else None,
-        coverage=coverage,
+        total if complete else None,
+        raw_components,
+        dict(raw_components),
+        normalized.cohort,
+        as_date(effective_date) if effective_date is not None else None,
+        coverage,
     )
+
+
+def momentum_scores(records: Iterable[Mapping[str, Any]]) -> dict[str, MomentumScore]:
+    """Normalize raw records inside separate typed cohorts and calculate scores."""
+
+    parsed = [_record_parts(record) for record in records]
+    groups: dict[tuple[str, str | None], list[tuple[int, tuple[str, str, str | None, Mapping[str, Any], date | None, bool], dict[str, Decimal]]]] = {}
+    for index, item in enumerate(parsed):
+        _, asset_class, category, components, _, _ = item
+        raw = _decimal_components(components)
+        weights = MF_WEIGHTS if asset_class == "mutual_fund" else EQUITY_WEIGHTS
+        canonical = {
+            key: value for key in weights if (value := _lookup(raw, key)) is not None
+        }
+        group = (asset_class, category if asset_class == "mutual_fund" else None)
+        groups.setdefault(group, []).append((index, item, canonical))
+
+    results: dict[str, MomentumScore] = {}
+    for (asset_class, category), members in groups.items():
+        weights = MF_WEIGHTS if asset_class == "mutual_fund" else EQUITY_WEIGHTS
+        normalized_by_index: dict[int, dict[str, Decimal | None]] = {
+            index: {key: None for key in weights} for index, _, _ in members
+        }
+        for key in weights:
+            available = [(index, canonical[key]) for index, _, canonical in members if key in canonical]
+            values = [value for _, value in available]
+            normalized_values = _percentile(values, higher_is_better=key != "category_rank") if values else []
+            for (index, _), normalized_value in zip(available, normalized_values):
+                normalized_by_index[index][key] = normalized_value
+        cohort = f"mutual_fund:{category}" if asset_class == "mutual_fund" and category is not None else asset_class
+        for index, item, canonical in members:
+            identifier, _, _, _, effective, complete_history = item
+            normalized_input = NormalizedMomentumInput(
+                {key: value for key, value in normalized_by_index[index].items() if value is not None},
+                asset_class,
+                category,
+            )
+            composite = momentum_score(normalized_input, effective_date=effective)
+            insufficient = not complete_history or (
+                asset_class == "mutual_fund" and "twelve_month_return" not in canonical
+            )
+            results[identifier] = MomentumScore(
+                None if insufficient else composite.score,
+                {key: canonical.get(key) for key in weights},
+                normalized_by_index[index],
+                cohort,
+                effective,
+                composite.coverage,
+            )
+    return results
