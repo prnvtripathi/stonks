@@ -1,4 +1,4 @@
-import type { AssetClass, MetricDefinition, MetricState, SavedScreen, ScreenRun } from "@stonks/contracts";
+import type { AssetClass, GlossaryEntry, MetricDefinition, MetricState, SavedScreen, ScreenRun } from "@stonks/contracts";
 
 export interface StatusSource {
   readonly sourceId: string;
@@ -115,6 +115,8 @@ export interface DashboardApi {
   createScreen(input: { readonly name: string; readonly source: string }): Promise<SavedScreen>;
   updateScreen?(screenId: string, input: { readonly name: string; readonly source: string }): Promise<SavedScreen>;
   runScreen(screenId: string): Promise<ScreenRun & { readonly matches?: readonly ResultMatchDto[] }>;
+  getGlossary?(): Promise<Page<GlossaryEntry>>;
+  getGlossaryEntry?(slug: string): Promise<GlossaryEntry>;
 }
 
 export interface ScreenRunSummary extends ScreenRun {
@@ -153,5 +155,7 @@ export function createApiClient(options: ApiClientOptions = {}): DashboardApi {
     createScreen: (input) => request<SavedScreen>("/api/v1/screens", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) }),
     updateScreen: (screenId, input) => request<SavedScreen>(`/api/v1/screens/${encodeURIComponent(screenId)}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) }),
     runScreen: (screenId) => request<ScreenRun & { readonly matches?: readonly ResultMatchDto[] }>(`/api/v1/screens/${encodeURIComponent(screenId)}/runs`, { method: "POST", headers: { "Content-Type": "application/json" } }),
+    getGlossary: () => request<Page<GlossaryEntry>>("/api/v1/glossary"),
+    getGlossaryEntry: (slug) => request<GlossaryEntry>(`/api/v1/glossary/${encodeURIComponent(slug)}`),
   };
 }

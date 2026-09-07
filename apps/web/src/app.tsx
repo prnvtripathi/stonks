@@ -1,15 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import type { MetricDefinition, SavedScreen } from "@stonks/contracts";
-import { DEFAULT_METRIC_CATALOG } from "@stonks/contracts";
+import { DEFAULT_GLOSSARY_ENTRIES, DEFAULT_METRIC_CATALOG } from "@stonks/contracts";
 import { parseQuery, typecheckQuery } from "@stonks/query";
 import { createApiClient, type DashboardApi, type ScreenRunSummary, type StatusDto } from "./api";
 import { InstrumentView, ScreenResultsView } from "./research";
+import { LearnView } from "./learn";
 import "./styles.css";
 
 export type { DashboardApi } from "./api";
 
 interface AppProps { readonly api?: DashboardApi; }
-type View = "overview" | "editor" | "results" | "instrument";
+type View = "overview" | "editor" | "results" | "instrument" | "learn";
 type EditorMode = "new" | "edit" | "duplicate";
 
 const fallbackStatus: StatusDto = { effectiveDate: null, datasetId: null, sources: [] };
@@ -35,7 +36,7 @@ export function App({ api }: AppProps) {
   const resolvedApi = api ?? defaultApiRef.current;
   const initialPath = typeof window === "undefined" ? "/" : window.location.pathname;
   const initialParts = initialPath.split("/").filter(Boolean);
-  const [view, setView] = useState<View>(initialParts[0] === "instruments" ? "instrument" : initialParts[0] === "screens" ? (initialParts[1] === "new" || initialParts[2] === "edit" ? "editor" : "results") : "overview");
+  const [view, setView] = useState<View>(initialParts[0] === "instruments" ? "instrument" : initialParts[0] === "screens" ? (initialParts[1] === "new" || initialParts[2] === "edit" ? "editor" : "results") : initialParts[0] === "learn" ? "learn" : "overview");
   const [routeId, setRouteId] = useState(initialParts[1] ?? "");
   const [originScreenId, setOriginScreenId] = useState(() => typeof window === "undefined" ? "" : new URLSearchParams(window.location.search).get("fromScreen") ?? "");
   const [status, setStatus] = useState<StatusDto>(fallbackStatus);
@@ -85,7 +86,7 @@ export function App({ api }: AppProps) {
   }, [dirty]);
 
   const navigate = useCallback((path: string, nextView: View, id = "") => { window.history.pushState({}, "", path); setView(nextView); setRouteId(id); }, []);
-  useEffect(() => { const onPopState = () => { const parts = window.location.pathname.split("/").filter(Boolean); setRouteId(parts[1] ?? ""); setOriginScreenId(new URLSearchParams(window.location.search).get("fromScreen") ?? ""); setView(parts[0] === "instruments" ? "instrument" : parts[0] === "screens" && parts[1] && parts[1] !== "new" && parts[2] !== "edit" ? "results" : parts[0] === "screens" ? "editor" : "overview"); }; window.addEventListener("popstate", onPopState); return () => window.removeEventListener("popstate", onPopState); }, []);
+  useEffect(() => { const onPopState = () => { const parts = window.location.pathname.split("/").filter(Boolean); setRouteId(parts[1] ?? ""); setOriginScreenId(new URLSearchParams(window.location.search).get("fromScreen") ?? ""); setView(parts[0] === "instruments" ? "instrument" : parts[0] === "screens" && parts[1] && parts[1] !== "new" && parts[2] !== "edit" ? "results" : parts[0] === "screens" ? "editor" : parts[0] === "learn" ? "learn" : "overview"); }; window.addEventListener("popstate", onPopState); return () => window.removeEventListener("popstate", onPopState); }, []);
   const openOverview = () => { if (dirty) setShowGuard(true); else navigate("/", "overview"); };
   const openEditor = (mode: EditorMode, screen?: SavedScreen) => { setEditorMode(mode); setEditing(screen); setDirty(false); navigate(screen && mode === "edit" ? `/screens/${encodeURIComponent(screen.id)}/edit` : "/screens/new", "editor", screen?.id ?? ""); };
   const confirmLeave = () => { setShowGuard(false); setDirty(false); navigate("/", "overview"); };
@@ -105,14 +106,14 @@ export function App({ api }: AppProps) {
       <nav aria-label="Primary navigation" className="primary-nav">
         <button className={view === "overview" ? "nav-link active" : "nav-link"} onClick={openOverview}>Overview</button>
         <button className={view === "editor" || view === "results" ? "nav-link active" : "nav-link"} onClick={() => openEditor("new")}>Screens</button>
-        <button className="nav-link" type="button" disabled aria-disabled="true" title="Glossary content is coming soon">Learn</button>
+        <button className={view === "learn" ? "nav-link active" : "nav-link"} type="button" onClick={() => navigate("/learn", "learn")}>Learn</button>
       </nav>
       <div className="private-badge"><span className="status-dot" aria-hidden="true" />Private workspace</div>
     </header>
 
     <main id="main-content" tabIndex={-1} aria-hidden={showGuard ? true : undefined}>
       <div className="page-frame">
-        {view === "overview" ? <Overview status={status} screens={screens} runs={runs} loading={loading} historyLoading={historyLoading} loadError={loadError} historyError={historyError} actionError={actionError} onRetry={() => void loadWorkspace()} onNew={() => openEditor("new")} onEdit={(screen) => openEditor("edit", screen)} onDuplicate={(screen) => openEditor("duplicate", screen)} onRun={onRun} onResults={(screen) => navigate(`/screens/${encodeURIComponent(screen.id)}`, "results", screen.id)} /> : view === "editor" ? <ScreenEditor {...(editing ? { initialScreen: editing } : {})} metrics={metrics} mode={editorMode} api={resolvedApi} onDirtyChange={setDirty} onSaved={onSaved} onRun={onRun} onBack={openOverview} /> : view === "results" ? <ScreenResultsView screenId={resolvedScreenId} api={resolvedApi} onBack={openOverview} onOpenInstrument={openInstrument} /> : <InstrumentView instrumentId={routeId} api={resolvedApi} onBack={backFromInstrument} />}
+        {view === "overview" ? <Overview status={status} screens={screens} runs={runs} loading={loading} historyLoading={historyLoading} loadError={loadError} historyError={historyError} actionError={actionError} onRetry={() => void loadWorkspace()} onNew={() => openEditor("new")} onEdit={(screen) => openEditor("edit", screen)} onDuplicate={(screen) => openEditor("duplicate", screen)} onRun={onRun} onResults={(screen) => navigate(`/screens/${encodeURIComponent(screen.id)}`, "results", screen.id)} /> : view === "editor" ? <ScreenEditor {...(editing ? { initialScreen: editing } : {})} metrics={metrics} mode={editorMode} api={resolvedApi} onDirtyChange={setDirty} onSaved={onSaved} onRun={onRun} onBack={openOverview} /> : view === "results" ? <ScreenResultsView screenId={resolvedScreenId} api={resolvedApi} onBack={openOverview} onOpenInstrument={openInstrument} /> : view === "learn" ? <LearnView entries={DEFAULT_GLOSSARY_ENTRIES} initialSlug={routeId || undefined} /> : <InstrumentView instrumentId={routeId} api={resolvedApi} onBack={backFromInstrument} />}
       </div>
     </main>
     <div aria-hidden={showGuard ? true : undefined}><Disclosure effectiveDate={status.effectiveDate} /></div>

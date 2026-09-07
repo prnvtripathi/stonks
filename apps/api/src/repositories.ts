@@ -1,4 +1,4 @@
-import { DEFAULT_METRIC_CATALOG, type AssetClass, type MetricDefinition, type SavedScreen, type ScreenMatch, type ScreenRun } from "@stonks/contracts";
+import { DEFAULT_GLOSSARY_ENTRIES, DEFAULT_METRIC_CATALOG, type AssetClass, type GlossaryEntry, type MetricDefinition, type SavedScreen, type ScreenMatch, type ScreenRun } from "@stonks/contracts";
 import { compileQuery, evaluateQuery, parseQuery, printAst, type Expression, type QueryAst, typecheckQuery } from "@stonks/query";
 
 export interface MetricRow { readonly metric: string; readonly value: number | null; readonly state: "present" | "missing" | "not_applicable"; readonly effectiveDate?: string | null; readonly stale?: boolean; readonly rawValue?: string | null; readonly normalizedValue?: number | null; readonly formulaVersion?: string | null; readonly sourceArtifactId?: string | null; readonly metadata?: Readonly<Record<string, unknown>>; }
@@ -28,6 +28,8 @@ export interface ResearchStore {
   runScreen(datasetId: string, screen: SavedScreen, effectiveDate: string): Promise<RunDetail>;
   instrument(datasetId: string, instrumentId: string): Promise<InstrumentRow | null>;
   chart(datasetId: string, instrumentId: string): Promise<ChartObject | null>;
+  listGlossary(): Promise<readonly GlossaryEntry[]>;
+  glossary(slug: string): Promise<GlossaryEntry | null>;
 }
 
 export class MemoryResearchStore implements ResearchStore {
@@ -76,6 +78,8 @@ export class MemoryResearchStore implements ResearchStore {
   }
   public async instrument(_datasetId: string, instrumentId: string): Promise<InstrumentRow | null> { const instrument = this.instruments.get(instrumentId); return instrument ? { ...instrument, momentum: instrument.momentum ?? buildMomentum(instrument) } : null; }
   public async chart(_datasetId: string, instrumentId: string): Promise<ChartObject | null> { return this.charts.get(instrumentId) ?? null; }
+  public async listGlossary(): Promise<readonly GlossaryEntry[]> { return DEFAULT_GLOSSARY_ENTRIES; }
+  public async glossary(slug: string): Promise<GlossaryEntry | null> { return DEFAULT_GLOSSARY_ENTRIES.find((entry) => entry.slug === slug) ?? null; }
 }
 
 export interface D1Result { readonly results?: readonly Record<string, unknown>[]; readonly success?: boolean; readonly meta?: Record<string, unknown>; }
@@ -134,6 +138,8 @@ export class D1ResearchStore implements ResearchStore {
   }
   public async instrument(datasetId: string, instrumentId: string): Promise<InstrumentRow | null> { const row = await this.db.prepare("SELECT instrument_id, symbol, name, asset_class, active, metadata_json FROM instruments WHERE dataset_id = ? AND instrument_id = ?").bind(datasetId, instrumentId).first<Record<string, unknown>>(); if (!row) return null; const dataset = await this.db.prepare("SELECT effective_date FROM datasets WHERE dataset_id = ?").bind(datasetId).first<{ effective_date: string | null }>(); const metrics = await this.db.prepare("SELECT metric, value, state, effective_date, raw_value, normalized_value, formula_version, source_artifact_id, metadata_json FROM latest_metrics WHERE dataset_id = ? AND instrument_id = ? ORDER BY metric").bind(datasetId, instrumentId).all<{ metric: string; value: number | null; state: MetricRow["state"]; effective_date: string | null; raw_value?: string | null; normalized_value?: number | null; formula_version?: string | null; source_artifact_id?: string | null; metadata_json?: string | null }>(); const periods = await this.db.prepare("SELECT period_id, period_end, period_type, filing_id, filed_at, metrics_json, source_artifact_id FROM fundamental_periods WHERE dataset_id = ? AND instrument_id = ? ORDER BY period_end DESC, period_id DESC").bind(datasetId, instrumentId).all<Record<string, unknown>>(); const actions = await this.db.prepare("SELECT action_id, action_date, action_type, numerator, denominator, metadata_json, source_artifact_id FROM corporate_actions WHERE dataset_id = ? AND instrument_id = ? ORDER BY action_date DESC, action_id DESC").bind(datasetId, instrumentId).all<Record<string, unknown>>(); const instrument: InstrumentRow = { instrumentId: String(row.instrument_id), symbol: row.symbol == null ? null : String(row.symbol), name: row.name == null ? null : String(row.name), assetClass: String(row.asset_class) as AssetClass, active: Boolean(row.active), metadata: parseMetadata(row.metadata_json) as Record<string, string | number | null>, metricRows: metrics.results.map((metric) => ({ metric: metric.metric, value: metric.value, state: metric.state, effectiveDate: metric.effective_date, stale: Boolean(dataset?.effective_date && metric.effective_date && metric.effective_date < dataset.effective_date), rawValue: metric.raw_value ?? null, normalizedValue: metric.normalized_value ?? null, formulaVersion: metric.formula_version ?? null, sourceArtifactId: metric.source_artifact_id ?? null, metadata: parseMetadata(metric.metadata_json) })), fundamentalPeriods: periods.results.map((period) => ({ periodId: String(period.period_id), periodEnd: String(period.period_end), periodType: String(period.period_type), filingId: String(period.filing_id), filedAt: String(period.filed_at), metrics: parseMetadata(period.metrics_json), sourceArtifactId: period.source_artifact_id == null ? null : String(period.source_artifact_id) })), corporateActions: actions.results.map((action) => ({ actionId: String(action.action_id), actionDate: String(action.action_date), actionType: String(action.action_type), numerator: action.numerator == null ? null : Number(action.numerator), denominator: action.denominator == null ? null : Number(action.denominator), metadata: parseMetadata(action.metadata_json), sourceArtifactId: action.source_artifact_id == null ? null : String(action.source_artifact_id) })) }; return { ...instrument, momentum: buildMomentum(instrument) }; }
   public async chart(datasetId: string, instrumentId: string): Promise<ChartObject | null> { return this.chartStore ? this.chartStore.get(`charts/${datasetId}/${instrumentId}.json.gz`) : null; }
+  public async listGlossary(): Promise<readonly GlossaryEntry[]> { return DEFAULT_GLOSSARY_ENTRIES; }
+  public async glossary(slug: string): Promise<GlossaryEntry | null> { return DEFAULT_GLOSSARY_ENTRIES.find((entry) => entry.slug === slug) ?? null; }
   private screen(row: Record<string, unknown>): SavedScreen { return { id: String(row.screen_id), name: String(row.name), source: String(row.expression), languageVersion: "v1", createdAt: String(row.created_at), updatedAt: String(row.updated_at) }; }
 }
 

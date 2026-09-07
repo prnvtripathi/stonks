@@ -48,6 +48,9 @@ async function handle(request: Request, env: ApiEnv, store: ResearchStore, now: 
   try {
     if (path === "/api/v1/status" && request.method === "GET") return json(await store.status(await store.activeDatasetId()));
     if (path === "/api/v1/metrics" && request.method === "GET") return json({ metrics: await store.metrics() });
+    if (path === "/api/v1/glossary" && request.method === "GET") return listGlossary(url, store);
+    const glossaryDetail = path.match(/^\/api\/v1\/glossary\/([^/]+)$/);
+    if (glossaryDetail && request.method === "GET") return getGlossary(decodeURIComponent(glossaryDetail[1]!), store);
     if (path === "/api/v1/instruments" && request.method === "GET") return listInstruments(url, store);
     if (path === "/api/v1/screens" && request.method === "GET") return listScreens(url, store);
     if (path === "/api/v1/screens" && request.method === "POST") return createScreen(request, env, store, now);
@@ -89,6 +92,22 @@ async function listInstruments(url: URL, store: ResearchStore): Promise<Response
   const instruments = await store.listInstruments(datasetId);
   const ordered = [...instruments].sort((left, right) => String(left[sort as keyof typeof left]).localeCompare(String(right[sort as keyof typeof right])) || left.instrumentId.localeCompare(right.instrumentId));
   return json({ data: ordered.slice(offset, offset + limit), pagination: { limit, offset, total: ordered.length } });
+}
+
+async function listGlossary(url: URL, store: ResearchStore): Promise<Response> {
+  const query = url.searchParams.get("q")?.trim() ?? "";
+  if (query.length > 100) return error(400, "Search query is too long");
+  const pagination = readPagination(url);
+  if (!pagination) return error(400, "Invalid pagination");
+  const normalized = query.toLocaleLowerCase("en-IN");
+  const entries = (await store.listGlossary()).filter((entry) => !normalized || [entry.slug, entry.term, ...entry.aliases, entry.summary].some((field) => field.toLocaleLowerCase("en-IN").includes(normalized)));
+  const { limit, offset } = pagination;
+  return json({ data: entries.slice(offset, offset + limit), pagination: { limit, offset, total: entries.length } });
+}
+
+async function getGlossary(slug: string, store: ResearchStore): Promise<Response> {
+  const entry = await store.glossary(slug);
+  return entry ? json(entry) : error(404, "Glossary entry not found");
 }
 
 async function readScreenPayload(request: Request, env: ApiEnv): Promise<{ name: string; source: string } | Response> {
@@ -195,11 +214,12 @@ function readPagination(url: URL): { readonly limit: number; readonly offset: nu
 }
 function methodNotAllowed(allow: string): Response { return new Response(JSON.stringify({ error: { code: "METHOD_NOT_ALLOWED", message: "Method not allowed" } }), { status: 405, headers: { ...jsonHeaders, Allow: allow } }); }
 function allowedMethodsFor(path: string): readonly ("GET" | "POST" | "PUT")[] | null {
-  if (["/api/v1/status", "/api/v1/metrics", "/api/v1/instruments"].includes(path)) return ["GET"];
+  if (["/api/v1/status", "/api/v1/metrics", "/api/v1/instruments", "/api/v1/glossary"].includes(path)) return ["GET"];
   if (path === "/api/v1/screens") return ["GET", "POST"];
   if (/^\/api\/v1\/screens\/[^/]+$/.test(path)) return ["GET", "PUT"];
   if (/^\/api\/v1\/screens\/[^/]+\/runs$/.test(path)) return ["GET", "POST"];
   if (/^\/api\/v1\/screens\/[^/]+\/results$/.test(path)) return ["GET"];
   if (/^\/api\/v1\/instruments\/[^/]+(?:\/chart)?$/.test(path)) return ["GET"];
+  if (/^\/api\/v1\/glossary\/[^/]+$/.test(path)) return ["GET"];
   return null;
 }
