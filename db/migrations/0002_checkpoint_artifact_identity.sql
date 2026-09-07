@@ -1,4 +1,13 @@
--- Forward migration for installations created before artifact-aware checkpoints.
--- The runner performs the conditional SQLite table rewrite because SQLite has no
--- portable IF COLUMN NOT EXISTS operation. Legacy rows receive a deterministic
--- `legacy-<sha256>` artifact ID and retain their checksum/object key.
+-- INTENTIONALLY NO SQL. This file exists to keep the migration chain numbered
+-- and documented; it applies no statements.
+--
+-- Forward migration for installations created before artifact-aware
+-- checkpoints. SQLite has no portable "ADD COLUMN IF NOT EXISTS" and cannot
+-- rewrite a primary key in place, so the migration is a conditional table
+-- rewrite that has to inspect the existing schema first. That logic lives in
+-- `upgrade_checkpoint_schema()` in
+-- `pipeline/market_pipeline/jobs/backfill.py`, and is invoked from
+-- `D1Publisher.initialize_schema()` between 0001 and 0003, so applying the
+-- migration files alone is not sufficient -- run the pipeline's schema
+-- initializer. Legacy rows receive a deterministic `legacy-<sha256>` artifact
+-- ID and retain their checksum and object key.

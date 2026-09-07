@@ -135,6 +135,12 @@ CREATE TABLE IF NOT EXISTS screen_matches (
     PRIMARY KEY (dataset_id, run_id, ordinal)
 );
 
+-- NOTE: dead schema as of Task 12. The reviewed glossary is served entirely
+-- from `packages/contracts/src/glossary.ts`, whose `GlossaryEntry` contract
+-- (slug, term, aliases, summary, ...) does not match these columns, and no
+-- code reads or writes this table. It is retained rather than dropped because
+-- 0001 is the applied base migration on existing databases; drop it in a
+-- forward migration if the glossary is ever moved back into D1.
 CREATE TABLE IF NOT EXISTS glossary_entries (
     dataset_id TEXT NOT NULL REFERENCES datasets(dataset_id),
     term TEXT NOT NULL,

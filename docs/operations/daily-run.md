@@ -32,14 +32,24 @@ manifest, gated by the reconciliation and storage-budget checks in
    ephemeral -- without this step every run would start from an empty
    database and look like a first-ever run to the CLI. See "Coverage
    baseline persistence" below for why this matters.
-4. Invoke the existing `market-pipeline` CLI (`daily` or `backfill`). This
+4. **Skip cleanly if no manifest is present.** The scheduled trigger looks for
+   `manifests/daily.json`. No automated NSE/AMFI fetch is wired (see
+   `docs/operations/source-policy.md`), so producing that file is an operator
+   step and it is normally absent. The "Resolve run parameters" step sets a
+   `manifest_present` output; when it is `false` every subsequent step is
+   skipped, the job posts a `::notice::` and a job summary explaining that no
+   manifest was supplied, and the job **succeeds**. This is deliberate: a
+   missing manifest is "nothing to do today", not an incident, and failing the
+   job every weekday would train the operator to ignore this workflow's
+   alerts. A run that *does* have a manifest and then fails still goes red.
+5. Invoke the existing `market-pipeline` CLI (`daily` or `backfill`). This
    repository does not run automated NSE fetch (see
    `docs/operations/source-policy.md` -- NSE's Terms of Use currently
    disallow it), so the CLI is always invoked against a pre-fetched artifact
    manifest, exactly as it is in local/manual use. Producing that manifest
    (AMFI NAV automation, or committed/uploaded official artifacts for other
    sources) is outside this workflow; supply its path via `manifest_path`.
-5. The CLI itself now runs the backfill/daily job with `strict_coverage`
+6. The CLI itself now runs the backfill/daily job with `strict_coverage`
    disabled -- a source missing some or all of its requested dates does not
    abort the run before reconciliation gets to see it -- and then runs a
    **reconciliation and budget safety gate** before printing its result:
@@ -64,20 +74,31 @@ manifest, gated by the reconciliation and storage-budget checks in
      ratio; a budget at or past its hard limit (`exceeded`) also blocks.
    - The combined verdict is `evaluate_pre_promotion(...)`, surfaced in the
      CLI's JSON output as `safe_to_promote` and `blocking_reasons`, and as the
-     process exit code: `0` = safe, `3` = blocking failure (coverage drop,
-     failed source, or exceeded budget), `2` = input error (unreadable/invalid
-     manifest, or a bad date range) raised before the job or reconciliation
-     even run.
+     process exit code: `0` = safe **and published**, `3` = blocking failure
+     (coverage drop, failed source, or exceeded budget) -- nothing was staged,
+     `4` = the gate passed but the dataset could not be built or staged, `2` =
+     input error (unreadable/invalid manifest, or a bad date range) raised
+     before the job or reconciliation even run.
    - **Only a safe-to-promote (`exit 0`) run is recorded as a future
      baseline** -- see "Coverage baseline persistence" below.
-6. **Save `market.db`** back to the cache (`actions/cache/save`, same
+   - **Publication.** Only when the gate passes does the CLI run
+     `market_pipeline/jobs/publish.py`: it re-reads the checkpointed artifact
+     bodies out of the immutable raw store, normalizes them, computes returns,
+     risk, benchmark RS and momentum, and calls `D1Publisher.stage` followed
+     by `promote` (an atomic `active_dataset` pointer swap). The outcome is
+     reported under `publication` in the CLI's JSON output (`promoted`,
+     `dataset_id`, `instrument_count`, `metric_count`, `warnings`). Only
+     `amfi-nav` has a wired normalization path; artifacts from a source
+     without one are retained and reported as a warning rather than silently
+     dropped.
+7. **Save `market.db`** back to the cache (`actions/cache/save`, same
    `market-db-${{ github.run_id }}` key, `if: always()` so it runs even if
    the CLI step failed) so the next scheduled or manual run can read it back.
-7. The workflow redacts the run's JSON output (stripping any key that looks
+8. The workflow redacts the run's JSON output (stripping any key that looks
    like a token/secret/password/authorization/API key) and publishes it both
    as a build artifact (`daily-data-reconciliation-report`, 90-day retention)
    and as the job's step summary.
-8. If the CLI's exit code is non-zero, the workflow step "Stop before
+9. If the CLI's exit code is non-zero, the workflow step "Stop before
    promotion on blocking failure" fails the job with that same exit code.
    **No promotion step runs after this point** -- see the note below on the
    current scope of promotion.
@@ -102,7 +123,7 @@ against itself (ratio 1.0) -- source failures and the budget check still
 protect that bootstrap case.
 
 This is why the workflow restores/saves `market.db` via `actions/cache`
-around the CLI invocation (step 3 and step 6 above): the CLI's own baseline
+around the CLI invocation (step 3 and step 7 above): the CLI's own baseline
 bookkeeping only works if the database it reads from actually carries state
 from the previous run. `--previous-count` remains available for manual
 `workflow_dispatch` runs and historical re-runs where an operator wants to
@@ -123,17 +144,19 @@ be treated as the new known-good dataset. Concretely:
   reached on a blocking failure, so readers keep seeing the last known-good
   data (see the Global Constraint: a failed run must never replace the last
   known-good dataset).
-- Raw artifacts fetched/checkpointed during the run are retained (the
-  backfill job's checkpoint table is idempotent), so a retry does not need to
-  re-fetch anything that already succeeded -- see
+- Raw artifacts fetched/checkpointed during the run are retained in the
+  immutable raw store (the backfill job's checkpoint table is idempotent), so
+  a retry does not need to re-fetch anything that already succeeded -- see
   `docs/operations/recovery.md` for the retry command.
 
-Note on scope: as of this task, `market-pipeline daily`/`backfill` do not yet
-call `D1Publisher.promote` themselves -- they populate raw-artifact
-checkpoints and report reconciliation/budget status. The `safe_to_promote`
-gate defined here is the interlock a future publish step (or an operator
-running the D1 publish path manually) must consult before calling `promote`;
-this workflow already fails closed on it today.
+Note on scope: `market-pipeline daily`/`backfill` now perform publication
+themselves. `safe_to_promote` is the interlock: `D1Publisher.stage` is not
+reached at all unless the gate passes, so a blocked candidate never becomes a
+staged dataset, let alone the active one. The workflow's caches therefore
+carry three things between runs -- `market.db` (checkpoints and the coverage
+baseline), `raw/` (immutable artifact bodies, re-read to rebuild the
+three-year series a twelve-month return needs), and `history/` (published
+Parquet history and chart objects).
 
 ## Concurrency lock
 
