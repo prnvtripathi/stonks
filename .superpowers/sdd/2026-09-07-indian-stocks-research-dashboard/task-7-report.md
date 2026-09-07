@@ -164,3 +164,73 @@ Implementation fixes committed as `102ef91 fix: harden publication backfill and 
   empty fetcher. NSE automation remains disabled.
 - Budget math has no hard-coded provider limit; callers configure byte limits and
   warning thresholds while stores measure local/injected-client usage.
+
+## Fix round 2/5
+
+### Findings addressed
+
+- JSON manifests now require an explicit `{"artifacts": [...]}` schema. Each entry
+  validates `SourceArtifact` metadata, base64-decodes its body, verifies the body
+  checksum, and produces a typed `FetchedArtifact` for the injected job fetcher.
+- CLI backfill now uses strict coverage, returning nonzero machine-readable errors
+  for incomplete manifests just like daily runs.
+- Added `0002_checkpoint_artifact_identity.sql` and an upgrade-safe conditional
+  runner migration. Legacy source/date checkpoints are preserved with a
+  deterministic `legacy-<sha256>` artifact ID and their checksum/object key.
+  Publisher schema initialization invokes the same upgrade path.
+- R2 history budget telemetry supports an injected usage provider or an opaque
+  client's `usage_bytes`/`get_usage_bytes` method. It no longer introspects test
+  `.objects`; local filesystem accounting remains available for local stores.
+
+### Fix-round RED
+
+Command:
+
+```text
+PYTHONPATH=pipeline .venv/bin/pytest pipeline/tests/integration/test_cli.py pipeline/tests/integration/test_backfill.py pipeline/tests/integration/test_budgets.py -q
+```
+
+Initial result before fixes:
+
+```text
+4 failed, 13 passed
+```
+
+Failures were: valid manifest returned missing dates; incomplete backfill exited
+zero; legacy checkpoint lacked `artifact_id`; and opaque R2 usage measured zero.
+
+### Fix-round GREEN and final verification
+
+```text
+PYTHONPATH=pipeline .venv/bin/pytest pipeline/tests/integration/test_cli.py pipeline/tests/integration/test_backfill.py pipeline/tests/integration/test_budgets.py -q
+17 passed in 0.15s
+```
+
+```text
+PYTHONPATH=pipeline .venv/bin/pytest -q
+138 passed in 0.27s
+```
+
+```text
+PYTHONPATH=pipeline .venv/bin/ruff check pipeline
+All checks passed!
+
+PYTHONPATH=pipeline .venv/bin/mypy pipeline
+Success: no issues found in 51 source files
+```
+
+Implementation fixes committed as `cb1c5c4 fix: support artifact manifests and checkpoint migration`.
+
+### Fix-round self-review and concerns
+
+- Manifest validation is intentionally strict and only accepts committed artifact
+  bytes represented as base64; malformed metadata, unknown fields, invalid base64,
+  and checksum drift fail before any job run.
+- Backfill still reports missing dates in its result API, but the CLI treats them as
+  a strict coverage failure; integrity failures remain immediate everywhere.
+- The SQL migration file documents the conditional rewrite, while the executable
+  SQLite rewrite lives in the shared runner so it works on both fresh and legacy
+  databases without relying on unsupported SQLite conditional DDL.
+- Production R2 clients should provide a usage method or be paired with an
+  injected usage provider; absent telemetry is represented as zero usage and does
+  not invent a provider limit.
