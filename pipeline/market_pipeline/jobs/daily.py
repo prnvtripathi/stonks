@@ -17,6 +17,7 @@ def run_daily(
     effective_date: date,
     raw_store: Any | None = None,
     strict_coverage: bool = True,
+    budget_sources: Iterable[Any] = (),
 ) -> BackfillResult:
     return run_backfill(
         database,
@@ -26,6 +27,7 @@ def run_daily(
         end=effective_date,
         raw_store=raw_store,
         strict_coverage=strict_coverage,
+        budget_sources=budget_sources,
     )
 
 

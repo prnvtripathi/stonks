@@ -17,6 +17,10 @@ class CoverageError(RuntimeError):
     """Raised when a required source/date is missing and strict coverage is on."""
 
 
+class BackfillIntegrityError(RuntimeError):
+    """Raised immediately when an artifact violates lineage or checksum integrity."""
+
+
 ArtifactFetcher = Callable[
     [str, date],
     Iterable[FetchedArtifact | SourceArtifact | tuple[SourceArtifact, bytes]],
@@ -47,6 +51,7 @@ class BackfillResult:
     skipped: int
     missing_dates: Mapping[str, tuple[date, ...]] = field(default_factory=dict)
     errors: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
 
     @property
     def missing(self) -> Mapping[str, tuple[date, ...]]:
@@ -56,8 +61,8 @@ class BackfillResult:
 def _ensure_checkpoint_table(connection: sqlite3.Connection) -> None:
     connection.execute(
         "CREATE TABLE IF NOT EXISTS backfill_checkpoints ("
-        "source_id TEXT NOT NULL, effective_date TEXT NOT NULL, checksum TEXT NOT NULL, "
-        "object_key TEXT, completed_at TEXT NOT NULL, PRIMARY KEY(source_id,effective_date))"
+        "source_id TEXT NOT NULL, effective_date TEXT NOT NULL, artifact_id TEXT NOT NULL, checksum TEXT NOT NULL, "
+        "object_key TEXT, completed_at TEXT NOT NULL, PRIMARY KEY(source_id,effective_date,artifact_id))"
     )
     connection.commit()
 
@@ -73,6 +78,7 @@ class BackfillJob:
         rate_limit_seconds: float = 0.0,
         sleeper: Callable[[float], None] = time.sleep,
         strict_coverage: bool = False,
+        budget_sources: Iterable[Any] = (),
     ) -> None:
         self.database = database
         self.source_ids = tuple(str(source) for source in source_ids)
@@ -81,12 +87,13 @@ class BackfillJob:
         self.rate_limit_seconds = max(0.0, rate_limit_seconds)
         self.sleeper = sleeper
         self.strict_coverage = strict_coverage
+        self.budget_sources = tuple(budget_sources)
         _ensure_checkpoint_table(database)
 
-    def _checkpoint(self, source_id: str, effective_date: date) -> tuple[str, str | None] | None:
+    def _checkpoint(self, source_id: str, effective_date: date, artifact_id: str) -> tuple[str, str | None] | None:
         row = self.database.execute(
-            "SELECT checksum, object_key FROM backfill_checkpoints WHERE source_id=? AND effective_date=?",
-            (source_id, effective_date.isoformat()),
+            "SELECT checksum, object_key FROM backfill_checkpoints WHERE source_id=? AND effective_date=? AND artifact_id=?",
+            (source_id, effective_date.isoformat(), artifact_id),
         ).fetchone()
         return None if row is None else (str(row[0]), row[1])
 
@@ -100,11 +107,11 @@ class BackfillJob:
             return value[0], value[1]
         raise TypeError("fetcher must return FetchedArtifact, SourceArtifact, or (artifact, body)")
 
-    def _save_checkpoint(self, source: str, effective: date, checksum: str, object_key: str | None) -> None:
+    def _save_checkpoint(self, source: str, effective: date, artifact_id: str, checksum: str, object_key: str | None) -> None:
         self.database.execute(
-            "INSERT INTO backfill_checkpoints(source_id,effective_date,checksum,object_key,completed_at) "
-            "VALUES(?,?,?,?,?) ON CONFLICT(source_id,effective_date) DO UPDATE SET checksum=excluded.checksum,object_key=excluded.object_key,completed_at=excluded.completed_at",
-            (source, effective.isoformat(), checksum.lower(), object_key, datetime.now(UTC).isoformat()),
+            "INSERT INTO backfill_checkpoints(source_id,effective_date,artifact_id,checksum,object_key,completed_at) "
+            "VALUES(?,?,?,?,?,?) ON CONFLICT(source_id,effective_date,artifact_id) DO UPDATE SET checksum=excluded.checksum,object_key=excluded.object_key,completed_at=excluded.completed_at",
+            (source, effective.isoformat(), artifact_id, checksum.lower(), object_key, datetime.now(UTC).isoformat()),
         )
         self.database.commit()
 
@@ -139,33 +146,49 @@ class BackfillJob:
                     # callers can retry with a provider for committed user files.
                     raise
                 except Exception as exc:
-                    errors.append(f"{source}/{current.isoformat()}: {exc}")
-                    continue
+                    raise BackfillIntegrityError(f"{source}/{current.isoformat()}: fetch failed: {exc}") from exc
                 matching = [item for item in artifacts if item[0].effective_date == current]
                 if not matching:
                     missing[source].append(current)
                     continue
                 for artifact, body in matching:
                     if artifact.source_id != source:
-                        errors.append(f"{source}/{current.isoformat()}: artifact source lineage mismatch")
-                        continue
+                        raise BackfillIntegrityError(f"{source}/{current.isoformat()}: artifact source lineage mismatch")
                     checksum = artifact.checksum.lower()
                     if body is not None and sha256(body).hexdigest() != checksum:
-                        errors.append(f"{source}/{current.isoformat()}: checksum mismatch")
-                        continue
-                    prior = self._checkpoint(source, current)
+                        raise BackfillIntegrityError(f"{source}/{current.isoformat()}: checksum mismatch")
+                    artifact_id = str(artifact.artifact_id)
+                    prior = self._checkpoint(source, current, artifact_id)
                     if prior is not None and prior[0].lower() == checksum:
                         skipped += 1
                         continue
-                    key = self.raw_store.put(artifact, body) if self.raw_store is not None and body is not None else None
-                    self._save_checkpoint(source, current, checksum, key)
+                    if prior is not None:
+                        raise BackfillIntegrityError(f"{source}/{current.isoformat()}: artifact checksum changed for {artifact_id}")
+                    key: str | None = None
+                    if self.raw_store is not None and body is not None:
+                        try:
+                            key = self.raw_store.put(artifact, body)
+                        except SourcePolicyError:
+                            raise
+                        except Exception as exc:
+                            raise BackfillIntegrityError(f"{source}/{current.isoformat()}: artifact persistence failed: {exc}") from exc
+                    if key is None:
+                        key = f"raw/{source}/{current.isoformat()}/{checksum}/{artifact.filename}"
+                    self._save_checkpoint(source, current, artifact_id, checksum, key)
                     completed += 1
             current += timedelta(days=1)
         self.database.commit()
         frozen_missing = {source: tuple(dates) for source, dates in missing.items() if dates}
         if self.strict_coverage and frozen_missing:
             raise CoverageError(f"missing source dates: {frozen_missing}")
-        return BackfillResult(start, end, completed, skipped, frozen_missing, tuple(errors))
+        warnings: list[str] = []
+        for source in self.budget_sources:
+            report_method = getattr(source, "budget_report", None)
+            if callable(report_method):
+                report = report_method()
+                if report.warning:
+                    warnings.append(f"storage budget warning: {report.as_dict()}")
+        return BackfillResult(start, end, completed, skipped, frozen_missing, tuple(errors), tuple(warnings))
 
 
 def run_backfill(
@@ -179,10 +202,11 @@ def run_backfill(
     execution_date: date | None = None,
     latest_complete_date: date | None = None,
     strict_coverage: bool = False,
+    budget_sources: Iterable[Any] = (),
 ) -> BackfillResult:
-    return BackfillJob(database, source_ids, fetcher, raw_store=raw_store, strict_coverage=strict_coverage).run(
+    return BackfillJob(database, source_ids, fetcher, raw_store=raw_store, strict_coverage=strict_coverage, budget_sources=budget_sources).run(
         start, end, execution_date=execution_date, latest_complete_date=latest_complete_date
     )
 
 
-__all__ = ["ArtifactFetcher", "BackfillJob", "BackfillResult", "CoverageError", "default_backfill_range", "run_backfill"]
+__all__ = ["ArtifactFetcher", "BackfillIntegrityError", "BackfillJob", "BackfillResult", "CoverageError", "default_backfill_range", "run_backfill"]

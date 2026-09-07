@@ -9,6 +9,8 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence, cast
 
+from market_pipeline.storage.budgets import StorageBudget
+
 
 class ReconciliationError(RuntimeError):
     """Raised when a candidate dataset cannot be safely promoted."""
@@ -40,6 +42,7 @@ class DatasetCandidate:
     effective_date: date | str | None = None
     valid: bool = True
     reconciliation_ok: bool = True
+    status: str = "verified"
 
     @classmethod
     def from_value(cls, value: DatasetCandidate | Mapping[str, Any]) -> DatasetCandidate:
@@ -62,6 +65,7 @@ class DatasetCandidate:
             effective_date=raw.pop("effective_date", None),
             valid=bool(raw.pop("valid", True)),
             reconciliation_ok=bool(raw.pop("reconciliation_ok", raw.pop("reconciled", True))),
+            status=str(raw.pop("status", "verified")),
         )
 
 
@@ -73,7 +77,13 @@ class D1Publisher:
     candidate active, so readers see either the old or the new complete view.
     """
 
-    def __init__(self, database: sqlite3.Connection | str | Path) -> None:
+    def __init__(
+        self,
+        database: sqlite3.Connection | str | Path,
+        *,
+        budget_limit_bytes: int | None = None,
+        budget_warning_threshold: float = 0.8,
+    ) -> None:
         if isinstance(database, sqlite3.Connection):
             self.connection = database
             self._owns_connection = False
@@ -81,6 +91,8 @@ class D1Publisher:
             self.connection = sqlite3.connect(str(database))
             self._owns_connection = True
         self.connection.execute("PRAGMA foreign_keys = ON")
+        self.budget_limit_bytes = budget_limit_bytes
+        self.budget_warning_threshold = budget_warning_threshold
 
     def close(self) -> None:
         if self._owns_connection:
@@ -113,12 +125,25 @@ class D1Publisher:
         )
         self.connection.commit()
 
+    def budget_report(self) -> StorageBudget:
+        page_size = int(self.connection.execute("PRAGMA page_size").fetchone()[0])
+        page_count = int(self.connection.execute("PRAGMA page_count").fetchone()[0])
+        return StorageBudget(
+            page_size * page_count,
+            self.budget_limit_bytes,
+            self.budget_warning_threshold,
+        )
+
+    storage_budget = budget_report
+
     @staticmethod
     def _validate_candidate(candidate: DatasetCandidate) -> None:
         if not candidate.valid or not candidate.reconciliation_ok:
             raise ReconciliationError(f"dataset candidate {candidate.dataset_id!r} failed reconciliation")
         if not candidate.dataset_id or any(char in candidate.dataset_id for char in "\x00\n\r"):
             raise ReconciliationError("dataset ID is invalid")
+        if candidate.status not in {"verified", "validated", "reconciled", "complete"}:
+            raise ReconciliationError(f"candidate status is not verified: {candidate.status}")
         unknown = set(candidate.tables) - _TABLES
         if unknown:
             raise ReconciliationError(f"candidate contains unknown tables: {sorted(unknown)}")
@@ -130,24 +155,64 @@ class D1Publisher:
                     raise ReconciliationError(f"candidate row in {table} must be a mapping")
 
     @staticmethod
+    def _required_sources(candidate: DatasetCandidate) -> tuple[str, ...]:
+        required = candidate.metadata.get("required_sources", candidate.metadata.get("required_source_ids"))
+        if required is None:
+            required = [row.get("source_id") for row in candidate.tables.get("sources", ()) if row.get("source_id")]
+        if isinstance(required, str):
+            required = [required]
+        return tuple(str(source) for source in required or ())
+
+    @classmethod
+    def _validate_completeness(cls, candidate: DatasetCandidate) -> None:
+        instruments = candidate.tables.get("instruments", ())
+        metrics = candidate.tables.get("latest_metrics", ())
+        if not instruments or not metrics:
+            raise ReconciliationError("candidate requires non-empty instruments and latest_metrics")
+        if candidate.effective_date is None:
+            raise ReconciliationError("candidate effective_date is required")
+        required = cls._required_sources(candidate)
+        if not required:
+            raise ReconciliationError("candidate requires at least one expected source")
+        runs = candidate.tables.get("source_runs", ())
+        effective = candidate.effective_date.isoformat() if isinstance(candidate.effective_date, date) else str(candidate.effective_date)
+        for source in required:
+            if not any(
+                str(row.get("source_id")) == source
+                and str(row.get("effective_date"))[:10] == effective[:10]
+                and str(row.get("status", "")).lower() in {"complete", "success"}
+                for row in runs
+            ):
+                raise ReconciliationError(f"required source run is incomplete: {source}/{effective}")
+
+    @staticmethod
     def _json(value: Any) -> str:
         return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
 
     def stage(self, value: DatasetCandidate | Mapping[str, Any]) -> str:
         candidate = DatasetCandidate.from_value(value)
         self._validate_candidate(candidate)
-        metadata = self._json(candidate.metadata)
+        self._validate_completeness(candidate)
+        if self.connection.execute("SELECT 1 FROM datasets WHERE dataset_id=?", (candidate.dataset_id,)).fetchone():
+            raise ReconciliationError(f"dataset ID has already been used: {candidate.dataset_id}")
+        metadata_value = dict(candidate.metadata)
+        metadata_value.setdefault("status", candidate.status)
+        metadata_value.setdefault("valid", candidate.valid)
+        metadata_value.setdefault("reconciliation_ok", candidate.reconciliation_ok)
+        metadata = self._json(metadata_value)
         effective = candidate.effective_date.isoformat() if isinstance(candidate.effective_date, date) else candidate.effective_date
         try:
             self.connection.execute("BEGIN")
             self.connection.execute(
-                "INSERT INTO datasets(dataset_id,status,created_at,effective_date,metadata_json) VALUES(?, 'staging', ?, ?, ?) "
-                "ON CONFLICT(dataset_id) DO UPDATE SET status='staging', effective_date=excluded.effective_date, metadata_json=excluded.metadata_json",
+                "INSERT INTO datasets(dataset_id,status,created_at,effective_date,metadata_json) VALUES(?, 'staging', ?, ?, ?)",
                 (candidate.dataset_id, _now(), effective, metadata),
             )
             for table, rows in candidate.tables.items():
                 self._replace_rows(table, candidate.dataset_id, rows)
             self.connection.commit()
+        except sqlite3.IntegrityError as exc:
+            self.connection.rollback()
+            raise ReconciliationError(f"dataset version cannot be inserted: {candidate.dataset_id}") from exc
         except Exception:
             self.connection.rollback()
             raise
@@ -192,7 +257,13 @@ class D1Publisher:
                 metadata = json.loads(row[0])
             except json.JSONDecodeError as exc:
                 raise ReconciliationError("staged dataset metadata is invalid") from exc
-            candidate = DatasetCandidate(dataset_id=dataset_id, metadata=metadata)
+            candidate = DatasetCandidate(
+                dataset_id=dataset_id,
+                metadata=metadata,
+                valid=bool(metadata.get("valid", True)),
+                reconciliation_ok=bool(metadata.get("reconciliation_ok", True)),
+                status=str(metadata.get("status", "verified")),
+            )
         else:
             candidate = DatasetCandidate.from_value(value)
             self._validate_candidate(candidate)
@@ -208,12 +279,28 @@ class D1Publisher:
                 raise ReconciliationError(f"dataset candidate {dataset_id!r} failed reconciliation")
             # A row missing dataset_id is impossible through this publisher; the
             # check guards manually altered staging rows from being promoted.
-            for table in _TABLES:
-                bad = self.connection.execute(
-                    f"SELECT COUNT(*) FROM {table} WHERE dataset_id = ?", (dataset_id,)
+            metadata = json.loads(row[1])
+            staged = DatasetCandidate(dataset_id=dataset_id, metadata=metadata, effective_date=self.connection.execute(
+                "SELECT effective_date FROM datasets WHERE dataset_id=?", (dataset_id,)
+            ).fetchone()[0], status=str(metadata.get("status", "verified")))
+            counts = {
+                table: int(self.connection.execute(f"SELECT COUNT(*) FROM {table} WHERE dataset_id = ?", (dataset_id,)).fetchone()[0])
+                for table in _TABLES
+            }
+            if counts["instruments"] == 0 or counts["latest_metrics"] == 0:
+                raise ReconciliationError("staged candidate requires non-empty instruments and latest_metrics")
+            if not staged.effective_date:
+                raise ReconciliationError("staged candidate effective_date is required")
+            required = self._required_sources(staged)
+            if not required:
+                raise ReconciliationError("staged candidate has no expected sources")
+            for source in required:
+                exists = self.connection.execute(
+                    "SELECT 1 FROM source_runs WHERE dataset_id=? AND source_id=? AND effective_date=? AND lower(status) IN ('complete','success') LIMIT 1",
+                    (dataset_id, source, str(staged.effective_date)[:10]),
                 ).fetchone()
-                if bad is None:
-                    raise ReconciliationError(f"cannot reconcile table {table}")
+                if exists is None:
+                    raise ReconciliationError(f"required source run is incomplete: {source}")
             now = _now()
             self.connection.execute(
                 "UPDATE datasets SET status='superseded' WHERE status='active' AND dataset_id <> ?", (dataset_id,)

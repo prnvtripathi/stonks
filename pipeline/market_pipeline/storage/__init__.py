@@ -1,3 +1,4 @@
+from market_pipeline.storage.budgets import StorageBudget
 from market_pipeline.storage.d1_publisher import (
     D1Publisher,
     DatasetCandidate,
@@ -19,5 +20,6 @@ __all__ = [
     "LocalHistoryStore",
     "R2HistoryStore",
     "ReconciliationError",
+    "StorageBudget",
     "publish",
 ]

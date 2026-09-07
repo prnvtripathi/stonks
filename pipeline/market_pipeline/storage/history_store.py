@@ -15,6 +15,8 @@ from uuid import UUID
 import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
+from market_pipeline.storage.budgets import StorageBudget
+
 
 class HistoryStoreError(RuntimeError):
     """Raised for malformed keys or attempts to overwrite history."""
@@ -107,10 +109,30 @@ def chart_key(dataset_id: str, instrument_id: str | UUID) -> str:
 class HistoryStore:
     """Write immutable yearly Parquet and dataset-scoped gzip chart objects."""
 
-    def __init__(self, target: HistoryObjectClient | str | Path) -> None:
+    def __init__(
+        self,
+        target: HistoryObjectClient | str | Path,
+        *,
+        budget_limit_bytes: int | None = None,
+        budget_warning_threshold: float = 0.8,
+    ) -> None:
         self.client: HistoryObjectClient = (
             _LocalObjectClient(Path(target)) if isinstance(target, (str, Path)) else target
         )
+        self.budget_limit_bytes = budget_limit_bytes
+        self.budget_warning_threshold = budget_warning_threshold
+
+    def budget_report(self) -> StorageBudget:
+        objects = getattr(self.client, "objects", None)
+        if isinstance(objects, Mapping):
+            used = sum(len(value) for value in objects.values() if isinstance(value, bytes))
+        elif isinstance(self.client, _LocalObjectClient):
+            used = sum(path.stat().st_size for path in self.client.root.rglob("*") if path.is_file())
+        else:
+            used = 0
+        return StorageBudget(used, self.budget_limit_bytes, self.budget_warning_threshold)
+
+    storage_budget = budget_report
 
     def put_if_absent(self, key: str, body: bytes) -> str:
         if not self.client.put_if_absent(key, body):
@@ -184,15 +206,15 @@ class HistoryStore:
 class LocalHistoryStore(HistoryStore):
     """Filesystem-backed history store, useful for local jobs and tests."""
 
-    def __init__(self, root: str | Path) -> None:
-        super().__init__(root)
+    def __init__(self, root: str | Path, *, budget_limit_bytes: int | None = None, budget_warning_threshold: float = 0.8) -> None:
+        super().__init__(root, budget_limit_bytes=budget_limit_bytes, budget_warning_threshold=budget_warning_threshold)
 
 
 class R2HistoryStore(HistoryStore):
     """History store backed by an injected S3/R2-compatible object client."""
 
-    def __init__(self, client: HistoryObjectClient) -> None:
-        super().__init__(client)
+    def __init__(self, client: HistoryObjectClient, *, budget_limit_bytes: int | None = None, budget_warning_threshold: float = 0.8) -> None:
+        super().__init__(client, budget_limit_bytes=budget_limit_bytes, budget_warning_threshold=budget_warning_threshold)
 
 
 __all__ = [

@@ -147,10 +147,11 @@ CREATE TABLE IF NOT EXISTS glossary_entries (
 CREATE TABLE IF NOT EXISTS backfill_checkpoints (
     source_id TEXT NOT NULL,
     effective_date TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
     checksum TEXT NOT NULL,
     object_key TEXT,
     completed_at TEXT NOT NULL,
-    PRIMARY KEY (source_id, effective_date)
+    PRIMARY KEY (source_id, effective_date, artifact_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_metrics_active ON latest_metrics(dataset_id, metric, effective_date);
