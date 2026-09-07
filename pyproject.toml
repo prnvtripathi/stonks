@@ -14,6 +14,9 @@ dependencies = [
     "pyarrow>=20,<21",
 ]
 
+[project.scripts]
+market-pipeline = "market_pipeline.cli:main"
+
 [dependency-groups]
 dev = [
     "mypy>=1.17,<2",
