@@ -53,23 +53,19 @@ def _artifact_from_args(
     artifact: SourceArtifact | None,
     source_url: str | None,
     terms_url: str | None,
+    effective_date: date | None,
 ) -> SourceArtifact:
     supplied = source_artifact or artifact
     if source_artifact is not None and artifact is not None and source_artifact != artifact:
         raise NseFilingsProvenanceError("source_artifact and artifact disagree")
     if supplied is None:
-        if source_url is None or terms_url is None:
-            raise NseFilingsProvenanceError("official source URL and terms URL are required")
-        supplied = SourceArtifact(
-            source_id="nse-filings-xbrl",
-            source_url=source_url,
-            retrieved_at=datetime.now(timezone.utc),
-            effective_date=date.today(),
-            checksum=sha256(body).hexdigest(),
-            adapter_version="1.0.0",
-            terms_url=terms_url,
-            filename="filing.csv",
-        )
+        raise NseFilingsProvenanceError("a SourceArtifact or FetchedArtifact is required")
+    if source_url is not None and supplied.source_url != source_url:
+        raise NseFilingsProvenanceError("source URL does not match SourceArtifact")
+    if terms_url is not None and supplied.terms_url != terms_url:
+        raise NseFilingsProvenanceError("terms URL does not match SourceArtifact")
+    if effective_date is not None and supplied.effective_date != effective_date:
+        raise NseFilingsProvenanceError("effective date does not match SourceArtifact")
     _validate_provenance(supplied)
     if supplied.checksum.lower() != sha256(body).hexdigest().lower():
         raise NseFilingsProvenanceError("filing artifact checksum does not match supplied bytes")
@@ -128,6 +124,40 @@ def _date(value: str) -> date:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
 
 
+def _infer_period_type(days: int) -> str:
+    # Filing periods vary by leap years and whether the first/last day is
+    # included, so use deliberately narrow, deterministic bands.
+    if 80 <= days <= 100:
+        return "quarter"
+    if 170 <= days <= 200:
+        return "half_year"
+    if 250 <= days <= 290:
+        return "nine_month"
+    if 330 <= days <= 380:
+        return "annual"
+    raise ValueError(f"unsupported duration length for period type: {days} days")
+
+
+def _normalize_period_type(value: str) -> str:
+    candidate = value.strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "q": "quarter",
+        "q1": "quarter",
+        "q2": "quarter",
+        "q3": "quarter",
+        "q4": "quarter",
+        "quarterly": "quarter",
+        "6m": "half_year",
+        "halfyear": "half_year",
+        "half_yearly": "half_year",
+        "9m": "nine_month",
+        "ninem": "nine_month",
+        "fy": "annual",
+        "full_year": "annual",
+    }
+    return aliases.get(candidate, candidate)
+
+
 def _period_from_row(row: Mapping[str, str], artifact: SourceArtifact) -> FundamentalPeriod:
     instrument_col = _column(row, "instrument")
     end_col = _column(row, "period_end")
@@ -148,7 +178,9 @@ def _period_from_row(row: Mapping[str, str], artifact: SourceArtifact) -> Fundam
     data: dict[str, Any] = {
         "instrument_id": instrument,
         "period_end": period_end,
-        "period_type": row[period_type_col].strip().lower() if period_type_col else "annual",
+        "period_type": _normalize_period_type(row[period_type_col])
+        if period_type_col
+        else "unknown",
         "filing_id": row[filing_col].strip() if filing_col else artifact.filename,
         "filed_at": datetime.fromisoformat(row[filed_col].strip().replace("Z", "+00:00"))
         if filed_col
@@ -182,6 +214,7 @@ def parse_financial_results_csv(
     artifact: SourceArtifact | None = None,
     source_url: str | None = None,
     terms_url: str | None = None,
+    effective_date: date | None = None,
 ) -> list[FundamentalPeriod]:
     """Parse a user-supplied official NSE financial-results CSV."""
 
@@ -198,6 +231,7 @@ def parse_financial_results_csv(
         artifact=artifact,
         source_url=source_url,
         terms_url=terms_url,
+        effective_date=effective_date,
     )
     try:
         text = raw.decode("utf-8-sig")
@@ -218,6 +252,9 @@ def parse_financial_results_xbrl(
     artifact: SourceArtifact | None = None,
     source_url: str | None = None,
     terms_url: str | None = None,
+    effective_date: date | None = None,
+    period_end: date | None = None,
+    period_type: str | None = None,
 ) -> list[FundamentalPeriod]:
     """Parse simple fact/context XBRL supplied by an operator.
 
@@ -236,14 +273,85 @@ def parse_financial_results_xbrl(
         artifact=artifact,
         source_url=source_url,
         terms_url=terms_url,
+        effective_date=effective_date,
     )
     root = ET.fromstring(body)
-    context = next(iter(root.findall(".//{*}context")), None)
-    if context is None:
+    contexts: dict[str, dict[str, Any]] = {}
+    for context in root.findall(".//{*}context"):
+        context_id = context.attrib.get("id")
+        if not context_id:
+            raise ValueError("XBRL context is missing an ID")
+        instant_element = context.find("./{*}period/{*}instant")
+        start = context.find("./{*}period/{*}startDate")
+        end = context.find("./{*}period/{*}endDate")
+        if instant_element is not None and instant_element.text:
+            contexts[context_id] = {
+                "id": context_id,
+                "kind": "instant",
+                "start": None,
+                "end": _date(instant_element.text),
+                "period_type": "instant",
+                "entity": context.find("./{*}entity/{*}identifier"),
+            }
+        elif start is not None and start.text and end is not None and end.text:
+            start_date = _date(start.text)
+            end_date = _date(end.text)
+            contexts[context_id] = {
+                "id": context_id,
+                "kind": "duration",
+                "start": start_date,
+                "end": end_date,
+                "period_type": _infer_period_type((end_date - start_date).days + 1),
+                "entity": context.find("./{*}entity/{*}identifier"),
+            }
+        else:
+            raise ValueError(f"XBRL context has unsupported period shape: {context_id}")
+    if not contexts:
         raise ValueError("XBRL filing is missing a context")
-    end = context.find(".//{*}endDate")
-    if end is None or not end.text:
-        raise ValueError("XBRL filing context is missing end date")
+
+    metadata_period_type = period_type
+    if metadata_period_type is None:
+        for element in root.iter():
+            local = element.tag.rsplit("}", 1)[-1].lower().replace("_", "")
+            if local in {"periodtype", "reportperiod", "filingperiod"} and element.text:
+                candidate = _normalize_period_type(element.text)
+                if candidate in {"quarter", "half_year", "nine_month", "annual", "instant"}:
+                    metadata_period_type = candidate
+                    break
+    metadata_period_type = (
+        _normalize_period_type(metadata_period_type) if metadata_period_type is not None else None
+    )
+    target_end = period_end or max(item["end"] for item in contexts.values())
+    duration = [
+        item for item in contexts.values() if item["kind"] == "duration" and item["end"] == target_end
+    ]
+    instant_contexts = [
+        item for item in contexts.values() if item["kind"] == "instant" and item["end"] == target_end
+    ]
+    selected_duration: dict[str, Any] | None = None
+    if duration:
+        if metadata_period_type is not None and metadata_period_type != "instant":
+            duration = [item for item in duration if item["period_type"] == metadata_period_type]
+            if not duration:
+                raise ValueError("filing period type does not match any duration context")
+        elif len({item["period_type"] for item in duration}) > 1:
+            raise ValueError("ambiguous duration contexts for filing period")
+        if len(duration) != 1:
+            raise ValueError("ambiguous duration contexts for filing period")
+        selected_duration = duration[0]
+    elif metadata_period_type not in {None, "instant"}:
+        raise ValueError("filing period type requires a matching duration context")
+    if len(instant_contexts) > 1:
+        raise ValueError("ambiguous instant contexts for filing period")
+    selected_instant = instant_contexts[0] if instant_contexts else None
+    selected_ids = {
+        item["id"] for item in (selected_duration, selected_instant) if item is not None
+    }
+    if not selected_ids:
+        raise ValueError("XBRL filing has no context ending on filing period end")
+    inferred_type = metadata_period_type or (
+        selected_duration["period_type"] if selected_duration is not None else "instant"
+    )
     xbrl_metric_aliases = {
         "revenuefromoperations": "revenue",
         "revenue": "revenue",
@@ -265,21 +373,38 @@ def parse_financial_results_xbrl(
         "marketcapitalisation": "market_cap",
         "marketcapitalization": "market_cap",
     }
+    balance_fields = {"equity", "debt", "capital_employed", "market_cap"}
     facts: dict[str, str] = {}
     for element in root.iter():
         name = element.tag.rsplit("}", 1)[-1].lower().replace("_", "")
         metric = xbrl_metric_aliases.get(name)
-        if metric is not None and element.text:
+        context_ref = element.attrib.get("contextRef")
+        expected_context = selected_instant if metric in balance_fields else selected_duration
+        if expected_context is None:
+            expected_context = selected_instant
+        if expected_context is None:
+            continue
+        if metric is not None and element.text and context_ref == expected_context["id"]:
             facts[metric] = element.text.strip()
-    entity = context.find(".//{*}identifier")
+    context_for_entity = selected_duration or selected_instant
+    if context_for_entity is None:
+        raise ValueError("XBRL filing has no selected context")
+    selected_entities = {
+        item["entity"].text.strip()
+        for item in (selected_duration, selected_instant)
+        if item is not None and item["entity"] is not None and item["entity"].text
+    }
+    if len(selected_entities) > 1:
+        raise ValueError("selected XBRL contexts belong to different entities")
+    entity = context_for_entity["entity"]
     instrument = entity.text.strip() if entity is not None and entity.text else "unknown"
     from uuid import NAMESPACE_URL, uuid5
 
     return [
         FundamentalPeriod(
             instrument_id=uuid5(NAMESPACE_URL, "stonks/nse-instrument/" + instrument),
-            period_end=_date(end.text),
-            period_type="annual",
+            period_end=target_end,
+            period_type=inferred_type,
             filing_id=provenance.filename,
             filed_at=provenance.retrieved_at,
             source_artifact_id=provenance.artifact_id,

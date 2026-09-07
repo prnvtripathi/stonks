@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xbrl xmlns="http://www.xbrl.org/2003/instance" xmlns:in="https://example.test/in">
+  <context id="a-current"><entity><identifier scheme="nse">ACME</identifier></entity><period><startDate>2025-04-01</startDate><endDate>2026-03-31</endDate></period></context>
+  <context id="a-prior"><entity><identifier scheme="nse">ACME</identifier></entity><period><startDate>2024-04-01</startDate><endDate>2025-03-31</endDate></period></context>
+  <in:Revenue contextRef="a-current">400</in:Revenue>
+  <in:Revenue contextRef="a-prior">350</in:Revenue>
+</xbrl>

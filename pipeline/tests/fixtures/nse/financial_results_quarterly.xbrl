@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xbrl xmlns="http://www.xbrl.org/2003/instance" xmlns:in="https://example.test/in">
+  <context id="q-current"><entity><identifier scheme="nse">ACME</identifier></entity><period><startDate>2026-01-01</startDate><endDate>2026-03-31</endDate></period></context>
+  <context id="q-prior"><entity><identifier scheme="nse">ACME</identifier></entity><period><startDate>2025-01-01</startDate><endDate>2025-03-31</endDate></period></context>
+  <context id="i-current"><entity><identifier scheme="nse">ACME</identifier></entity><period><instant>2026-03-31</instant></period></context>
+  <context id="i-prior"><entity><identifier scheme="nse">ACME</identifier></entity><period><instant>2025-03-31</instant></period></context>
+  <in:Revenue contextRef="q-current">100</in:Revenue>
+  <in:Revenue contextRef="q-prior">80</in:Revenue>
+  <in:Equity contextRef="i-current">500</in:Equity>
+  <in:Equity contextRef="i-prior">450</in:Equity>
+</xbrl>

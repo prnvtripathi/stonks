@@ -2,6 +2,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from uuid import uuid4
 
+import pytest
 from market_pipeline.domain.models import SourceArtifact
 from market_pipeline.normalization.fundamentals import (
     FundamentalPeriod,
@@ -87,3 +88,24 @@ def test_normalizer_requires_official_artifact_provenance() -> None:
         ]
     )
     assert result.active()[0].source_artifact_id == source.artifact_id
+
+
+def test_incremental_restatement_resolves_predecessor_from_prior_lookup() -> None:
+    restated = RESTATED.model_copy(update={"id": uuid4()})
+
+    result = normalize_financial_results([restated], existing_periods=[ORIGINAL])
+
+    assert result.active().supersedes_id == ORIGINAL.id
+
+
+def test_incremental_restatement_rejects_unresolved_predecessor() -> None:
+    with pytest.raises(ValueError, match="unresolved restatement predecessor"):
+        normalize_financial_results([RESTATED.model_copy(update={"id": uuid4()})])
+
+
+def test_restatement_rejects_cross_period_predecessor() -> None:
+    other_period = ORIGINAL.model_copy(update={"period_end": date(2025, 12, 31), "id": uuid4()})
+    restated = RESTATED.model_copy(update={"restates_id": other_period.id, "id": uuid4()})
+
+    with pytest.raises(ValueError, match="does not match restated period"):
+        normalize_financial_results([restated], existing_periods=[other_period])

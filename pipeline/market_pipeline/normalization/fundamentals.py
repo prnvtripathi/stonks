@@ -114,7 +114,8 @@ class FundamentalPeriod(BaseModel):
                 result["source_artifact_id"] = artifact.artifact_id
             else:
                 result["source_artifact_id"] = SourceArtifact.model_validate(artifact).artifact_id
-        result.setdefault("id", _period_identity(result))
+        if not result.get("id"):
+            result["id"] = _period_identity(result)
         if "filing_id" not in result and "filing" in result:
             result["filing_id"] = result["filing"]
         if "filed_at" not in result:
@@ -180,17 +181,44 @@ class FundamentalPeriods(Sequence[FundamentalPeriod]):
 
 def normalize_financial_results(
     periods: Iterable[FundamentalPeriod | Mapping[str, Any]],
+    *,
+    existing_periods: Iterable[FundamentalPeriod | Mapping[str, Any]] | None = None,
+    prior_periods: Iterable[FundamentalPeriod | Mapping[str, Any]] | None = None,
+    existing_lookup: Mapping[Any, FundamentalPeriod | Mapping[str, Any]] | None = None,
+    prior_lookup: Mapping[Any, FundamentalPeriod | Mapping[str, Any]] | None = None,
 ) -> FundamentalPeriods:
     """Normalize bounded V1 financial fields and mark superseded filings inactive."""
 
     normalized = [FundamentalPeriod.model_validate(period) for period in periods]
-    by_id = {period.id: period for period in normalized}
+    prior_inputs: list[FundamentalPeriod | Mapping[str, Any]] = []
+    if existing_periods is not None:
+        prior_inputs.extend(existing_periods)
+    if prior_periods is not None:
+        prior_inputs.extend(prior_periods)
+    if existing_lookup is not None:
+        prior_inputs.extend(existing_lookup.values())
+    if prior_lookup is not None:
+        prior_inputs.extend(prior_lookup.values())
+    prior = [FundamentalPeriod.model_validate(period) for period in prior_inputs]
+    by_id: dict[UUID, FundamentalPeriod] = {
+        period.id: period for period in [*prior, *normalized] if period.id is not None
+    }
     superseded: set[UUID] = set()
     updated: list[FundamentalPeriod] = []
     for period in normalized:
         predecessor = period.restates_id
-        if predecessor in by_id:
-            superseded.add(predecessor)  # type: ignore[arg-type]
+        if predecessor is not None:
+            previous = by_id.get(predecessor)
+            if previous is None:
+                raise ValueError(f"unresolved restatement predecessor: {predecessor}")
+            if (
+                previous.instrument_id != period.instrument_id
+                or previous.period_end != period.period_end
+                or previous.period_type != period.period_type
+            ):
+                raise ValueError("restatement predecessor does not match restated period")
+            if predecessor in {item.id for item in normalized}:
+                superseded.add(predecessor)
             period = period.model_copy(update={"supersedes_id": predecessor})
         updated.append(period)
     return FundamentalPeriods(period for period in updated if period.id not in superseded)
