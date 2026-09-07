@@ -16,7 +16,13 @@ from typing import Any, Sequence
 from market_pipeline.domain.models import FetchedArtifact, SourceArtifact
 from market_pipeline.jobs.backfill import BackfillJob, CoverageError
 from market_pipeline.jobs.daily import run_daily
+from market_pipeline.monitoring.budgets import budget_report
 from market_pipeline.storage.d1_publisher import D1Publisher
+from market_pipeline.validation.reconcile import (
+    SourceObservation,
+    evaluate_pre_promotion,
+    reconcile,
+)
 
 
 def _date(value: str) -> date:
@@ -38,6 +44,18 @@ def _parser() -> argparse.ArgumentParser:
         sub.add_argument("--end", type=_date, help="inclusive backfill end")
         sub.add_argument("--source", action="append", dest="sources", default=None, help="source ID; repeatable")
         sub.add_argument("--manifest", help="JSON manifest of committed official artifacts")
+        sub.add_argument(
+            "--previous-count",
+            type=int,
+            default=None,
+            help="known-good artifact count from the last successful run, for coverage reconciliation",
+        )
+        sub.add_argument(
+            "--min-coverage-ratio",
+            type=float,
+            default=0.90,
+            help="minimum candidate/previous coverage ratio before a run is flagged non-publishable",
+        )
     return parser
 
 
@@ -107,6 +125,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         connection.close()
         print(json.dumps({"error": str(exc)}, sort_keys=True), file=sys.stderr)
         return 2
+
+    # Safety gate: before any future promotion step runs, reconcile the
+    # candidate run's coverage against the last known-good baseline and check
+    # storage budget. A caller (the daily-data workflow) that supplies
+    # --previous-count gets a real coverage-drop check; without it the check
+    # is self-consistent (ratio 1.0) and only source failures / budget can
+    # block, which still protects a bare `daily`/`backfill` invocation from
+    # silently reporting success when a source completely failed.
+    total_days = (result.end - result.start).days + 1
+    source_observations = {
+        source: SourceObservation(
+            expected=True,
+            failed=len(result.missing_dates.get(source, ())) == total_days,
+            delay_days=len(result.missing_dates.get(source, ())),
+            max_delay_days=0,
+        )
+        for source in sources
+    }
+    previous_count = args.previous_count if args.previous_count is not None else result.completed
+    reconciliation = reconcile(
+        previous=previous_count,
+        candidate=result.completed,
+        min_coverage_ratio=args.min_coverage_ratio,
+        sources=source_observations,
+    )
+    storage = publisher.budget_report()
+    storage_report = budget_report(
+        used=storage.used_bytes,
+        limit=storage.limit_bytes,
+        warning_threshold=storage.warning_threshold,
+        source="d1",
+    )
+    safe_to_promote, blocking_reasons = evaluate_pre_promotion(reconciliation, [storage_report])
+
     print(json.dumps({
         "start": result.start.isoformat(),
         "end": result.end.isoformat(),
@@ -118,8 +170,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
         "errors": list(result.errors),
         "warnings": list(result.warnings),
+        "reconciliation": reconciliation.as_dict(),
+        "budget": storage_report.as_dict(),
+        "safe_to_promote": safe_to_promote,
+        "blocking_reasons": list(blocking_reasons),
     }, sort_keys=True))
     connection.close()
+    if not safe_to_promote:
+        # This CLI does not itself call D1Publisher.promote; this exit code is
+        # the enforcement point a future publish step, or the daily-data
+        # workflow, must treat as "do not promote this candidate".
+        return 3
     return 0
 
 

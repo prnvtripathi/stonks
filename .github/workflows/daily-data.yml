@@ -1,0 +1,208 @@
+name: Daily Data Refresh
+
+# Schedule: NSE's official EOD bhavcopy is typically published in the early
+# evening IST. Asia/Kolkata is UTC+5:30, so 13:30 UTC lands at 19:00 IST,
+# comfortably after expected EOD availability. GitHub Actions cron always
+# runs in UTC, and its day-of-week field also uses UTC days; 1-5 (Mon-Fri
+# UTC) is used as a practical proxy for NSE's Mon-Fri IST trading week since
+# the UTC weekday only diverges from the IST weekday very close to midnight
+# IST, well outside this run window.
+#
+# IMPORTANT LIMITATION: automated network fetch adapters for NSE are
+# deliberately not wired into this pipeline (NSE's Terms of Use currently
+# prohibit automated collection - see docs/operations/source-policy.md).
+# This workflow therefore does not fetch artifacts itself; it invokes the
+# existing `market-pipeline` CLI against an operator/job-runner-supplied
+# artifact manifest (see docs/operations/daily-run.md for how that manifest
+# is produced today). What this workflow *does* own end-to-end is the
+# scheduling, concurrency lock, reconciliation/budget safety gate, and
+# redacted operator reporting around that CLI invocation.
+on:
+  schedule:
+    - cron: "30 13 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "daily (single date) or backfill (date range)"
+        type: choice
+        options:
+          - daily
+          - backfill
+        default: daily
+      date:
+        description: "Effective date for daily mode (YYYY-MM-DD)"
+        required: false
+        type: string
+      start:
+        description: "Backfill start date, inclusive (YYYY-MM-DD)"
+        required: false
+        type: string
+      end:
+        description: "Backfill end date, inclusive (YYYY-MM-DD)"
+        required: false
+        type: string
+      manifest_path:
+        description: "Path (within the checked-out repo) to a pre-fetched artifact manifest JSON"
+        required: true
+        type: string
+      previous_count:
+        description: "Known-good previous completed-artifact count, for coverage reconciliation"
+        required: false
+        type: string
+      min_coverage_ratio:
+        description: "Minimum candidate/previous coverage ratio before a run is flagged non-publishable"
+        required: false
+        type: string
+        default: "0.90"
+
+# A scheduled run and a manually triggered run must never race each other
+# against the same database/dataset: queue, do not run concurrently, and
+# never cancel a run that is already in progress (a cancelled mid-write run
+# is exactly the kind of partial state reconciliation exists to catch).
+concurrency:
+  group: daily-data
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    environment: daily-data-refresh
+    env:
+      # Placeholder for future publish-step credentials (e.g. a Cloudflare
+      # D1/R2 API token). No current CLI path consumes it; it is threaded
+      # through via a GitHub Environment now so enabling real publication
+      # later does not require re-plumbing secrets through this workflow.
+      MARKET_PIPELINE_PUBLISH_TOKEN: ${{ secrets.MARKET_PIPELINE_PUBLISH_TOKEN }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.2"
+
+      - name: Install Python dependencies
+        run: uv sync --locked
+
+      - name: Resolve run parameters
+        id: params
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            mode="daily"
+            date="$(TZ=Asia/Kolkata date +%Y-%m-%d)"
+            manifest="${MANIFEST_PATH:-manifests/daily.json}"
+          else
+            mode="${{ inputs.mode }}"
+            date="${{ inputs.date }}"
+            manifest="${{ inputs.manifest_path }}"
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "date=$date" >> "$GITHUB_OUTPUT"
+          echo "start=${{ inputs.start }}" >> "$GITHUB_OUTPUT"
+          echo "end=${{ inputs.end }}" >> "$GITHUB_OUTPUT"
+          echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
+          echo "previous_count=${{ inputs.previous_count }}" >> "$GITHUB_OUTPUT"
+          echo "min_coverage_ratio=${{ inputs.min_coverage_ratio || '0.90' }}" >> "$GITHUB_OUTPUT"
+
+      - name: Run market-pipeline refresh
+        id: run
+        run: |
+          set -euo pipefail
+          args=(--db market.db daily)
+          if [ "${{ steps.params.outputs.mode }}" = "backfill" ]; then
+            args=(--db market.db backfill --start "${{ steps.params.outputs.start }}" --end "${{ steps.params.outputs.end }}")
+          else
+            args+=(--date "${{ steps.params.outputs.date }}")
+          fi
+          args+=(--manifest "${{ steps.params.outputs.manifest }}")
+          args+=(--min-coverage-ratio "${{ steps.params.outputs.min_coverage_ratio }}")
+          if [ -n "${{ steps.params.outputs.previous_count }}" ]; then
+            args+=(--previous-count "${{ steps.params.outputs.previous_count }}")
+          fi
+          set +e
+          uv run market-pipeline "${args[@]}" > run-report.json 2> run-error.json
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          set -e
+
+      - name: Redact and publish operator report
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          SECRET_KEY_PATTERN = re.compile(r"(token|secret|password|authorization|api[_-]?key)", re.IGNORECASE)
+
+          def redact(value):
+              if isinstance(value, dict):
+                  return {
+                      key: ("***redacted***" if SECRET_KEY_PATTERN.search(key) else redact(val))
+                      for key, val in value.items()
+                  }
+              if isinstance(value, list):
+                  return [redact(item) for item in value]
+              return value
+
+          report = {}
+          for name in ("run-report.json", "run-error.json"):
+              path = Path(name)
+              if not path.exists() or not path.read_text().strip():
+                  continue
+              try:
+                  report[name] = redact(json.loads(path.read_text()))
+              except json.JSONDecodeError:
+                  report[name] = "***unparseable output, omitted***"
+
+          Path("reconciliation-report.json").write_text(json.dumps(report, indent=2, sort_keys=True))
+
+          summary_lines = ["# Daily data refresh report", ""]
+          run_report = report.get("run-report.json")
+          if isinstance(run_report, dict):
+              reconciliation = run_report.get("reconciliation", {})
+              budget = run_report.get("budget", {})
+              summary_lines += [
+                  f"- **Safe to promote:** {run_report.get('safe_to_promote')}",
+                  f"- **Coverage ratio:** {reconciliation.get('coverage_ratio')}"
+                  f" (min {reconciliation.get('min_coverage_ratio')})",
+                  f"- **Storage budget:** {budget.get('ratio')} of limit"
+                  f" (warning={budget.get('warning')}, exceeded={budget.get('exceeded')})",
+                  "",
+                  "## Blocking reasons",
+              ]
+              reasons = run_report.get("blocking_reasons") or []
+              summary_lines += [f"- {reason}" for reason in reasons] or ["- none"]
+          else:
+              summary_lines.append("Run produced no parseable report (see run-error.json).")
+          Path("summary.md").write_text("\n".join(summary_lines))
+          PY
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload redacted report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-data-reconciliation-report
+          path: reconciliation-report.json
+          retention-days: 90
+
+      - name: Stop before promotion on blocking failure
+        run: |
+          set -euo pipefail
+          exit_code="${{ steps.run.outputs.exit_code }}"
+          if [ "$exit_code" != "0" ]; then
+            echo "::error::market-pipeline exited $exit_code; this candidate must not be promoted. See the reconciliation-report artifact and job summary for details."
+            exit "$exit_code"
+          fi
+          echo "Reconciliation and budget checks passed; candidate is safe to promote."

@@ -58,3 +58,55 @@ def test_explicit_sources_replace_default() -> None:
 
     args = _parser().parse_args(["backfill", "--source", "nse-eod"])
     assert args.sources == ["nse-eod"]
+
+
+def test_successful_run_reports_publishable_reconciliation(tmp_path: Path, capsys: Any) -> None:
+    body = b"official artifact"
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"artifacts": [{
+        "artifact": {
+            "source_id": "amfi-nav",
+            "source_url": "https://www.amfiindia.com/spages/NAVAll.txt",
+            "retrieved_at": datetime.now(UTC).isoformat(),
+            "effective_date": "2026-09-01",
+            "checksum": hashlib.sha256(body).hexdigest(),
+            "adapter_version": "v1",
+            "terms_url": "https://www.amfiindia.com/terms.html",
+            "filename": "nav.txt",
+        },
+        "body_base64": base64.b64encode(body).decode(),
+    }]}))
+    result = main(["--db", str(tmp_path / "market.db"), "daily", "--date", "2026-09-01", "--manifest", str(manifest)])
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert payload["safe_to_promote"] is True
+    assert payload["reconciliation"]["publishable"] is True
+    assert payload["blocking_reasons"] == []
+
+
+def test_coverage_drop_against_previous_count_blocks_promotion(tmp_path: Path, capsys: Any) -> None:
+    body = b"official artifact"
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"artifacts": [{
+        "artifact": {
+            "source_id": "amfi-nav",
+            "source_url": "https://www.amfiindia.com/spages/NAVAll.txt",
+            "retrieved_at": datetime.now(UTC).isoformat(),
+            "effective_date": "2026-09-01",
+            "checksum": hashlib.sha256(body).hexdigest(),
+            "adapter_version": "v1",
+            "terms_url": "https://www.amfiindia.com/terms.html",
+            "filename": "nav.txt",
+        },
+        "body_base64": base64.b64encode(body).decode(),
+    }]}))
+    result = main([
+        "--db", str(tmp_path / "market.db"),
+        "daily", "--date", "2026-09-01", "--manifest", str(manifest),
+        "--previous-count", "2500",
+    ])
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 3
+    assert payload["safe_to_promote"] is False
+    assert payload["reconciliation"]["publishable"] is False
+    assert any("coverage" in reason for reason in payload["blocking_reasons"])
