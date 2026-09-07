@@ -10,7 +10,7 @@ const triOr = (left: TriState, right: TriState): TriState => left === "true" || 
 
 export function evaluateQuery(ast: Expression, row: QueryRow): TriState {
   const value = (node: Expression): Value => {
-    if (node.kind === "number") return node.value;
+    if (node.kind === "number") return node.percent ? node.value / 100 : node.value;
     if (node.kind === "metric") {
       const result = row[node.id];
       return typeof result === "number" && Number.isFinite(result) ? result : null;

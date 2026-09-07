@@ -52,6 +52,8 @@ describe("safe screener language", () => {
     const valid = typecheckQuery(parseQuery("Return over 1day > 3%").value!, DEFAULT_METRIC_CATALOG, ["equity"]);
     expect(valid.valid).toBe(true);
     expect(valid.diagnostics).toEqual([]);
+    expect(compileQuery(valid.ast, DEFAULT_METRIC_CATALOG).params).toEqual([0.03]);
+    expect(evaluateQuery(valid.ast, { return_1d: 0.03 })).toBe("false");
   });
 
   it("rejects unknown fields with a suggestion", () => {
@@ -89,20 +91,33 @@ describe("safe screener language", () => {
   });
 
   it("executes EAV SQL against SQLite with the same tri-state results", () => {
-    const parsed = parseQuery("Volume > 500 AND Volume / 0 > 1");
+    const parsed = parseQuery("Volume > 500 AND (Return over 1day > 0% OR Volume / 0 > 1)");
     const checked = typecheckQuery(parsed.value!, DEFAULT_METRIC_CATALOG, ["equity"]);
     const compiled = compileEavQuery(checked.ast, DEFAULT_METRIC_CATALOG, "dataset-1");
-    const rows = [100, 600, null, 800, 20];
-    const expected = rows.flatMap((volume, index) => evaluateQuery(parsed.value!, { volume }) === "true" ? [`i${index}`] : []);
+    expect(compiled.params[0]).toBe("dataset-1");
+    expect(compiled.whereSql).toContain("i.dataset_id = ?");
+    const rows: readonly { dataset: string; id: string; volume: number | null; return_1d: number | null }[] = [
+      { dataset: "dataset-1", id: "i0", volume: 100, return_1d: 0.03 },
+      { dataset: "dataset-2", id: "i0", volume: 900, return_1d: 0.03 },
+      { dataset: "dataset-1", id: "i1", volume: 600, return_1d: 0.03 },
+      { dataset: "dataset-1", id: "i2", volume: 600, return_1d: -0.01 },
+      { dataset: "dataset-1", id: "i3", volume: null, return_1d: 0.03 },
+      { dataset: "dataset-1", id: "i4", volume: 600, return_1d: null },
+    ];
+    const expected = rows.filter((item) => item.dataset === "dataset-1" && evaluateQuery(parsed.value!, {
+      volume: item.volume,
+      return_1d: item.return_1d,
+    }) === "true").map((item) => item.id);
     const params = compiled.params.map((value, index) => `.parameter set ?${index + 1} ${typeof value === "string" ? `'${value.replaceAll("'", "''")}'` : value === null ? "NULL" : value}`).join("\n");
-    const inserts = rows.flatMap((volume, index) => [
-      `INSERT INTO instruments VALUES ('i${index}');`,
-      volume === null ? `INSERT INTO latest_metrics VALUES ('dataset-1','i${index}','volume','missing',NULL);` : `INSERT INTO latest_metrics VALUES ('dataset-1','i${index}','volume','present',${volume});`,
+    const inserts = rows.flatMap((item) => [
+      `INSERT INTO instruments VALUES ('${item.dataset}','${item.id}');`,
+      item.volume === null ? `INSERT INTO latest_metrics VALUES ('${item.dataset}','${item.id}','volume','missing',NULL);` : `INSERT INTO latest_metrics VALUES ('${item.dataset}','${item.id}','volume','present',${item.volume});`,
+      item.return_1d === null ? `INSERT INTO latest_metrics VALUES ('${item.dataset}','${item.id}','return_1d','missing',NULL);` : `INSERT INTO latest_metrics VALUES ('${item.dataset}','${item.id}','return_1d','present',${item.return_1d});`,
     ]).join("\n");
     const script = [
       ".parameter init",
       params,
-      "CREATE TABLE instruments (instrument_id TEXT PRIMARY KEY);",
+      "CREATE TABLE instruments (dataset_id TEXT, instrument_id TEXT, PRIMARY KEY (dataset_id, instrument_id));",
       "CREATE TABLE latest_metrics (dataset_id TEXT, instrument_id TEXT, metric TEXT, state TEXT, value REAL);",
       inserts,
       ".mode list",
@@ -113,6 +128,25 @@ describe("safe screener language", () => {
     expect(result.status).toBe(0);
     expect(result.stderr).toBe("");
     expect(result.stdout.trim() ? result.stdout.trim().split("\n") : []).toEqual(expected);
+
+    const division = parseQuery("Volume / 0 > 1");
+    const divisionCompiled = compileEavQuery(division.value!, DEFAULT_METRIC_CATALOG, "dataset-1");
+    const divisionParams = divisionCompiled.params.map((value, index) => `.parameter set ?${index + 1} ${typeof value === "string" ? `'${value}'` : value}`).join("\n");
+    const divisionResult = spawnSync("sqlite3", [":memory:"], {
+      input: [
+        ".parameter init",
+        divisionParams,
+        "CREATE TABLE instruments (dataset_id TEXT, instrument_id TEXT);",
+        "CREATE TABLE latest_metrics (dataset_id TEXT, instrument_id TEXT, metric TEXT, state TEXT, value REAL);",
+        "INSERT INTO instruments VALUES ('dataset-1','i1');",
+        "INSERT INTO latest_metrics VALUES ('dataset-1','i1','volume','present',900);",
+        `.mode list\nSELECT i.instrument_id FROM instruments AS i WHERE ${divisionCompiled.whereSql};`,
+        ".quit",
+      ].join("\n"),
+      encoding: "utf8",
+    });
+    expect(divisionResult.status).toBe(0);
+    expect(divisionResult.stdout.trim()).toBe("");
   });
 
   it("rejects bounded malformed and identifier payloads", () => {

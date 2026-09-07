@@ -21,20 +21,22 @@ const safeIdentifier = /^[A-Za-z_][A-Za-z0-9_]*$/;
 export function compileQuery(ast: Expression, catalog: MetricCatalog, options: CompileOptions = {}): CompiledQuery {
   const params: (number | string | null)[] = [];
   const references: string[] = [];
+  const eav = options.relation === "eav";
+  if (eav) params.push(options.datasetId ?? null);
   const metric = (id: string): string => {
     const definition = catalog.find((item) => item.id === id);
     if (!definition || !safeIdentifier.test(definition.column)) throw new QueryCompileError(`Metric '${id}' is not in the checked catalog.`);
     if (!references.includes(id)) references.push(id);
-    if (options.relation === "eav") {
-      params.push(options.datasetId ?? null, id);
-      return `(SELECT CASE WHEN m.state = 'present' THEN m.value END FROM latest_metrics AS m WHERE m.dataset_id = ? AND m.instrument_id = i.instrument_id AND m.metric = ?)`;
+    if (eav) {
+      params.push(id);
+      return `(SELECT CASE WHEN m.state = 'present' THEN m.value END FROM latest_metrics AS m WHERE m.dataset_id = i.dataset_id AND m.instrument_id = i.instrument_id AND m.metric = ?)`;
     }
     return `\"${definition.column}\"`;
   };
   const expression = (node: Expression): string => {
     if (node.kind === "metric") return metric(node.id);
     if (node.kind === "number") {
-      params.push(node.value);
+      params.push(node.percent ? node.value / 100 : node.value);
       return "?";
     }
     if (node.kind === "unary") {
@@ -44,7 +46,8 @@ export function compileQuery(ast: Expression, catalog: MetricCatalog, options: C
     const sqlOperator = node.operator === "and" ? "AND" : node.operator === "or" ? "OR" : node.operator;
     return `(${expression(node.left)} ${sqlOperator} ${expression(node.right)})`;
   };
-  return { whereSql: `(${expression(ast)}) IS TRUE`, params, referencedMetricIds: references };
+  const predicate = `(${expression(ast)}) IS TRUE`;
+  return { whereSql: eav ? `(i.dataset_id = ? AND ${predicate})` : predicate, params, referencedMetricIds: references };
 }
 
 /**
