@@ -1,0 +1,20 @@
+# Cloudflare Workers Static Assets (and Cloudflare Pages) both read this
+# file from the root of the deployed static asset directory and apply these
+# headers to every static-asset response (the SPA shell, its JS/CSS bundles,
+# and any other file under apps/web/dist). It has no effect on responses the
+# Worker's own fetch() code generates (apps/api/src/index.ts sets its own
+# security headers directly -- see the SECURITY_HEADERS constant there).
+#
+# This dashboard is a private, authenticated-only SPA with no third-party
+# embeds, inline scripts, or inline <style> blocks (all styling ships as a
+# single linked apps/web/src/styles.css, and Vite emits only external
+# module/script/link tags -- see apps/web/index.html) -- so every directive
+# below is scoped to 'self' rather than allowing any inline or third-party
+# source.
+/*
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'
+  Strict-Transport-Security: max-age=63072000; includeSubDomains; preload
+  X-Frame-Options: DENY
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer
+  Cache-Control: private, no-store

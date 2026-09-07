@@ -31,6 +31,25 @@ describe("private research API", () => {
     expect((await api.fetch(request("/api/v1/status"))).status).toBe(401);
   });
 
+  it("sets strict security response headers on every response, without weakening existing cache directives", async () => {
+    const api = testApi();
+    const unauthenticated = await api.fetch(request("/api/v1/status"));
+    expect(unauthenticated.status).toBe(401);
+    expect(unauthenticated.headers.get("Content-Security-Policy")).toBe("default-src 'none'; frame-ancestors 'none'");
+    expect(unauthenticated.headers.get("Strict-Transport-Security")).toBe("max-age=63072000; includeSubDomains; preload");
+    expect(unauthenticated.headers.get("X-Frame-Options")).toBe("DENY");
+    expect(unauthenticated.headers.get("X-Content-Type-Options")).toBe("nosniff");
+    expect(unauthenticated.headers.get("Referrer-Policy")).toBe("no-referrer");
+
+    const authenticated = await api.fetch(request("/api/v1/status", { headers: { Authorization: `Bearer ${await token()}` } }));
+    expect(authenticated.headers.get("Cache-Control")).toBe("private, no-store");
+    expect(authenticated.headers.get("Content-Security-Policy")).toBe("default-src 'none'; frame-ancestors 'none'");
+    expect(authenticated.headers.get("Strict-Transport-Security")).toBe("max-age=63072000; includeSubDomains; preload");
+    expect(authenticated.headers.get("X-Frame-Options")).toBe("DENY");
+    expect(authenticated.headers.get("X-Content-Type-Options")).toBe("nosniff");
+    expect(authenticated.headers.get("Referrer-Policy")).toBe("no-referrer");
+  });
+
   it("rejects invalid issuer, audience, signature, expiry, and email", async () => {
     const api = testApi();
     for (const bearer of [

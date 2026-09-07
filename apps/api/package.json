@@ -7,6 +7,9 @@
     "@stonks/contracts": "workspace:*",
     "@stonks/query": "workspace:*"
   },
+  "devDependencies": {
+    "wrangler": "4.129.1"
+  },
   "scripts": {
     "test": "vitest run --config vitest.config.ts",
     "lint": "tsc --noEmit",

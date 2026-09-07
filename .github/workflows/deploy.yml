@@ -1,0 +1,217 @@
+name: Deploy
+
+# Ships the private research Worker (API + built SPA, see
+# apps/api/wrangler.jsonc) to Cloudflare through a strict preview-then-
+# production gate. See docs/operations/deploy.md for the full rationale,
+# the exact secrets/variables this workflow expects, and the manual
+# Cloudflare-side setup (Access applications, API token scopes, the
+# "production" GitHub Environment's required-reviewer rule) that no
+# workflow file can express on its own.
+#
+# Action pinning: this repository's existing workflows (ci.yml,
+# daily-data.yml) pin third-party actions to a version tag (e.g. `@v4`),
+# not a commit SHA. This workflow matches that convention for consistency.
+# SHA-pinning every action would be a stronger supply-chain control and is
+# worth adopting repository-wide in a follow-up; it is not introduced here
+# unilaterally for just this one new workflow.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# A second push while a deploy is in flight must queue behind it, never run
+# concurrently against the same D1 migration state or race a partially
+# rolled out Worker. Never cancel a deploy that is already applying
+# migrations or has already touched production.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Job 1: validate, test, then migrate+deploy+smoke-test PREVIEW only.
+  # Nothing in this job can touch production resources: its Cloudflare API
+  # token, D1 database, R2 bucket, and Access application are all distinct
+  # from production's (see apps/api/wrangler.jsonc `env.preview` and
+  # security-checklist.md's token-scoping section).
+  # ---------------------------------------------------------------------
+  preview:
+    name: Validate, test, and deploy preview
+    runs-on: ubuntu-latest
+    environment: preview
+    outputs:
+      preview_url: ${{ vars.PREVIEW_URL }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.2"
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.x"
+          cache: pnpm
+
+      - name: Install Python dependencies
+        run: uv sync --locked
+
+      - name: Install Node dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Step order below follows the plan's required gate exactly:
+      # validate source policy -> run all tests -> migrate preview ->
+      # deploy preview -> authenticated smoke test -> (job 2) migrate
+      # production -> deploy production -> read-only production smoke test.
+
+      - name: Validate source policy
+        run: uv run pytest pipeline/tests/sources/test_registry.py -v
+
+      - name: Run all tests (Python)
+        run: |
+          uv run ruff check .
+          uv run mypy pipeline
+          uv run pytest
+
+      - name: Install Playwright browsers
+        run: pnpm --filter @stonks/web exec playwright install --with-deps chromium
+
+      - name: Run all tests (Node)
+        run: |
+          pnpm lint
+          pnpm typecheck
+          pnpm test
+          pnpm --filter @stonks/web test:e2e
+
+      - name: Build the SPA (wrangler deploy serves apps/web/dist as static assets)
+        run: pnpm --filter @stonks/web build
+
+      - name: Migrate preview D1 database
+        working-directory: apps/api
+        run: pnpm exec wrangler d1 migrations apply stonks-research-preview --env preview --remote
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Deploy preview Worker
+        working-directory: apps/api
+        run: pnpm exec wrangler deploy --env preview
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Authenticated smoke test (preview)
+        # CF_ACCESS_SERVICE_TOKEN_ID / _SECRET are a Cloudflare Access
+        # Service Token bound to the preview Access application (Cloudflare
+        # Zero Trust > Access > Service Auth), distinct from the owner's
+        # interactive identity. Cloudflare's edge exchanges the
+        # CF-Access-Client-Id/Secret header pair for a verified Access JWT
+        # before the request ever reaches this Worker.
+        #
+        # KNOWN CAVEAT (see docs/operations/deploy.md and
+        # docs/operations/launch-checklist.md): apps/api/src/middleware/
+        # access.ts currently authorizes only by matching an allowlisted
+        # `email` claim, and Cloudflare Access service-token JWTs carry a
+        # `common_name` claim instead of `email`. Until the application adds
+        # an explicit, narrowly-scoped allowlist entry for this service
+        # token's `common_name` (a deliberate addition, not a bypass route:
+        # it is still a cryptographically verified, audience-scoped
+        # credential), the application layer will correctly return 401 even
+        # though Access's edge check passed. This step therefore checks that
+        # Access's own edge did not redirect to its login page (a non-2xx,
+        # non-401 response here would mean the service token itself is
+        # misconfigured); a full 200 additionally requires that follow-up
+        # allowlist change. See launch-checklist.md for the manual
+        # verification this step does not yet fully automate.
+        run: |
+          set -euo pipefail
+          status=$(curl -s -o /tmp/preview-smoke.json -w '%{http_code}' \
+            -H "CF-Access-Client-Id: ${{ secrets.CF_ACCESS_SERVICE_TOKEN_ID }}" \
+            -H "CF-Access-Client-Secret: ${{ secrets.CF_ACCESS_SERVICE_TOKEN_SECRET }}" \
+            "${{ vars.PREVIEW_URL }}/api/v1/status")
+          echo "preview /api/v1/status responded $status"
+          if [ "$status" != "200" ] && [ "$status" != "401" ]; then
+            echo "::error::Unexpected status $status from preview smoke test (expected 200, or 401 pending the common_name allowlist follow-up documented above)"
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------
+  # Job 2: migrate+deploy+smoke-test PRODUCTION. Depends on `preview`
+  # succeeding. The "production" GitHub Environment referenced below must
+  # have a required-reviewer protection rule configured in the repository
+  # settings (Settings > Environments > production) -- that manual approval
+  # step is the actual preview-to-production gate; GitHub pauses this job
+  # until an approver acts, and no workflow YAML can express that rule
+  # itself. See docs/operations/deploy.md.
+  # ---------------------------------------------------------------------
+  production:
+    name: Migrate and deploy production
+    needs: preview
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.x"
+          cache: pnpm
+
+      - name: Install Node dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the SPA (wrangler deploy serves apps/web/dist as static assets)
+        run: pnpm --filter @stonks/web build
+
+      - name: Migrate production D1 database
+        working-directory: apps/api
+        run: pnpm exec wrangler d1 migrations apply stonks-research --env production --remote
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Deploy production Worker
+        working-directory: apps/api
+        run: pnpm exec wrangler deploy --env production
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Read-only production smoke test
+        # GET only -- this step must never call a mutating route (no POST
+        # /api/v1/screens, no PUT, no /runs). Same known email-vs-common_name
+        # caveat as the preview smoke test above.
+        run: |
+          set -euo pipefail
+          status=$(curl -s -o /tmp/production-smoke.json -w '%{http_code}' \
+            -H "CF-Access-Client-Id: ${{ secrets.CF_ACCESS_SERVICE_TOKEN_ID }}" \
+            -H "CF-Access-Client-Secret: ${{ secrets.CF_ACCESS_SERVICE_TOKEN_SECRET }}" \
+            "${{ vars.PRODUCTION_URL }}/api/v1/status")
+          echo "production /api/v1/status responded $status"
+          if [ "$status" != "200" ] && [ "$status" != "401" ]; then
+            echo "::error::Unexpected status $status from production smoke test (expected 200, or 401 pending the common_name allowlist follow-up documented above)"
+            exit 1
+          fi

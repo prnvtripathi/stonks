@@ -16,10 +16,32 @@ const jsonHeaders = { "Content-Type": "application/json; charset=utf-8", "Cache-
 const json = (body: unknown, status = 200): Response => new Response(JSON.stringify(body), { status, headers: jsonHeaders });
 const error = (status: number, message: string, details?: unknown): Response => json({ error: { code: message.toUpperCase().replaceAll(" ", "_"), message, ...(details === undefined ? {} : { details }) } }, status);
 
+/**
+ * Response-level security headers applied to every response this Worker
+ * returns, success or error, authenticated or not. This is a JSON-only API
+ * behind Cloudflare Access with no HTML rendering surface of its own, so the
+ * CSP is maximally strict (`'none'`) rather than allowlisting any origin.
+ * These are added alongside each route's existing `Cache-Control` (private,
+ * no-store or private, max-age=...) rather than replacing it -- caching
+ * semantics are unrelated to these headers and must not be weakened here.
+ */
+const SECURITY_HEADERS: Readonly<Record<string, string>> = {
+  "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+  "Strict-Transport-Security": "max-age=63072000; includeSubDomains; preload",
+  "X-Frame-Options": "DENY",
+  "X-Content-Type-Options": "nosniff",
+  "Referrer-Policy": "no-referrer",
+};
+function withSecurityHeaders(response: Response): Response {
+  const headers = new Headers(response.headers);
+  for (const [key, value] of Object.entries(SECURITY_HEADERS)) headers.set(key, value);
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
 export function createApi(dependencies: ApiDependencies): Api {
   const { env, store } = dependencies;
   const now = dependencies.now ?? (() => new Date());
-  return { fetch: async (request) => handle(request, env, store, now, dependencies.accessVerifier ?? verifyAccessRequest), issueTestToken: (options) => { if (!dependencies.testAccessSecret) throw new Error("Test token issuance requires an injected test secret"); return issueTestAccessToken(env, dependencies.testAccessSecret, options); } };
+  return { fetch: async (request) => withSecurityHeaders(await handle(request, env, store, now, dependencies.accessVerifier ?? verifyAccessRequest)), issueTestToken: (options) => { if (!dependencies.testAccessSecret) throw new Error("Test token issuance requires an injected test secret"); return issueTestAccessToken(env, dependencies.testAccessSecret, options); } };
 }
 
 export type WorkerBindings = ApiEnv & { DB?: unknown; CHARTS?: { get(key: string): Promise<{ body: ReadableStream<Uint8Array>; httpMetadata?: { contentType?: string; contentEncoding?: string } } | null> } };

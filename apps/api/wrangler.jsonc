@@ -1,9 +1,102 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
+  // ARCHITECTURE NOTE (see docs/operations/deploy.md for the full writeup):
+  // this Worker serves BOTH the private JSON API (src/index.ts, for
+  // "/api/*") AND the built React SPA (apps/web/dist, everything else) via
+  // Cloudflare Workers Static Assets. They are one deployment, one
+  // hostname, and therefore one Cloudflare Access application per
+  // environment -- there is no separate Cloudflare Pages project. This
+  // matches apps/web/src/api.ts, which already calls the API with an empty
+  // `baseUrl` (same-origin fetches): the SPA was never written to expect a
+  // cross-origin API, so unifying the two here avoids inventing CORS/Access
+  // plumbing the application code does not have. `run_worker_first` scopes
+  // Worker execution to "/api/*" only; every other path (the SPA shell and
+  // its hashed JS/CSS bundles) is served directly from the assets binding
+  // without invoking this Worker's code at all -- Cloudflare Access still
+  // gates 100% of both, because Access enforces at the hostname/application
+  // level in front of both the Worker and the assets binding, not inside
+  // this file's fetch() code.
+  //
+  // Top-level config is used only by an operator's unqualified local
+  // `wrangler dev` (no --env). Every real deploy or migration in
+  // .github/workflows/deploy.yml always passes --env preview or
+  // --env production explicitly. Wrangler does NOT inherit bindings or
+  // vars from this top-level block into named environments, so
+  // preview/production below repeat every binding and var in full rather
+  // than relying on partial overrides.
   "name": "stonks-research-api",
   "main": "src/index.ts",
   "compatibility_date": "2026-09-07",
   "workers_dev": false,
-  "d1_databases": [{ "binding": "DB", "database_name": "stonks-research", "database_id": "replace-in-deployment" }],
-  "r2_buckets": [{ "binding": "CHARTS", "bucket_name": "stonks-private-history" }]
+  "d1_databases": [{ "binding": "DB", "database_name": "stonks-research", "database_id": "replace-in-deployment", "migrations_dir": "../../db/migrations" }],
+  "r2_buckets": [{ "binding": "CHARTS", "bucket_name": "stonks-private-history" }],
+  "vars": { "MAX_BODY_BYTES": 16384 },
+  "assets": {
+    "directory": "../web/dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+
+  "env": {
+    // Preview: a distinct Worker, D1 database, R2 bucket, and Access
+    // application/audience so a preview deploy can never read or write
+    // production data, and a preview Access credential can never
+    // authenticate against production or vice versa. Deployed on every
+    // push to main before production (see deploy.yml).
+    "preview": {
+      "name": "stonks-research-api-preview",
+      "workers_dev": false,
+      "d1_databases": [
+        { "binding": "DB", "database_name": "stonks-research-preview", "database_id": "replace-in-deployment-preview", "migrations_dir": "../../db/migrations" }
+      ],
+      "r2_buckets": [
+        { "binding": "CHARTS", "bucket_name": "stonks-private-history-preview" }
+      ],
+      "assets": {
+        "directory": "../web/dist",
+        "binding": "ASSETS",
+        "not_found_handling": "single-page-application",
+        "run_worker_first": ["/api/*"]
+      },
+      "vars": {
+        "ACCESS_TEAM_DOMAIN": "replace-in-deployment.cloudflareaccess.com",
+        "ACCESS_AUD": "replace-in-deployment-preview-access-aud",
+        "ALLOWED_ORIGIN": "https://stonks-research-api-preview.replace-in-deployment.workers.dev",
+        "MAX_BODY_BYTES": 16384
+      }
+      // ACCESS_ALLOWED_EMAILS is a secret, not a var: set once via
+      // `wrangler secret put ACCESS_ALLOWED_EMAILS --env preview`. It is
+      // never written to this file (see security-checklist.md).
+    },
+
+    // Production: the one environment end users (the owner) reach. Deployed
+    // only after preview deploys cleanly and its authenticated smoke test
+    // passes (see deploy.yml and deploy.md for the exact gate order).
+    "production": {
+      "name": "stonks-research-api",
+      "workers_dev": false,
+      "d1_databases": [
+        { "binding": "DB", "database_name": "stonks-research", "database_id": "replace-in-deployment", "migrations_dir": "../../db/migrations" }
+      ],
+      "r2_buckets": [
+        { "binding": "CHARTS", "bucket_name": "stonks-private-history" }
+      ],
+      "assets": {
+        "directory": "../web/dist",
+        "binding": "ASSETS",
+        "not_found_handling": "single-page-application",
+        "run_worker_first": ["/api/*"]
+      },
+      "vars": {
+        "ACCESS_TEAM_DOMAIN": "replace-in-deployment.cloudflareaccess.com",
+        "ACCESS_AUD": "replace-in-deployment-production-access-aud",
+        "ALLOWED_ORIGIN": "https://stonks-research.example",
+        "MAX_BODY_BYTES": 16384
+      }
+      // ACCESS_ALLOWED_EMAILS is a secret: `wrangler secret put ACCESS_ALLOWED_EMAILS --env production`.
+      // A custom domain (replacing the *.workers.dev default) should be
+      // bound via `routes` once one is registered; see deploy.md.
+    }
+  }
 }

@@ -36,7 +36,7 @@ export function App({ api }: AppProps) {
   const resolvedApi = api ?? defaultApiRef.current;
   const initialPath = typeof window === "undefined" ? "/" : window.location.pathname;
   const initialParts = initialPath.split("/").filter(Boolean);
-  const [view, setView] = useState<View>(initialParts[0] === "instruments" ? "instrument" : initialParts[0] === "screens" ? (initialParts[1] === "new" || initialParts[2] === "edit" ? "editor" : "results") : initialParts[0] === "learn" ? "learn" : "overview");
+  const [view, setView] = useState<View>(initialParts[0] === "instruments" ? "instrument" : initialParts[0] === "screens" ? (!initialParts[1] ? "overview" : initialParts[1] === "new" || initialParts[2] === "edit" ? "editor" : "results") : initialParts[0] === "learn" ? "learn" : "overview");
   const [routeId, setRouteId] = useState(initialParts[1] ?? "");
   const [originScreenId, setOriginScreenId] = useState(() => typeof window === "undefined" ? "" : new URLSearchParams(window.location.search).get("fromScreen") ?? "");
   const [status, setStatus] = useState<StatusDto>(fallbackStatus);
@@ -86,7 +86,7 @@ export function App({ api }: AppProps) {
   }, [dirty]);
 
   const navigate = useCallback((path: string, nextView: View, id = "") => { window.history.pushState({}, "", path); setView(nextView); setRouteId(id); }, []);
-  useEffect(() => { const onPopState = () => { const parts = window.location.pathname.split("/").filter(Boolean); setRouteId(parts[1] ?? ""); setOriginScreenId(new URLSearchParams(window.location.search).get("fromScreen") ?? ""); setView(parts[0] === "instruments" ? "instrument" : parts[0] === "screens" && parts[1] && parts[1] !== "new" && parts[2] !== "edit" ? "results" : parts[0] === "screens" ? "editor" : parts[0] === "learn" ? "learn" : "overview"); }; window.addEventListener("popstate", onPopState); return () => window.removeEventListener("popstate", onPopState); }, []);
+  useEffect(() => { const onPopState = () => { const parts = window.location.pathname.split("/").filter(Boolean); setRouteId(parts[1] ?? ""); setOriginScreenId(new URLSearchParams(window.location.search).get("fromScreen") ?? ""); setView(parts[0] === "instruments" ? "instrument" : parts[0] === "screens" ? (!parts[1] ? "overview" : parts[1] !== "new" && parts[2] !== "edit" ? "results" : "editor") : parts[0] === "learn" ? "learn" : "overview"); }; window.addEventListener("popstate", onPopState); return () => window.removeEventListener("popstate", onPopState); }, []);
   const openOverview = () => { if (dirty) setShowGuard(true); else navigate("/", "overview"); };
   const openEditor = (mode: EditorMode, screen?: SavedScreen) => { setEditorMode(mode); setEditing(screen); setDirty(false); navigate(screen && mode === "edit" ? `/screens/${encodeURIComponent(screen.id)}/edit` : "/screens/new", "editor", screen?.id ?? ""); };
   const confirmLeave = () => { setShowGuard(false); setDirty(false); navigate("/", "overview"); };
