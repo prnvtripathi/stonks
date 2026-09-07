@@ -48,14 +48,18 @@ class NseParsedRow:
     report_date: date | None
     close: float | None
     row: Mapping[str, str]
+    # Preserve provider cells exactly; `series` and `instrument_type` are the
+    # canonical comparison forms used by eligibility rules.
+    raw_series: str = ""
+    raw_type: str = ""
 
-    @property
-    def raw_series(self) -> str:
-        return self.series
-
-    @property
-    def raw_type(self) -> str:
-        return self.instrument_type
+    def __post_init__(self) -> None:
+        # Keep hand-constructed parsed rows compatible with the public
+        # normalizer contract while parser-produced rows retain exact cells.
+        if not self.raw_series:
+            object.__setattr__(self, "raw_series", self.series)
+        if not self.raw_type:
+            object.__setattr__(self, "raw_type", self.instrument_type)
 
 
 _ALIASES: dict[str, tuple[str, ...]] = {
@@ -71,6 +75,10 @@ _ALIASES: dict[str, tuple[str, ...]] = {
 
 def _header(value: str) -> str:
     return " ".join(value.replace("\ufeff", "").strip().split()).upper()
+
+
+def _canonical(value: str) -> str:
+    return " ".join(re.sub(r"[^A-Z0-9]+", " ", value.upper()).split())
 
 
 def _read_csv(body: bytes | str) -> tuple[list[dict[str, str]], dict[str, str]]:
@@ -89,7 +97,7 @@ def _read_csv(body: bytes | str) -> tuple[list[dict[str, str]], dict[str, str]]:
         raise NseRowError("NSE report is missing a header")
     headers = {_header(name): name for name in reader.fieldnames if name is not None}
     rows = [
-        {_header(key): (value or "").strip() for key, value in row.items() if key is not None}
+        {_header(key): (value or "") for key, value in row.items() if key is not None}
         for row in reader
     ]
     if not rows:
@@ -130,6 +138,10 @@ def _value(row: Mapping[str, str], column: str | None) -> str:
     return row.get(column or "", "").strip()
 
 
+def _raw_value(row: Mapping[str, str], column: str | None) -> str:
+    return row.get(column or "", "")
+
+
 def parse_nse_security_master(body: bytes | str) -> list[NseParsedRow]:
     """Parse an NSE security-master CSV while retaining native fields."""
 
@@ -140,19 +152,27 @@ def parse_nse_security_master(body: bytes | str) -> list[NseParsedRow]:
     isin_col = _column(headers, "isin", required=False)
     type_col = _column(headers, "type", required=False)
     parsed: list[NseParsedRow] = []
+    seen: set[str] = set()
     for number, row in enumerate(rows, start=2):
         symbol = _value(row, symbol_col).upper()
+        if symbol in seen:
+            raise NseRowError(f"security master contains duplicate symbol: {symbol}")
+        seen.add(symbol)
+        raw_series = _raw_value(row, series_col)
+        raw_type = _raw_value(row, type_col)
         parsed.append(
             NseParsedRow(
                 row_number=number,
                 symbol=symbol,
-                series=_value(row, series_col).upper(),
-                instrument_type=_value(row, type_col).upper(),
+                series=_canonical(raw_series),
+                instrument_type=_canonical(raw_type),
                 name=_value(row, name_col),
                 isin=_value(row, isin_col).upper(),
                 report_date=None,
                 close=None,
                 row=row,
+                raw_series=raw_series,
+                raw_type=raw_type,
             )
         )
     return parsed
@@ -172,6 +192,8 @@ def parse_nse_bhavcopy(body: bytes | str) -> list[NseParsedRow]:
     parsed: list[NseParsedRow] = []
     for number, row in enumerate(rows, start=2):
         symbol = _value(row, symbol_col).upper()
+        raw_series = _raw_value(row, series_col)
+        raw_type = _raw_value(row, type_col)
         raw_date = _value(row, date_col)
         try:
             report_date = _parse_date(raw_date)
@@ -186,26 +208,22 @@ def parse_nse_bhavcopy(body: bytes | str) -> list[NseParsedRow]:
             NseParsedRow(
                 row_number=number,
                 symbol=symbol,
-                series=_value(row, series_col).upper(),
-                instrument_type=_value(row, type_col).upper(),
+                series=_canonical(raw_series),
+                instrument_type=_canonical(raw_type),
                 name=_value(row, name_col),
                 isin=_value(row, isin_col).upper(),
                 report_date=report_date,
                 close=close,
                 row=row,
+                raw_series=raw_series,
+                raw_type=raw_type,
             )
         )
     return parsed
 
 
 def _looks_like_etf(row: NseParsedRow) -> bool:
-    native_type = row.instrument_type.replace("-", " ").replace("/", " ")
-    if native_type in {"ETF", "ETP", "EXCHANGE TRADED FUND", "ETF ETP"}:
-        return True
-    # Legacy bhavcopies do not carry instrument type.  Keep this narrow and
-    # only infer from an explicit ETF name marker or the well-known BeES suffix.
-    name = f" {row.name.upper()} "
-    return " ETF " in name or row.symbol.endswith("BEES")
+    return row.instrument_type == "ETF"
 
 
 def _rejected(row: NseParsedRow, reason: str) -> RejectedNseRow:
@@ -266,6 +284,8 @@ def normalize_nse_rows(
                 report_date=row.report_date,
                 close=row.close,
                 row=row.row,
+                raw_series=row.raw_series or master.raw_series,
+                raw_type=row.raw_type or master.raw_type,
             )
         if not row.series:
             rejected.append(_rejected(row, "malformed row: series is missing"))
@@ -279,11 +299,13 @@ def normalize_nse_rows(
             elif row.report_date != inferred_date:
                 rejected.append(_rejected(row, "report date mismatch within report"))
                 continue
-        if row.close is None and row.report_date is not None:
-            rejected.append(_rejected(row, "malformed row: closing price is missing or invalid"))
-            continue
-        if row.report_date is None and row.close is not None:
-            rejected.append(_rejected(row, "malformed row: report date is missing or invalid"))
+        if row.report_date is None or row.close is None:
+            missing: list[str] = []
+            if row.report_date is None:
+                missing.append("report date is missing or invalid")
+            if row.close is None:
+                missing.append("closing price is missing or invalid")
+            rejected.append(_rejected(row, "malformed row: " + "; ".join(missing)))
             continue
         if row.symbol in seen:
             rejected.append(_rejected(row, "duplicate symbol"))
@@ -291,8 +313,14 @@ def normalize_nse_rows(
         if row.series != "EQ":
             rejected.append(_rejected(row, f"ineligible series: {row.raw_series}"))
             continue
-        native_type = row.raw_type.replace("-", " ").replace("/", " ")
-        if native_type in {"SME", "REIT", "INVIT", "IN VIT", "PREFERENCE", "PARTLY PAID"}:
+        native_type = row.instrument_type
+        if (
+            native_type in {"SME", "REIT", "INVIT", "IN VIT", "ETP"}
+            or "PREFERENCE" in native_type
+            or native_type == "PREF"
+            or native_type.startswith("PREF ")
+            or "PARTLY PAID" in native_type
+        ):
             rejected.append(_rejected(row, f"ineligible instrument type: {row.raw_type}"))
             continue
         asset_class = AssetClass.ETF if _looks_like_etf(row) else AssetClass.EQUITY

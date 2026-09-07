@@ -77,6 +77,52 @@ Success: no issues found in 17 source files
 - Current ZIP selection intentionally requires exactly one CSV/TXT member. A
   future multi-file licensed NSE bundle should select members by an explicit
   caller-provided name rather than guessing.
-- ETF inference from legacy bhavcopies is deliberately narrow (explicit ETF type,
-  explicit ETF name marker, or the known `BEES` suffix); a security master can be
-  supplied to enrich type and ISIN where bhavcopy columns omit them.
+- ETF classification is deliberately explicit (`ETF` type only); a security
+  master can be supplied to enrich type and ISIN where bhavcopy columns omit them.
+
+## Fix round 1/5
+
+### Findings addressed
+
+- Rows are rejected whenever either the parsed report date or close is absent or
+  invalid, including rows where both fields are empty or malformed.
+- Parsed rows now retain exact provider series/type cells in separate audit fields;
+  canonical comparison values are used only for eligibility checks.
+- ETF classification requires the explicit `ETF` provider/security-master type.
+  Generic `ETP`, name markers, and symbol suffixes no longer infer ETF status.
+  EQ-series preference and partly-paid type variants are canonicalized and rejected.
+- Duplicate security-master symbols now fail deterministic schema validation rather
+  than using last-row-wins behavior.
+
+### RED
+
+After adding regression tests for the review findings, before the fixes:
+
+```text
+UV_CACHE_DIR=/private/tmp/stonks-uv-cache uv run pytest pipeline/tests/sources/test_nse_eod.py pipeline/tests/normalization/test_nse.py pipeline/tests/storage/test_raw_store.py -q
+.....FFF..FFF..................                                          [100%]
+6 failed, 25 passed in 0.14s
+```
+
+The failures covered duplicate security-master acceptance, over-permissive ETF and
+EQ-series exclusions, exact raw-cell loss, and missing date/close rejection.
+
+### GREEN
+
+After implementing the fixes:
+
+```text
+UV_CACHE_DIR=/private/tmp/stonks-uv-cache uv run pytest pipeline/tests/sources/test_nse_eod.py pipeline/tests/normalization/test_nse.py pipeline/tests/storage/test_raw_store.py -q
+...............................                                          [100%]
+31 passed in 0.13s
+```
+
+```text
+UV_CACHE_DIR=/private/tmp/stonks-uv-cache uv run ruff check pipeline/market_pipeline pipeline/tests
+All checks passed!
+```
+
+```text
+UV_CACHE_DIR=/private/tmp/stonks-uv-cache uv run mypy pipeline
+Success: no issues found in 17 source files
+```

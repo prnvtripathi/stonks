@@ -3,6 +3,7 @@ from io import BytesIO
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
+from market_pipeline.normalization.nse import NseRowError
 from market_pipeline.sources.nse_eod import (
     NseArchiveError,
     NseEodAdapter,
@@ -46,3 +47,16 @@ def test_archive_parser_reads_single_csv_member() -> None:
 
     rows = parse_nse_bhavcopy(output.getvalue())
     assert rows[0].symbol == "INFY"
+
+
+def test_security_master_duplicate_symbols_fail_schema_validation() -> None:
+    body = (
+        b"SYMBOL,SERIES,NAME OF COMPANY,ISIN NUMBER\n"
+        b"INFY,EQ,Infosys,INE009A01021\n"
+        b"INFY,EQ,Infosys renamed,INE009A01021\n"
+    )
+
+    with pytest.raises(NseRowError, match="duplicate"):
+        from market_pipeline.normalization.nse import parse_nse_security_master as parse_master
+
+        parse_master(body)
