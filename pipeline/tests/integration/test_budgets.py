@@ -26,16 +26,16 @@ def test_publisher_exposes_configurable_budget() -> None:
 
 
 def test_history_store_exposes_injected_object_usage() -> None:
-    class Objects:
-        def __init__(self) -> None:
-            self.objects = {"charts/d/i.json.gz": b"1234567890"}
+    class OpaqueClient:
+        def usage_bytes(self) -> int:
+            return 10
 
         def put_if_absent(self, key: str, body: bytes) -> bool:
             return False
 
         def get(self, key: str) -> bytes | None:
-            return self.objects.get(key)
+            return None
 
-    report = R2HistoryStore(Objects(), budget_limit_bytes=10).budget_report()
+    report = R2HistoryStore(OpaqueClient(), budget_limit_bytes=10).budget_report()
     assert report.used == 10
     assert report.warning

@@ -101,6 +101,12 @@ class D1Publisher:
     def initialize_schema(self) -> None:
         migration = Path(__file__).resolve().parents[3] / "db" / "migrations" / "0001_market_schema.sql"
         self.connection.executescript(migration.read_text(encoding="utf-8"))
+        # 0002 is conditional because SQLite cannot express ADD COLUMN IF NOT
+        # EXISTS for a primary-key rewrite. Reuse the idempotent runner upgrade
+        # so D1/local initialization both preserve legacy checkpoint rows.
+        from market_pipeline.jobs.backfill import upgrade_checkpoint_schema
+
+        upgrade_checkpoint_schema(self.connection)
         self.connection.commit()
 
     def active_dataset_id(self) -> str | None:

@@ -9,7 +9,7 @@ import re
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 from uuid import UUID
 
 import pyarrow as pa  # type: ignore[import-untyped]
@@ -26,6 +26,13 @@ class HistoryObjectClient(Protocol):
     def put_if_absent(self, key: str, body: bytes) -> bool: ...
 
     def get(self, key: str) -> bytes | None: ...
+
+
+
+class UsageReportingObjectClient(HistoryObjectClient, Protocol):
+    """Optional R2 client extension for provider-reported byte usage."""
+
+    def usage_bytes(self) -> int: ...
 
 
 class _LocalObjectClient:
@@ -115,21 +122,25 @@ class HistoryStore:
         *,
         budget_limit_bytes: int | None = None,
         budget_warning_threshold: float = 0.8,
+        usage_provider: Callable[[], int] | None = None,
     ) -> None:
         self.client: HistoryObjectClient = (
             _LocalObjectClient(Path(target)) if isinstance(target, (str, Path)) else target
         )
         self.budget_limit_bytes = budget_limit_bytes
         self.budget_warning_threshold = budget_warning_threshold
+        self.usage_provider = usage_provider
 
     def budget_report(self) -> StorageBudget:
-        objects = getattr(self.client, "objects", None)
-        if isinstance(objects, Mapping):
-            used = sum(len(value) for value in objects.values() if isinstance(value, bytes))
+        if self.usage_provider is not None:
+            used = self.usage_provider()
         elif isinstance(self.client, _LocalObjectClient):
             used = sum(path.stat().st_size for path in self.client.root.rglob("*") if path.is_file())
         else:
-            used = 0
+            provider = getattr(self.client, "usage_bytes", None)
+            if not callable(provider):
+                provider = getattr(self.client, "get_usage_bytes", None)
+            used = int(provider()) if callable(provider) else 0
         return StorageBudget(used, self.budget_limit_bytes, self.budget_warning_threshold)
 
     storage_budget = budget_report
@@ -206,19 +217,20 @@ class HistoryStore:
 class LocalHistoryStore(HistoryStore):
     """Filesystem-backed history store, useful for local jobs and tests."""
 
-    def __init__(self, root: str | Path, *, budget_limit_bytes: int | None = None, budget_warning_threshold: float = 0.8) -> None:
-        super().__init__(root, budget_limit_bytes=budget_limit_bytes, budget_warning_threshold=budget_warning_threshold)
+    def __init__(self, root: str | Path, *, budget_limit_bytes: int | None = None, budget_warning_threshold: float = 0.8, usage_provider: Callable[[], int] | None = None) -> None:
+        super().__init__(root, budget_limit_bytes=budget_limit_bytes, budget_warning_threshold=budget_warning_threshold, usage_provider=usage_provider)
 
 
 class R2HistoryStore(HistoryStore):
     """History store backed by an injected S3/R2-compatible object client."""
 
-    def __init__(self, client: HistoryObjectClient, *, budget_limit_bytes: int | None = None, budget_warning_threshold: float = 0.8) -> None:
-        super().__init__(client, budget_limit_bytes=budget_limit_bytes, budget_warning_threshold=budget_warning_threshold)
+    def __init__(self, client: HistoryObjectClient, *, budget_limit_bytes: int | None = None, budget_warning_threshold: float = 0.8, usage_provider: Callable[[], int] | None = None) -> None:
+        super().__init__(client, budget_limit_bytes=budget_limit_bytes, budget_warning_threshold=budget_warning_threshold, usage_provider=usage_provider)
 
 
 __all__ = [
     "HistoryObjectClient",
+    "UsageReportingObjectClient",
     "HistoryStore",
     "HistoryStoreError",
     "LocalHistoryStore",

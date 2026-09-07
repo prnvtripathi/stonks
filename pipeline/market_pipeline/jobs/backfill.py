@@ -58,7 +58,35 @@ class BackfillResult:
         return self.missing_dates
 
 
+def upgrade_checkpoint_schema(connection: sqlite3.Connection) -> None:
+    """Apply the 0002 forward migration when an old primary key is present."""
+
+    table_exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='backfill_checkpoints'"
+    ).fetchone() is not None
+    if table_exists:
+        columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(backfill_checkpoints)")}
+        if "artifact_id" not in columns:
+            connection.execute("ALTER TABLE backfill_checkpoints RENAME TO backfill_checkpoints_legacy")
+            connection.execute(
+                "CREATE TABLE backfill_checkpoints (source_id TEXT NOT NULL, effective_date TEXT NOT NULL, artifact_id TEXT NOT NULL, checksum TEXT NOT NULL, object_key TEXT, completed_at TEXT NOT NULL, PRIMARY KEY(source_id,effective_date,artifact_id))"
+            )
+            rows = connection.execute(
+                "SELECT source_id,effective_date,checksum,object_key,completed_at FROM backfill_checkpoints_legacy"
+            ).fetchall()
+            for source, effective, checksum, object_key, completed_at in rows:
+                identity = sha256(f"{source}|{effective}|{checksum}|{object_key or ''}".encode()).hexdigest()
+                connection.execute(
+                    "INSERT INTO backfill_checkpoints VALUES (?,?,?,?,?,?)",
+                    (source, effective, f"legacy-{identity}", checksum, object_key, completed_at),
+                )
+            connection.execute("DROP TABLE backfill_checkpoints_legacy")
+            connection.commit()
+            return
+
+
 def _ensure_checkpoint_table(connection: sqlite3.Connection) -> None:
+    upgrade_checkpoint_schema(connection)
     connection.execute(
         "CREATE TABLE IF NOT EXISTS backfill_checkpoints ("
         "source_id TEXT NOT NULL, effective_date TEXT NOT NULL, artifact_id TEXT NOT NULL, checksum TEXT NOT NULL, "
@@ -209,4 +237,4 @@ def run_backfill(
     )
 
 
-__all__ = ["ArtifactFetcher", "BackfillIntegrityError", "BackfillJob", "BackfillResult", "CoverageError", "default_backfill_range", "run_backfill"]
+__all__ = ["ArtifactFetcher", "BackfillIntegrityError", "BackfillJob", "BackfillResult", "CoverageError", "default_backfill_range", "run_backfill", "upgrade_checkpoint_schema"]

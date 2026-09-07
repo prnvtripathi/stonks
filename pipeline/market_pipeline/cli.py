@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
+import hashlib
 import json
 import sqlite3
 import sys
@@ -10,6 +13,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Sequence
 
+from market_pipeline.domain.models import FetchedArtifact, SourceArtifact
 from market_pipeline.jobs.backfill import BackfillJob, CoverageError
 from market_pipeline.jobs.daily import run_daily
 from market_pipeline.storage.d1_publisher import D1Publisher
@@ -42,15 +46,31 @@ def _manifest_fetcher(path: str) -> Any:
         document = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"artifact manifest is unreadable: {exc}") from exc
-    if not isinstance(document, dict):
-        raise ValueError("artifact manifest must be a JSON object")
+    if not isinstance(document, dict) or not isinstance(document.get("artifacts"), list):
+        raise ValueError("artifact manifest must contain an artifacts array")
+    by_date: dict[tuple[str, str], list[FetchedArtifact]] = {}
+    for number, entry in enumerate(document["artifacts"], start=1):
+        if not isinstance(entry, dict) or not isinstance(entry.get("artifact"), dict):
+            raise ValueError(f"manifest artifact {number} must contain an artifact object")
+        encoded = entry.get("body_base64")
+        if not isinstance(encoded, str) or not encoded:
+            raise ValueError(f"manifest artifact {number} requires body_base64")
+        try:
+            body = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError(f"manifest artifact {number} has invalid body_base64") from exc
+        try:
+            artifact = SourceArtifact.model_validate(entry["artifact"])
+            fetched = FetchedArtifact(artifact=artifact, body=body)
+        except ValueError as exc:
+            raise ValueError(f"manifest artifact {number} has invalid artifact metadata: {exc}") from exc
+        if artifact.checksum.lower() != hashlib.sha256(body).hexdigest():
+            raise ValueError(f"manifest artifact {number} checksum does not match body")
+        key = (artifact.source_id, artifact.effective_date.isoformat())
+        by_date.setdefault(key, []).append(fetched)
 
     def fetch(source: str, effective: date) -> list[Any]:
-        source_entries = document.get(source, {})
-        if not isinstance(source_entries, dict):
-            return []
-        entries = source_entries.get(effective.isoformat(), [])
-        return entries if isinstance(entries, list) else []
+        return list(by_date.get((source, effective.isoformat()), ()))
 
     return fetch
 
@@ -82,7 +102,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "daily":
             result = run_daily(connection, fetcher, sources, effective_date=start, strict_coverage=True, budget_sources=(publisher,))
         else:
-            result = BackfillJob(connection, sources, fetcher, budget_sources=(publisher,)).run(start, end)
+            result = BackfillJob(connection, sources, fetcher, strict_coverage=True, budget_sources=(publisher,)).run(start, end)
     except (CoverageError, ValueError, RuntimeError) as exc:
         connection.close()
         print(json.dumps({"error": str(exc)}, sort_keys=True), file=sys.stderr)

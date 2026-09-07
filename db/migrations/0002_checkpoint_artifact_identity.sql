@@ -1,0 +1,4 @@
+-- Forward migration for installations created before artifact-aware checkpoints.
+-- The runner performs the conditional SQLite table rewrite because SQLite has no
+-- portable IF COLUMN NOT EXISTS operation. Legacy rows receive a deterministic
+-- `legacy-<sha256>` artifact ID and retain their checksum/object key.

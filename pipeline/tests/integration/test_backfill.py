@@ -101,3 +101,16 @@ def test_backfill_result_includes_storage_budget_warnings() -> None:
         sqlite3.connect(":memory:"), ["amfi-nav"], lambda _source, _date: [], budget_sources=(BudgetSource(),)
     ).run(date(2026, 9, 1), date(2026, 9, 1))
     assert result.warnings
+
+
+def test_legacy_checkpoint_schema_is_upgraded_without_losing_rows() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.execute("CREATE TABLE backfill_checkpoints (source_id TEXT NOT NULL, effective_date TEXT NOT NULL, checksum TEXT NOT NULL, object_key TEXT, completed_at TEXT NOT NULL, PRIMARY KEY(source_id,effective_date))")
+    connection.execute("INSERT INTO backfill_checkpoints VALUES ('amfi-nav','2026-09-01','abc','raw/key','2026-09-02T00:00:00Z')")
+    BackfillJob(connection, ["amfi-nav"], lambda _source, _date: []).run(date(2026, 9, 2), date(2026, 9, 2))
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(backfill_checkpoints)")}
+    assert "artifact_id" in columns
+    row = connection.execute("SELECT source_id,effective_date,artifact_id,checksum,object_key FROM backfill_checkpoints").fetchone()
+    assert row[:2] == ("amfi-nav", "2026-09-01")
+    assert row[2].startswith("legacy-")
+    assert row[3:] == ("abc", "raw/key")
