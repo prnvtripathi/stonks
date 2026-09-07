@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.2"
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.x"
+          cache: pnpm
+      - name: Install Python dependencies
+        run: uv sync --locked
+      - name: Install Node dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Python checks
+        run: |
+          uv run ruff check .
+          uv run mypy pipeline
+          uv run pytest
+      - name: Node checks
+        run: |
+          pnpm lint
+          pnpm typecheck
+          pnpm test

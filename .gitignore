@@ -1,1 +1,20 @@
 .worktrees/
+
+# Node / pnpm
+node_modules/
+dist/
+coverage/
+.pnpm-debug.log*
+
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environment
+.env
+.env.*
+!.env.example
