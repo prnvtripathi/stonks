@@ -150,11 +150,13 @@ def serialize_momentum_provenance(
         "metadata": score_metadata,
     }]
     weights = MF_WEIGHTS if score.cohort.startswith("mutual_fund:") else EQUITY_WEIGHTS
+    percentage_components = {"six_month_performance", "three_month_performance", "six_month_return", "three_month_return", "twelve_month_return"}
     for component_id, weight in weights.items():
         raw = score.raw_components.get(component_id)
         normalized = score.normalized_components.get(component_id)
         component_metadata: dict[str, Any] = {
             "component_id": component_id,
+            "unit": "percent" if component_id in percentage_components else "ratio",
             "cohort": score.cohort,
             "coverage": float(score.coverage),
             "weight": float(weight),

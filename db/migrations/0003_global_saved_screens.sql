@@ -3,7 +3,7 @@
 -- This unique-index preflight aborts before any table rewrite if legacy snapshots
 -- reused a screen_id. The migration runner must execute each migration
 -- transactionally; no conflicting owner configuration is silently discarded.
-CREATE UNIQUE INDEX saved_screens_migration_unique_id ON saved_screens(screen_id);
+CREATE UNIQUE INDEX IF NOT EXISTS saved_screens_migration_unique_id ON saved_screens(screen_id);
 
 CREATE TABLE IF NOT EXISTS saved_screens_v2 (
     screen_id TEXT PRIMARY KEY,

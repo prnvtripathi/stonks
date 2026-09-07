@@ -36,7 +36,9 @@ export interface FundamentalPeriodDto { readonly periodId: string; readonly peri
 export interface CorporateActionDto { readonly actionId: string; readonly actionDate: string; readonly actionType: string; readonly numerator?: number | null; readonly denominator?: number | null; readonly metadata?: Readonly<Record<string, unknown>>; readonly sourceArtifactId?: string | null; }
 
 export interface MomentumComponentDto {
+  readonly componentId: string;
   readonly label: string;
+  readonly unit: "percent" | "ratio" | "count";
   readonly raw: number | null;
   readonly normalized: number | null;
   readonly weight: number;

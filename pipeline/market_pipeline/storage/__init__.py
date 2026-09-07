@@ -4,6 +4,7 @@ from market_pipeline.storage.d1_publisher import (
     DatasetCandidate,
     ReconciliationError,
     publish,
+    with_momentum_provenance,
 )
 from market_pipeline.storage.history_store import (
     HistoryStore,
@@ -22,4 +23,5 @@ __all__ = [
     "ReconciliationError",
     "StorageBudget",
     "publish",
+    "with_momentum_provenance",
 ]

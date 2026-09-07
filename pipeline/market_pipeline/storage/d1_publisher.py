@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence, cast
 
+from market_pipeline.analytics.momentum import MomentumScore, serialize_momentum_provenance
 from market_pipeline.storage.budgets import StorageBudget
 
 
@@ -108,6 +109,8 @@ class D1Publisher:
         from market_pipeline.jobs.backfill import upgrade_checkpoint_schema
 
         upgrade_checkpoint_schema(self.connection)
+        global_screens_migration = Path(__file__).resolve().parents[3] / "db" / "migrations" / "0003_global_saved_screens.sql"
+        self.connection.executescript(global_screens_migration.read_text(encoding="utf-8"))
         # Corporate actions are a forward-only addition so existing D1
         # databases receive the governed table without rewriting 0001.
         corporate_actions_migration = Path(__file__).resolve().parents[3] / "db" / "migrations" / "0004_corporate_actions.sql"
@@ -238,6 +241,10 @@ class D1Publisher:
             str(item[1])
             for item in self.connection.execute(f"PRAGMA table_info({table})").fetchall()
         }
+        if "dataset_id" not in available:
+            if rows:
+                raise ReconciliationError(f"dataset-scoped publication cannot write global table: {table}")
+            return
         columns = [column for column in ordered if column in available]
         self.connection.execute(f"DELETE FROM {table} WHERE dataset_id = ?", (dataset_id,))
         if not rows or len(columns) <= 1:
@@ -296,10 +303,12 @@ class D1Publisher:
             staged = DatasetCandidate(dataset_id=dataset_id, metadata=metadata, effective_date=self.connection.execute(
                 "SELECT effective_date FROM datasets WHERE dataset_id=?", (dataset_id,)
             ).fetchone()[0], status=str(metadata.get("status", "verified")))
-            counts = {
-                table: int(self.connection.execute(f"SELECT COUNT(*) FROM {table} WHERE dataset_id = ?", (dataset_id,)).fetchone()[0])
-                for table in _TABLES
-            }
+            counts = {}
+            for table in _TABLES:
+                table_columns = {str(item[1]) for item in self.connection.execute(f"PRAGMA table_info({table})").fetchall()}
+                query = f"SELECT COUNT(*) FROM {table} WHERE dataset_id = ?" if "dataset_id" in table_columns else f"SELECT COUNT(*) FROM {table}"
+                params = (dataset_id,) if "dataset_id" in table_columns else ()
+                counts[table] = int(self.connection.execute(query, params).fetchone()[0])
             if counts["instruments"] == 0 or counts["latest_metrics"] == 0:
                 raise ReconciliationError("staged candidate requires non-empty instruments and latest_metrics")
             if not staged.effective_date:
@@ -333,11 +342,44 @@ class D1Publisher:
         return dataset_id
 
 
-def publish(candidate: DatasetCandidate | Mapping[str, Any], publisher: D1Publisher) -> str:
+def with_momentum_provenance(
+    candidate: DatasetCandidate | Mapping[str, Any],
+    scores: Mapping[str, MomentumScore],
+    *,
+    source_artifact_ids: Mapping[str, str] | None = None,
+) -> DatasetCandidate:
+    """Attach canonical Task 6 momentum rows before a dataset is staged.
+
+    This is the publication seam used by dataset builders: existing non-momentum
+    metrics are retained, while rows for each newly computed instrument are
+    replaced with the complete score/component provenance. Artifact IDs are
+    caller-supplied only; this function never invents source lineage.
+    """
+
+    normalized = DatasetCandidate.from_value(candidate)
+    existing = [
+        row for row in normalized.tables.get("latest_metrics", ())
+        if not (str(row.get("instrument_id")) in scores and str(row.get("metric", "")).startswith("momentum_"))
+    ]
+    for instrument_id, score in scores.items():
+        existing.extend(serialize_momentum_provenance(instrument_id, score, source_artifact_id=(source_artifact_ids or {}).get(instrument_id)))
+    tables = dict(normalized.tables)
+    tables["latest_metrics"] = tuple(existing)
+    return replace(normalized, tables=tables)
+
+
+def publish(
+    candidate: DatasetCandidate | Mapping[str, Any],
+    publisher: D1Publisher,
+    *,
+    momentum_scores: Mapping[str, MomentumScore] | None = None,
+    source_artifact_ids: Mapping[str, str] | None = None,
+) -> str:
     """Stage and atomically promote a candidate dataset."""
 
-    dataset_id = publisher.stage(candidate)
+    enriched = with_momentum_provenance(candidate, momentum_scores, source_artifact_ids=source_artifact_ids) if momentum_scores else DatasetCandidate.from_value(candidate)
+    dataset_id = publisher.stage(enriched)
     return publisher.promote(dataset_id)
 
 
-__all__ = ["DatasetCandidate", "D1Publisher", "ReconciliationError", "publish"]
+__all__ = ["DatasetCandidate", "D1Publisher", "ReconciliationError", "publish", "with_momentum_provenance"]

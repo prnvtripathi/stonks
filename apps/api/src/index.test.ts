@@ -193,6 +193,33 @@ describe("private research API", () => {
     expect(body.run.matches[0]).toMatchObject({ symbol: "INFY", explanation: { clauses: expect.any(Array), momentum: { coverage: 1 } } });
   });
 
+  it("explains only saved AST predicates with boolean context and tri-state values", async () => {
+    const store = new MemoryResearchStore("dataset-1");
+    store.instruments.set("ONE", { instrumentId: "ONE", symbol: "ONE", name: "One", assetClass: "equity", active: true, metricRows: [
+      { metric: "volume", value: 10, state: "present" },
+      { metric: "return_3m", value: null, state: "missing" },
+      { metric: "roe", value: 0.2, state: "present" },
+      { metric: "momentum_score", value: 0.8, state: "present" },
+    ] });
+    const screen = await store.createScreen({ name: "Compound", source: "Volume > 5 OR Return over 3months > 10%", languageVersion: "v1", createdAt: "2026-01-01", updatedAt: "2026-01-01" });
+    const run = await store.runScreen("dataset-1", screen, "2026-01-01");
+    const clauses = run.matches[0]?.explanation.clauses ?? [];
+    expect(clauses).toHaveLength(2);
+    expect(clauses.map((clause) => clause.metric)).toEqual(["volume", "return_3m"]);
+    expect(clauses.map((clause) => clause.result)).toEqual(["Matched", "Unavailable"]);
+    expect(clauses[1]?.clause).toContain("OR");
+    expect(clauses.map((clause) => clause.metric)).not.toContain("roe");
+  });
+
+  it("orders same-day runs by completion time before the stable ID", async () => {
+    const store = new MemoryResearchStore("dataset-1");
+    store.runs.set("dataset-1:screen-1", [
+      { id: "z-uuid", screenId: "screen-1", datasetId: "dataset-1", effectiveDate: "2026-09-07", completedAt: "2026-09-07T10:00:00.000Z", matchCount: 0, status: "complete", matches: [] },
+      { id: "a-uuid", screenId: "screen-1", datasetId: "dataset-1", effectiveDate: "2026-09-07", completedAt: "2026-09-07T11:00:00.000Z", matchCount: 0, status: "complete", matches: [] },
+    ]);
+    expect((await store.listRuns("screen-1")).map((run) => run.id)).toEqual(["a-uuid", "z-uuid"]);
+  });
+
   it("surfaces a D1 mutation failure instead of reporting a saved screen", async () => {
     class FailingStatement implements D1Statement {
       bind(..._values: unknown[]): D1Statement { return this; }

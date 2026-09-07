@@ -3,7 +3,7 @@ import { expect, test } from "@playwright/test";
 test("explains a persisted match, preserves back navigation, and sends server sort requests", async ({ page }) => {
   const resultRequests: string[] = [];
   const screen = { id: "volume-breakout", name: "Volume breakout", source: "Volume > 500000", languageVersion: "v1", createdAt: "2026-09-01", updatedAt: "2026-09-04" };
-  const momentum = { components: [{ label: "Six-month performance", raw: 0.24, normalized: 0.82, weight: 0.2, contribution: 0.164 }], cohort: "equity", formulaVersion: "momentum-v2-cohort", coverage: 1, sourceDate: "2026-09-04" };
+  const momentum = { components: [{ componentId: "six_month_performance", label: "Six-month performance", unit: "percent", raw: 0.24, normalized: 0.82, weight: 0.2, contribution: 0.164 }], cohort: "equity", formulaVersion: "momentum-v2-cohort", coverage: 1, sourceDate: "2026-09-04" };
   const match = { instrumentId: "INFY", symbol: "INFY", rank: 1, score: 0.87, entered: true, exited: false, explanation: { matched: true, text: "Volume matched", metrics: ["volume"], clauses: [{ clause: "Volume > 500000", metric: "volume", result: "Matched" as const, value: { value: 900000, state: "present" as const } }] }, momentum };
   await page.route("**/api/v1/status", (route) => route.fulfill({ json: { effectiveDate: "2026-09-04", datasetId: "dataset-1", sources: [] } }));
   await page.route("**/api/v1/metrics", (route) => route.fulfill({ json: { metrics: [] } }));

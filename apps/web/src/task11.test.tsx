@@ -30,7 +30,7 @@ const match: ResultMatchDto = {
     clauses: [{ clause: "Return over 12months > 10%", result: "Matched", value: { value: 24.5, state: "present" } }],
   },
   momentum: {
-    components: [{ label: "12-month relative strength", raw: 24.5, normalized: 82, weight: 0.35, contribution: 28.7 }],
+    components: [{ componentId: "weighted_12m_rs_percentile", label: "12-month relative strength", unit: "ratio", raw: 24.5, normalized: 0.82, weight: 0.35, contribution: 0.287 }],
     cohort: "NSE EQ ordinary shares",
     formulaVersion: "momentum-v1",
     coverage: 1,
@@ -53,6 +53,13 @@ describe("Task 11 research views", () => {
     expect(screen.getByText("NSE EQ ordinary shares")).toBeVisible();
     expect(screen.getByText(/momentum-v1/)).toBeVisible();
     expect(screen.getByText(/100% coverage/)).toBeVisible();
+  });
+
+  it("formats fractional return components while documenting normalized scale", () => {
+    render(<MomentumBreakdown momentum={{ components: [{ componentId: "return_6m", label: "Six-month return", unit: "percent", raw: 0.24, normalized: 0.82, weight: 0.2, contribution: 0.164 }], cohort: "equity", formulaVersion: "momentum-v2-cohort", coverage: 1, sourceDate: "2026-09-04" }} />);
+    expect(screen.getByText("24%")) .toBeVisible();
+    expect(screen.getByText("0.82")) .toBeVisible();
+    expect(screen.getByText(/contribution is normalized × weight/i)).toBeVisible();
   });
 
   it("sorts and paginates labeled result rows", async () => {
