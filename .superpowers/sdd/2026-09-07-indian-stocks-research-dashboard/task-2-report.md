@@ -100,7 +100,8 @@ Success: no issues found in 12 source files
   four approved source IDs. Production should re-review each source's current usage
   and retention terms before scheduled automation; setting either policy flag false
   disables it without a fallback feed.
-- The injected R2 client intentionally exposes a small `put/get` contract. The
+- The injected R2 client intentionally exposes a small conditional `put_if_absent/get`
+  contract. The
   deployment adapter will need to wrap the chosen Cloudflare S3-compatible SDK to
   this contract.
 
@@ -115,7 +116,7 @@ Success: no issues found in 12 source files
   a recorded `permission_reference`/written license; AMFI and Nifty entries currently
   carry their official terms references.
 - `assert_source_enabled` now resolves the canonical registry entry and requires a
-  complete policy equality match. `assert_adapter_enabled`/`fetch_with_policy` gate
+  complete policy equality match. `assert_adapter_enabled`/`SourceAdapter.fetch` gate
   adapter fetches, and raw stores validate artifact URL/terms provenance against the
   canonical entry before persistence. Forged terms, URLs, and unknown IDs fail closed.
 - Metadata is now keyed per artifact filename (`{object_key}.metadata.json`). Local
@@ -190,3 +191,75 @@ No existing Python tests were intentionally removed.
 - Remaining concern: production must obtain and record an actual written permission or
   license before changing a disabled NSE canonical entry to enabled. The registry is
   deliberately fail-closed until that evidence exists.
+
+## Fix round 2/5
+
+### Findings addressed
+
+- Replaced the directly callable fetch protocol with a governed `SourceAdapter`
+  wrapper. Its public `fetch()` checks the complete canonical policy before invoking
+  only the implementation's private `_fetch()` method; no direct-fetch helper is
+  exported.
+- Added immutable commit markers alongside each body and per-artifact metadata. A
+  marker records the body and metadata SHA-256 values and is created conditionally
+  only after both objects. `get()` and `list()` expose an artifact only when the
+  marker and both hashes match. Local creation uses exclusive file creation; R2 uses
+  injected conditional `put_if_absent` for body, metadata, and marker. Metadata-race
+  tests confirm failed writes remain uncommitted and are not visible.
+- Added canonical approved HTTPS origin/path-prefix rules to each source policy.
+  Fetched artifact URLs can vary across official download paths while sibling hosts,
+  deceptive hostnames, HTTP, and disallowed paths fail closed. Exact fetched URLs
+  remain in artifact metadata.
+
+### Fix-round RED evidence
+
+```text
+UV_CACHE_DIR=/private/tmp/stonks-uv-cache uv run pytest pipeline/tests/sources/test_registry.py pipeline/tests/storage/test_raw_store.py -q
+8 failed, 8 passed in 0.12s
+```
+
+The failures demonstrated direct-fetch/forged-policy acceptance, enabled NSE entries,
+shared metadata, non-conditional R2 writes, and missing race/URL protections.
+
+The later listing test independently failed before its implementation:
+
+```text
+1 failed, 1 passed in 0.10s
+AttributeError: 'R2RawStore' object has no attribute 'list'
+```
+
+### Fix-round GREEN and final verification
+
+```text
+UV_CACHE_DIR=/private/tmp/stonks-uv-cache uv run pytest pipeline/tests/sources/test_registry.py pipeline/tests/storage/test_raw_store.py -q
+........................                                                 [100%]
+24 passed in 0.11s
+```
+
+```text
+UV_CACHE_DIR=/private/tmp/stonks-uv-cache uv run pytest -q
+.............................                                            [100%]
+29 passed in 0.10s
+```
+
+```text
+UV_CACHE_DIR=/private/tmp/stonks-uv-cache uv run ruff check pipeline/market_pipeline pipeline/tests
+All checks passed!
+```
+
+```text
+UV_CACHE_DIR=/private/tmp/stonks-uv-cache uv run mypy pipeline
+Success: no issues found in 12 source files
+```
+
+### Fix-round self-review and concerns
+
+- Verified adapter callers can only use the governed public wrapper, while private
+  implementations are policy-checked before their `_fetch()` method runs.
+- Verified marker creation is conditional and immutable for local and R2 stores;
+  adversarial metadata races leave bodies uncommitted, and listing excludes orphans.
+- Verified URL validation compares exact HTTPS hostnames plus path boundaries, so a
+  deceptive hostname or sibling path cannot satisfy an approved prefix.
+- Remaining concern: the deployment wrapper must map the Cloudflare S3-compatible SDK
+  to conditional `put_if_absent`; NSE automation remains disabled pending written
+  permission/license evidence.

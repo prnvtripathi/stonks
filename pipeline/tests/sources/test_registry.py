@@ -2,11 +2,12 @@ from datetime import date
 
 import pytest
 from market_pipeline.domain.models import FetchedArtifact, SourcePolicy
-from market_pipeline.sources.base import fetch_with_policy
+from market_pipeline.sources.base import SourceAdapter
 from market_pipeline.sources.registry import (
     OFFICIAL_SOURCE_IDS,
     SourcePolicyError,
     assert_source_enabled,
+    assert_source_url_allowed,
     get_source_policy,
 )
 
@@ -71,11 +72,26 @@ def test_adapter_policy_is_checked_before_fetch() -> None:
         adapter_version = "1.0.0"
         policy = get_source_policy("nse-eod")
 
-        def fetch(self, effective_date: date) -> list[FetchedArtifact]:
+        def _fetch(self, effective_date: date) -> list[FetchedArtifact]:
             raise AssertionError("fetch must not run for a disabled source")
 
     with pytest.raises(SourcePolicyError):
-        fetch_with_policy(Adapter(), date(2026, 9, 7))
+        SourceAdapter(Adapter()).fetch(date(2026, 9, 7))
+
+
+def test_official_download_url_prefixes_are_strict() -> None:
+    assert_source_url_allowed(
+        "nse-eod", "https://archives.nseindia.com/content/historical/EQUITIES/2026/SEP/cm04SEP2026bhav.csv.zip"
+    )
+    assert_source_url_allowed("amfi-nav", "https://www.amfiindia.com/spages/NAVAll.txt")
+    for url in (
+        "https://archives.nseindia.com.evil.example/content/file.zip",
+        "https://archives.nseindia.com.evil.example/content/file.zip",
+        "http://archives.nseindia.com/content/file.zip",
+        "https://www.nseindia.com/not-an-approved-download/file.zip",
+    ):
+        with pytest.raises(SourcePolicyError):
+            assert_source_url_allowed("nse-eod", url)
 
 
 def test_unknown_source_is_not_enabled() -> None:

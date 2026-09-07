@@ -129,6 +129,7 @@ class SourcePolicy(BaseModel):
     terms_url: str
     retention_allowed: bool = True
     permission_reference: str | None = None
+    approved_url_prefixes: tuple[str, ...] = ()
     description: str = ""
 
 

@@ -86,6 +86,38 @@ def test_local_metadata_conflict_is_rejected_before_body_creation(tmp_path: Path
     assert not (tmp_path / key).exists()
 
 
+def test_local_metadata_race_leaves_body_uncommitted(tmp_path: Path) -> None:
+    body = b"a"
+    artifact = make_artifact(body, "race.csv")
+
+    class MetadataRaceStore(LocalRawStore):
+        def _put_if_absent(self, path: Path, content: bytes) -> None:
+            if path.name.endswith(".metadata.json") and not path.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"raced metadata")
+            super()._put_if_absent(path, content)
+
+    store = MetadataRaceStore(tmp_path)
+    key = f"raw/{artifact.source_id}/{artifact.effective_date}/{artifact.checksum}/race.csv"
+    with pytest.raises(ImmutableRawStoreError):
+        store.put(artifact, body)
+    assert not (tmp_path / f"{key}.commit.json").exists()
+    with pytest.raises(KeyError):
+        store.get(key)
+
+
+def test_local_listing_excludes_uncommitted_bodies(tmp_path: Path) -> None:
+    body = b"a"
+    artifact = make_artifact(body, "listed.csv")
+    store = LocalRawStore(tmp_path)
+    key = store.put(artifact, body)
+    orphan = tmp_path / "raw/amfi-nav/2026-09-04/orphan/orphan.csv"
+    orphan.parent.mkdir(parents=True)
+    orphan.write_bytes(body)
+
+    assert store.list() == [key]
+
+
 def test_local_store_rejects_keys_that_escape_the_root(tmp_path: Path) -> None:
     artifact = make_artifact(b"a", "../../outside.csv")
     with pytest.raises(ImmutableRawStoreError):
@@ -108,9 +140,13 @@ class MemoryClient:
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
         self.put_if_absent_calls = 0
+        self.race_on_metadata = False
 
     def put_if_absent(self, key: str, body: bytes) -> bool:
         self.put_if_absent_calls += 1
+        if self.race_on_metadata and key.endswith(".metadata.json") and key not in self.objects:
+            self.objects[key] = b"raced metadata"
+            return False
         if key in self.objects:
             return False
         self.objects[key] = body
@@ -118,6 +154,9 @@ class MemoryClient:
 
     def get(self, key: str) -> bytes | None:
         return self.objects.get(key)
+
+    def list(self, prefix: str = "") -> list[str]:
+        return sorted(key for key in self.objects if key.startswith(prefix))
 
 
 def test_r2_store_uses_injected_client_and_same_key_layout() -> None:
@@ -142,7 +181,7 @@ def test_r2_conditional_create_rejects_existing_conflicting_bytes() -> None:
 
     with pytest.raises(ImmutableRawStoreError):
         store.put(artifact, body)
-    assert client.put_if_absent_calls == 3
+    assert client.put_if_absent_calls == 4
 
 
 def test_r2_metadata_conflict_is_rejected_before_body_creation() -> None:
@@ -155,3 +194,30 @@ def test_r2_metadata_conflict_is_rejected_before_body_creation() -> None:
     with pytest.raises(ImmutableRawStoreError):
         R2RawStore(client).put(artifact, body)
     assert key not in client.objects
+
+
+def test_r2_metadata_race_leaves_body_uncommitted() -> None:
+    body = b"a"
+    artifact = make_artifact(body, "race.json")
+    client = MemoryClient()
+    client.race_on_metadata = True
+    store = R2RawStore(client)
+    key = f"raw/{artifact.source_id}/{artifact.effective_date}/{artifact.checksum}/race.json"
+
+    with pytest.raises(ImmutableRawStoreError):
+        store.put(artifact, body)
+    assert f"{key}.commit.json" not in client.objects
+    with pytest.raises(KeyError):
+        store.get(key)
+
+
+def test_r2_listing_excludes_uncommitted_bodies() -> None:
+    body = b"a"
+    artifact = make_artifact(body, "listed.json")
+    client = MemoryClient()
+    store = R2RawStore(client)
+    key = store.put(artifact, body)
+    orphan = "raw/amfi-nav/2026-09-04/orphan/orphan.json"
+    client.objects[orphan] = body
+
+    assert store.list() == [key]
