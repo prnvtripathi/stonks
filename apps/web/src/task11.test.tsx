@@ -40,10 +40,30 @@ const match: ResultMatchDto = {
 
 describe("Task 11 research views", () => {
   it("distinguishes present, missing, and not applicable values", () => {
-    render(<div><MetricValue value={{ value: 24.5, state: "present" }} unit="percent" /><MetricValue value={{ value: null, state: "missing" }} /><MetricValue value={{ value: null, state: "not_applicable" }} /></div>);
+    render(<div><MetricValue value={{ value: 0.245, state: "present" }} unit="percent" /><MetricValue value={{ value: null, state: "missing" }} /><MetricValue value={{ value: null, state: "not_applicable" }} /></div>);
     expect(screen.getByText("24.5%")) .toBeVisible();
     expect(screen.getByText("Missing data")).toBeVisible();
     expect(screen.getByText("Not applicable")).toBeVisible();
+  });
+
+  // Task 8 fixed the storage convention as fractional percents (0.03 = 3%).
+  // High-momentum smallcaps routinely exceed +100%/-100%, so the renderer must
+  // never treat |value| > 1 as "already a percentage".
+  it("renders percent metrics above 100 percent without dropping the scale", () => {
+    render(<div><MetricValue value={{ value: 2.52, state: "present" }} unit="percent" label="12-month return" /><MetricValue value={{ value: -1.2, state: "present" }} unit="percent" label="drawdown" /></div>);
+    expect(screen.getByText("252%")) .toBeVisible();
+    expect(screen.getByText("-120%")) .toBeVisible();
+  });
+
+  it("renders momentum raw components above 100 percent at full scale", () => {
+    render(<MomentumBreakdown momentum={{ components: [{ componentId: "twelve_month_return", label: "Twelve-month return", unit: "percent", raw: 2.52, normalized: 0.99, weight: 0.3, contribution: 0.297 }], cohort: "equity", formulaVersion: "momentum-v2-cohort", coverage: 1, sourceDate: "2026-09-04" }} />);
+    expect(screen.getByText("252%")) .toBeVisible();
+  });
+
+  it("reads percent units from the shared metric catalog rather than a local list", () => {
+    render(<ComparisonTable instruments={[{ ...equity, metricRows: [{ metric: "return_3m", value: 1.2, state: "present" }, { metric: "market_cap", value: 1234, state: "present" }] }]} />);
+    expect(screen.getByText("120%")) .toBeVisible();
+    expect(screen.getByText("₹1,234")) .toBeVisible();
   });
 
   it("shows every momentum component and coverage context", () => {

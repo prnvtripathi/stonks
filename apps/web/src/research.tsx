@@ -1,18 +1,24 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { DEFAULT_GLOSSARY_ENTRIES, type AssetClass, type MetricState } from "@stonks/contracts";
+import { DEFAULT_GLOSSARY_ENTRIES, DEFAULT_METRIC_CATALOG, type AssetClass, type MetricState } from "@stonks/contracts";
 import type { ChartDto, DashboardApi, InstrumentDto, MetricValueDto, MomentumBreakdownDto, ResultMatchDto, ScreenResultsDto } from "./api";
 import { TermPopover } from "./learn";
 
 const assetLabel: Record<AssetClass, string> = { equity: "NSE equity", etf: "NSE ETF", mutual_fund: "AMFI mutual fund" };
-const percentMetrics = new Set(["return_1d", "return_1w", "return_1m", "return_3m", "return_6m", "return_12m", "volatility_1y", "max_drawdown_1y", "benchmark_rs_3m", "benchmark_rs_6m", "benchmark_rs_12m"]);
-const unitForMetric = (metric: string): string | undefined => percentMetrics.has(metric) ? "percent" : undefined;
+// Units are declared once, per metric, in the shared contracts catalog. Never
+// re-declare them here: a local copy silently drifts from what the pipeline
+// publishes and what the query language type-checks against.
+const unitForMetric = (metric: string): string | undefined => DEFAULT_METRIC_CATALOG.find((definition) => definition.id === metric)?.unit;
 const glossaryForMetric = (metric: string) => {
   const slug = metric.startsWith("return_") ? "return" : metric === "volume" ? "volume" : metric === "volume_1w_avg" ? "average-volume" : metric === "market_cap" ? "market-cap" : metric === "rs_rating" ? "relative-strength-rating" : metric === "volatility_1y" ? "volatility" : metric === "max_drawdown_1y" ? "drawdown" : metric === "benchmark_rs_3m" || metric === "benchmark_rs_6m" || metric === "benchmark_rs_12m" ? "relative-strength-benchmark" : undefined;
   return slug ? DEFAULT_GLOSSARY_ENTRIES.find((entry) => entry.slug === slug) : undefined;
 };
 function MetricTerm({ metric, children }: { readonly metric: string; readonly children: ReactNode }) { const entry = glossaryForMetric(metric); return entry ? <TermPopover entry={entry}>{children}</TermPopover> : children; }
+// Task 8 fixed the storage convention: percent-unit values are always stored as
+// fractions (0.03 = 3%). Scaling is therefore unconditional -- a magnitude-based
+// heuristic would mis-render every return beyond +/-100%, which is exactly the
+// range a momentum screener is built to surface.
 const formatNumber = (value: number, unit?: string): string => {
-  const displayValue = unit === "percent" && Math.abs(value) <= 1 ? value * 100 : value;
+  const displayValue = unit === "percent" ? value * 100 : value;
   const formatted = new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 }).format(displayValue);
   return unit === "percent" ? `${formatted}%` : unit === "currency" ? `₹${formatted}` : formatted;
 };

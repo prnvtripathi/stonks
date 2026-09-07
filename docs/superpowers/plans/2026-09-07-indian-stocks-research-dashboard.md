@@ -502,7 +502,7 @@ git commit -m "feat: add explainable research result views"
 
 **Interfaces:** Produces `{slug,term,aliases,summary,formula,interpretation,pitfalls,assetClasses,sources,reviewedAt}` and `/api/v1/glossary`.
 
-- [ ] **Step 1: Write failing content validation test**
+- [x] **Step 1: Write failing content validation test**
 
 ```ts
 it("requires an authoritative source and review date", () => {
@@ -512,15 +512,15 @@ it("requires an authoritative source and review date", () => {
 
 Seed return, volume, average volume, market cap, moving average, 52-week high, both RS forms, volatility, drawdown, NAV, ROE, ROCE, debt/equity, PE, and cash flow.
 
-- [ ] **Step 2: Implement validated content/API**
+- [x] **Step 2: Implement validated content/API**
 
 Require HTTPS sources, formula provenance when present, and review dates. Serve only curated content; never call a model.
 
-- [ ] **Step 3: Implement Learn search and keyboard-accessible popovers**
+- [x] **Step 3: Implement Learn search and keyboard-accessible popovers**
 
 Short popovers link to full meaning, formula, interpretation, pitfalls, applicability, review date, and descriptive authoritative links.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 pnpm --filter @stonks/api test && pnpm --filter @stonks/web test
@@ -534,7 +534,7 @@ git commit -m "feat: add reviewed financial glossary"
 
 **Interfaces:** Produces `ReconciliationReport`, `BudgetReport`, weekday workflow, manual date/range inputs, recovery commands.
 
-- [ ] **Step 1: Write failing reconciliation/budget tests**
+- [x] **Step 1: Write failing reconciliation/budget tests**
 
 ```python
 def test_coverage_drop_blocks_publish() -> None:
@@ -543,15 +543,15 @@ def test_eighty_percent_warns() -> None:
     assert budget_report(used=4_000_000_000, limit=5_000_000_000).warning
 ```
 
-- [ ] **Step 2: Implement source-specific freshness and reconciliation**
+- [x] **Step 2: Implement source-specific freshness and reconciliation**
 
 Compare counts, missing ratios, extremes, duplicates, action coverage, benchmark date, and RS distribution. Mark each source complete/delayed/failed/not_expected independently.
 
-- [ ] **Step 3: Add scheduled/manual workflow**
+- [x] **Step 3: Add scheduled/manual workflow**
 
 Run after expected NSE EOD availability in Asia/Kolkata, accept manual date/range, lock concurrent publication, use environment secrets, publish redacted reports, and stop before promotion on blocking failures.
 
-- [ ] **Step 4: Document exact retry/rollback/restore commands, verify, and commit**
+- [x] **Step 4: Document exact retry/rollback/restore commands, verify, and commit**
 
 ```bash
 uv run pytest pipeline/tests/validation pipeline/tests/monitoring -q
@@ -565,7 +565,7 @@ git commit -m "ops: schedule and safeguard daily refresh"
 
 **Interfaces:** Produces preview/production deployment, migration gate, Access verification, smoke checks, launch evidence.
 
-- [ ] **Step 1: Write failing privacy/mobile acceptance tests**
+- [x] **Step 1: Write failing privacy/mobile acceptance tests**
 
 ```ts
 test("anonymous API is denied", async ({ request }) => {
@@ -578,15 +578,15 @@ test("screens work at 320px", async ({ page }) => {
 });
 ```
 
-- [ ] **Step 2: Implement gated preview-to-production deployment**
+- [x] **Step 2: Implement gated preview-to-production deployment**
 
 Order: validate source policy, run all tests, migrate preview, deploy preview, authenticated smoke test, migrate production, deploy production, read-only production smoke test. Pin actions and scope Cloudflare tokens.
 
-- [ ] **Step 3: Configure/document Cloudflare Access and security headers**
+- [x] **Step 3: Configure/document Cloudflare Access and security headers**
 
 Allow one owner identity; bind exact Access audience; use a pipeline service token; permit no bypass routes. Set CSP, HSTS, frame denial, strict referrer policy, private caching, and secret rotation. Protect static assets, API, and R2 objects.
 
-- [ ] **Step 4: Run the complete verification suite**
+- [x] **Step 4: Run the complete verification suite**
 
 ```bash
 uv run ruff check . && uv run mypy pipeline && uv run pytest
@@ -596,7 +596,7 @@ pnpm --filter @stonks/web test:e2e
 
 Also run a fixture-backed pipeline, force and verify rollback, execute the representative volume screen, compare both RS outputs with golden fixtures, inspect provenance/glossary links, and review free-tier budgets.
 
-- [ ] **Step 5: Record acceptance evidence and commit**
+- [x] **Step 5: Record acceptance evidence and commit**
 
 ```bash
 git add .github apps docs/operations

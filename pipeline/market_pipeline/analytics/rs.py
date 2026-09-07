@@ -12,12 +12,18 @@ FORMULA_VERSION = "rs-v1"
 
 
 def benchmark_rs(asset: Decimal, benchmark: Decimal) -> Decimal:
-    """Return benchmark-relative performance in percentage points."""
+    """Return benchmark-relative performance as a fraction.
+
+    Both inputs and the result use the Task 8 fractional-percent convention
+    (``0.0909`` means 9.09%), matching returns, volatility, and drawdown. The
+    UI renders every ``unit: "percent"`` metric by multiplying by 100, so
+    returning percentage points here would display as "909%".
+    """
 
     if Decimal(1) + benchmark == 0:
         raise ValueError("benchmark return cannot be -100 percent")
-    value = ((Decimal(1) + asset) / (Decimal(1) + benchmark) - Decimal(1)) * Decimal(100)
-    return value.quantize(Decimal("0.000001"), rounding=ROUND_HALF_EVEN)
+    value = (Decimal(1) + asset) / (Decimal(1) + benchmark) - Decimal(1)
+    return value.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_EVEN)
 
 
 def weighted_rs_score(values: Sequence[Decimal]) -> Decimal:

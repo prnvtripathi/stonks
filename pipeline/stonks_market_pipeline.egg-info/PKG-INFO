@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: stonks-market-pipeline
+Version: 0.1.0
+Summary: Private end-of-day Indian markets research data pipeline
+Requires-Python: <3.14,>=3.13
+Requires-Dist: hypothesis<7,>=6.138
+Requires-Dist: pydantic<3,>=2.11
+Requires-Dist: polars<2,>=1.32
+Requires-Dist: pyarrow<21,>=20

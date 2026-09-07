@@ -4,8 +4,11 @@ from decimal import Decimal
 from market_pipeline.analytics.rs import benchmark_rs, equity_rs_rating, weighted_rs_score
 
 
-def test_benchmark_rs() -> None:
-    assert benchmark_rs(Decimal("0.20"), Decimal("0.10")) == Decimal("9.090909")
+def test_benchmark_rs_returns_a_fraction_like_every_other_percent_metric() -> None:
+    # Task 8 convention: percent-unit values are fractions (0.0909 = 9.09%), so
+    # benchmark RS must not be expressed in percentage points.
+    assert benchmark_rs(Decimal("0.20"), Decimal("0.10")) == Decimal("0.09090909")
+    assert benchmark_rs(Decimal("0.10"), Decimal("0.10")) == Decimal("0")
 
 
 def test_recent_quarter_has_double_weight() -> None:
