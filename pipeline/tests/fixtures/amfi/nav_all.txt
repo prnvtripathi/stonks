@@ -1,0 +1,9 @@
+﻿Scheme Code;ISIN Div Payout/ ISIN Growth;ISIN Div Reinvestment;Scheme Name;Net Asset Value;Date
+Acme Mutual Fund
+Open Ended Schemes (Equity Scheme - Large Cap)
+120503;INF000A01001;;Acme Large Cap Fund - Direct Plan - Growth;42.1234;07-Sep-2026
+120504;INF000A01002;;Acme Large Cap Fund - Regular Plan - IDCW;41.5000;07-Sep-2026
+Open Ended Schemes (Debt Scheme - Short Duration)
+120505;;INF000A01003;Acme Short Duration Fund;10.0000;07-Sep-2026
+Other Schemes
+120506;INF000A01004;;Acme ETF;10.0000;07-Sep-2026
