@@ -6,6 +6,7 @@ from market_pipeline.analytics.momentum import (
     NormalizedMomentumInput,
     momentum_score,
     momentum_scores,
+    serialize_momentum_provenance,
 )
 
 
@@ -219,3 +220,39 @@ def test_mutual_fund_requires_twelve_month_history_and_category() -> None:
 
     assert result.score == Decimal("1")
     assert result.cohort == "mutual_fund:Equity"
+
+
+def test_serializes_metric_rows_with_auditable_component_provenance() -> None:
+    result = momentum_score(NormalizedMomentumInput.from_mapping({key: Decimal("0.5") for key in (
+        "weighted_12m_rs_percentile", "six_month_performance", "three_month_performance",
+        "trend_strength", "proximity_to_52_week_high", "volume_confirmation",
+    )}, asset_class="equity"), effective_date="2026-09-07")
+    rows = serialize_momentum_provenance("INFY", result, source_artifact_id="artifact-1")
+    score = next(row for row in rows if row["metric"] == "momentum_score")
+    component = next(row for row in rows if row["metric"] == "momentum_weighted_12m_rs_percentile")
+    assert score["instrument_id"] == "INFY"
+    assert score["metric"] == "momentum_score"
+    assert score["value"] == 0.5
+    assert score["state"] == "present"
+    assert score["effective_date"] == "2026-09-07"
+    assert score["normalized_value"] == 0.5
+    assert score["formula_version"] == "momentum-v2-cohort"
+    assert score["source_artifact_id"] == "artifact-1"
+    assert score["metadata"]["coverage"] == 1.0
+    assert score["metadata"]["source_date"] == "2026-09-07"
+    metadata = component["metadata"]
+    assert metadata["component_id"] == "weighted_12m_rs_percentile"
+    assert metadata["normalized"] == 0.5
+    assert metadata["weight"] == 0.35
+    assert metadata["contribution"] == 0.175
+    assert metadata["cohort"] == "equity"
+
+
+def test_serializes_mutual_fund_component_ids_and_unavailable_warning() -> None:
+    result = momentum_score(NormalizedMomentumInput.from_mapping({"three_month_return": Decimal("0.5")}, asset_class="mutual_fund", category="large-cap"))
+    rows = serialize_momentum_provenance("FUND", result)
+    assert {row["metric"] for row in rows} >= {"momentum_score", "momentum_three_month_return"}
+    score = next(row for row in rows if row["metric"] == "momentum_score")
+    assert score["state"] == "missing"
+    assert score["metadata"]["cohort"] == "mutual_fund:large-cap"
+    assert "warning" in score["metadata"]

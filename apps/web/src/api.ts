@@ -29,7 +29,11 @@ export interface MetricValueDto {
   readonly normalizedValue?: number | null;
   readonly formulaVersion?: string | null;
   readonly sourceArtifactId?: string | null;
+  readonly metadata?: Readonly<Record<string, unknown>>;
 }
+
+export interface FundamentalPeriodDto { readonly periodId: string; readonly periodEnd: string; readonly periodType: string; readonly filingId: string; readonly filedAt: string; readonly metrics: Readonly<Record<string, unknown>>; readonly sourceArtifactId?: string | null; }
+export interface CorporateActionDto { readonly actionId: string; readonly actionDate: string; readonly actionType: string; readonly numerator?: number | null; readonly denominator?: number | null; readonly metadata?: Readonly<Record<string, unknown>>; readonly sourceArtifactId?: string | null; }
 
 export interface MomentumComponentDto {
   readonly label: string;
@@ -50,6 +54,7 @@ export interface MomentumBreakdownDto {
 
 export interface ClauseExplanationDto {
   readonly clause: string;
+  readonly metric?: string;
   readonly result: "Matched" | "Unavailable" | "Not applicable" | "Not matched";
   readonly value?: MetricValueDto;
 }
@@ -72,6 +77,8 @@ export interface InstrumentDto {
   readonly metricRows?: readonly ({ readonly metric: string } & MetricValueDto)[];
   readonly metadata?: Readonly<Record<string, string | number | null>>;
   readonly momentum?: MomentumBreakdownDto;
+  readonly fundamentalPeriods?: readonly FundamentalPeriodDto[];
+  readonly corporateActions?: readonly CorporateActionDto[];
 }
 
 export interface ResultMatchDto {
@@ -100,7 +107,7 @@ export interface DashboardApi {
   getMetrics(): Promise<readonly MetricDefinition[]>;
   getScreens(): Promise<Page<SavedScreen>>;
   getRuns?(screenId: string): Promise<{ readonly screen: SavedScreen; readonly runs: readonly ScreenRunSummary[] }>;
-  getResults?(screenId: string, options?: { readonly runId?: string; readonly limit?: number; readonly offset?: number; readonly sort?: "rank" | "score" | "symbol" | "assetClass" }): Promise<ScreenResultsDto>;
+  getResults?(screenId: string, options?: { readonly runId?: string; readonly limit?: number; readonly offset?: number; readonly sort?: "rank" | "score" | "symbol" | "assetClass"; readonly direction?: "asc" | "desc" }): Promise<ScreenResultsDto>;
   getInstrument?(instrumentId: string): Promise<InstrumentDto>;
   getChart?(instrumentId: string): Promise<ChartDto>;
   createScreen(input: { readonly name: string; readonly source: string }): Promise<SavedScreen>;
@@ -136,6 +143,7 @@ export function createApiClient(options: ApiClientOptions = {}): DashboardApi {
       if (options.limit !== undefined) params.set("limit", String(options.limit));
       if (options.offset !== undefined) params.set("offset", String(options.offset));
       if (options.sort) params.set("sort", options.sort);
+      if (options.direction) params.set("direction", options.direction);
       return request<ScreenResultsDto>(`/api/v1/screens/${encodeURIComponent(screenId)}/results${params.toString() ? `?${params}` : ""}`);
     },
     getInstrument: (instrumentId) => request<InstrumentDto>(`/api/v1/instruments/${encodeURIComponent(instrumentId)}`),

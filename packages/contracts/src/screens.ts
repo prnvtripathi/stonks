@@ -12,6 +12,7 @@ export interface ScreenRun {
   readonly screenId: string;
   readonly datasetId: string;
   readonly effectiveDate: string;
+  readonly completedAt?: string;
   readonly matchCount: number;
   readonly status: "complete" | "failed";
 }

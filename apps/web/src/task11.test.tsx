@@ -1,6 +1,7 @@
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { ComparisonTable, InstrumentResearch, MetricValue, MomentumBreakdown, ResultsTable } from "./research";
+import { createApiClient } from "./api";
 import type { InstrumentDto, ResultMatchDto } from "./api";
 
 const equity: InstrumentDto = {
@@ -77,5 +78,17 @@ describe("Task 11 research views", () => {
     expect(screen.getByRole("heading", { name: /infosys limited research/i })).toBeVisible();
     expect(screen.getByRole("heading", { name: /adjusted price history/i })).toBeVisible();
     expect(screen.getByRole("table", { name: /history/i })).toBeVisible();
+  });
+
+  it("formats fractional percent metrics using their catalog unit", () => {
+    render(<ComparisonTable instruments={[{ ...equity, metricRows: [{ metric: "return_12m", value: 0.245, state: "present" }] }]} />);
+    expect(screen.getByText("24.5%")) .toBeVisible();
+  });
+
+  it("sends server sort and pagination parameters", async () => {
+    const fetcher = vi.fn(async (_input: RequestInfo | URL) => Response.json({ screen: {}, run: { matches: [] }, pagination: { limit: 25, offset: 25, total: 30 } }));
+    const api = createApiClient({ baseUrl: "https://dashboard.example", fetcher });
+    await api.getResults!("screen-1", { sort: "score", direction: "desc", limit: 25, offset: 25 });
+    expect(String(fetcher.mock.calls[0]?.[0])).toContain("/api/v1/screens/screen-1/results?limit=25&offset=25&sort=score&direction=desc");
   });
 });

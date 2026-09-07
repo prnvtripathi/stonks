@@ -23,6 +23,7 @@ _TABLES = {
     "instrument_aliases",
     "latest_metrics",
     "fundamental_periods",
+    "corporate_actions",
     "saved_screens",
     "screen_runs",
     "screen_matches",
@@ -107,6 +108,10 @@ class D1Publisher:
         from market_pipeline.jobs.backfill import upgrade_checkpoint_schema
 
         upgrade_checkpoint_schema(self.connection)
+        # Corporate actions are a forward-only addition so existing D1
+        # databases receive the governed table without rewriting 0001.
+        corporate_actions_migration = Path(__file__).resolve().parents[3] / "db" / "migrations" / "0004_corporate_actions.sql"
+        self.connection.executescript(corporate_actions_migration.read_text(encoding="utf-8"))
         self.connection.commit()
 
     def active_dataset_id(self) -> str | None:
@@ -225,7 +230,9 @@ class D1Publisher:
         return candidate.dataset_id
 
     def _replace_rows(self, table: str, dataset_id: str, rows: Sequence[Mapping[str, Any]]) -> None:
-        columns = [str(row_key) for row in rows for row_key in row.keys()]
+        # Publication serializers may use the ergonomic ``metadata`` name;
+        # storage is governed by the schema's ``metadata_json`` column.
+        columns = ["metadata_json" if str(row_key) == "metadata" else str(row_key) for row in rows for row_key in row.keys()]
         ordered = list(dict.fromkeys(["dataset_id", *columns]))
         available = {
             str(item[1])
@@ -238,7 +245,7 @@ class D1Publisher:
         placeholders = ",".join("?" for _ in columns)
         sql = f"INSERT INTO {table} ({','.join(columns)}) VALUES ({placeholders})"
         for row in rows:
-            values = [dataset_id if column == "dataset_id" else self._db_value(row.get(column)) for column in columns]
+            values = [dataset_id if column == "dataset_id" else self._db_value(row.get("metadata" if column == "metadata_json" and "metadata" in row else column)) for column in columns]
             self.connection.execute(sql, values)
 
     @classmethod

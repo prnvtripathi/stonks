@@ -3,8 +3,10 @@
 from market_pipeline.analytics.momentum import (
     MomentumScore,
     NormalizedMomentumInput,
+    momentum_metric_rows,
     momentum_score,
     momentum_scores,
+    serialize_momentum_provenance,
 )
 from market_pipeline.analytics.returns import ReturnMetrics, calculate_returns
 from market_pipeline.analytics.risk import RiskMetrics, calculate_risk
@@ -20,6 +22,8 @@ __all__ = [
     "calculate_risk",
     "equity_rs_rating",
     "momentum_score",
+    "momentum_metric_rows",
     "momentum_scores",
+    "serialize_momentum_provenance",
     "weighted_rs_score",
 ]

@@ -139,6 +139,8 @@ async function getResults(screenId: string, url: URL, store: ResearchStore): Pro
   if (!pagination) return error(400, "Invalid pagination");
   const sort = url.searchParams.get("sort") ?? "rank";
   if (!(new Set(["rank", "score", "symbol", "assetClass"])).has(sort)) return error(400, "Invalid sort");
+  const direction = url.searchParams.get("direction") ?? (sort === "score" ? "desc" : "asc");
+  if (direction !== "asc" && direction !== "desc") return error(400, "Invalid sort direction");
   const runs = (await store.listRuns(screenId)).filter((candidate) => candidate.datasetId === datasetId && candidate.status === "complete");
   const requestedRunId = url.searchParams.get("runId");
   const run = (requestedRunId ? runs.find((candidate) => candidate.id === requestedRunId) : runs[0]) ?? null;
@@ -152,7 +154,8 @@ async function getResults(screenId: string, url: URL, store: ResearchStore): Pro
   const ordered = [...enriched].sort((left, right) => {
     const leftValue = sort === "symbol" ? left.symbol ?? "" : sort === "assetClass" ? left.assetClass ?? "" : left[sort as "rank" | "score"] ?? -Infinity;
     const rightValue = sort === "symbol" ? right.symbol ?? "" : sort === "assetClass" ? right.assetClass ?? "" : right[sort as "rank" | "score"] ?? -Infinity;
-    return typeof leftValue === "string" ? leftValue.localeCompare(String(rightValue)) || left.instrumentId.localeCompare(right.instrumentId) : Number(rightValue) - Number(leftValue) || left.instrumentId.localeCompare(right.instrumentId);
+    const comparison = typeof leftValue === "string" ? leftValue.localeCompare(String(rightValue)) : Number(leftValue) - Number(rightValue);
+    return (direction === "asc" ? comparison : -comparison) || left.instrumentId.localeCompare(right.instrumentId);
   });
   const { limit, offset } = pagination;
   return json({ screen, run: { ...run, matches: ordered.slice(offset, offset + limit) }, pagination: { limit, offset, total: ordered.length } });

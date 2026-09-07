@@ -109,6 +109,77 @@ class MomentumScore:
         return self.score
 
 
+def serialize_momentum_provenance(
+    instrument_id: str,
+    score: MomentumScore,
+    *,
+    source_artifact_id: str | None = None,
+    warning: str | None = None,
+) -> list[dict[str, Any]]:
+    """Serialize a score into ``latest_metrics`` rows for D1 publication.
+
+    The score row carries the cohort-level provenance while one stable metric
+    row is emitted for every asset-specific component. Raw component values
+    retain Task 6's fractional return/risk units; ``normalized_value`` and
+    component metadata are always unit-interval values. A missing score is
+    represented as ``state=missing`` rather than as numeric zero.
+    """
+
+    source_date = score.effective_date.isoformat() if score.effective_date else None
+    score_warning = warning or ("Insufficient component coverage." if score.score is None or score.coverage < Decimal("1") else None)
+    common: dict[str, Any] = {
+        "instrument_id": instrument_id,
+        "effective_date": source_date,
+        "formula_version": score.formula_version,
+        "source_artifact_id": source_artifact_id,
+    }
+    score_metadata: dict[str, Any] = {
+        "cohort": score.cohort,
+        "coverage": float(score.coverage),
+        "source_date": source_date,
+        "component_ids": list(score.raw_components),
+    }
+    if score_warning is not None:
+        score_metadata["warning"] = score_warning
+    rows: list[dict[str, Any]] = [{
+        **common,
+        "metric": "momentum_score",
+        "value": float(score.score) if score.score is not None else None,
+        "state": "present" if score.score is not None else "missing",
+        "normalized_value": float(score.score) if score.score is not None else None,
+        "metadata": score_metadata,
+    }]
+    weights = MF_WEIGHTS if score.cohort.startswith("mutual_fund:") else EQUITY_WEIGHTS
+    for component_id, weight in weights.items():
+        raw = score.raw_components.get(component_id)
+        normalized = score.normalized_components.get(component_id)
+        component_metadata: dict[str, Any] = {
+            "component_id": component_id,
+            "cohort": score.cohort,
+            "coverage": float(score.coverage),
+            "weight": float(weight),
+            "normalized": float(normalized) if normalized is not None else None,
+            "contribution": float(normalized * weight) if normalized is not None else None,
+            "source_date": source_date,
+        }
+        if score_warning is not None:
+            component_metadata["warning"] = score_warning
+        rows.append({
+            **common,
+            "metric": f"momentum_{component_id}",
+            "value": float(raw) if raw is not None else None,
+            "state": "present" if raw is not None else "missing",
+            "raw_value": str(raw) if raw is not None else None,
+            "normalized_value": float(normalized) if normalized is not None else None,
+            "metadata": component_metadata,
+        })
+    return rows
+
+
+# Stable alias for publishers that name the contract after its destination.
+momentum_metric_rows = serialize_momentum_provenance
+
+
 def _decimal_components(values: Mapping[str, Any]) -> dict[str, Decimal]:
     return {
         key: decimal_value

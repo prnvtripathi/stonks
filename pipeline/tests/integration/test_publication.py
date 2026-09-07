@@ -1,10 +1,25 @@
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 from typing import Any
 
 import pytest
 from market_pipeline.storage.d1_publisher import D1Publisher, ReconciliationError, publish
+
+
+def test_corporate_actions_forward_migration_upgrades_existing_and_fresh_databases() -> None:
+    migration_dir = Path(__file__).resolve().parents[3] / "db" / "migrations"
+    legacy = sqlite3.connect(":memory:")
+    legacy.executescript((migration_dir / "0001_market_schema.sql").read_text(encoding="utf-8"))
+    assert legacy.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='corporate_actions'").fetchone() is None
+    D1Publisher(legacy).initialize_schema()
+    assert legacy.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='corporate_actions'").fetchone() is not None
+
+    fresh = sqlite3.connect(":memory:")
+    D1Publisher(fresh).initialize_schema()
+    assert fresh.execute("PRAGMA table_info(corporate_actions)").fetchall()
+    assert fresh.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_corporate_actions_instrument'").fetchone() is not None
 
 
 def test_bad_candidate_does_not_replace_active() -> None:
