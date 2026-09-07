@@ -1,0 +1,9 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "stonks-research-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-07",
+  "workers_dev": false,
+  "d1_databases": [{ "binding": "DB", "database_name": "stonks-research", "database_id": "replace-in-deployment" }],
+  "r2_buckets": [{ "binding": "CHARTS", "bucket_name": "stonks-private-history" }]
+}

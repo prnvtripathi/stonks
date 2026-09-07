@@ -12,6 +12,8 @@ export interface CompileOptions {
   readonly relation?: "wide" | "eav";
   /** Required by D1/EAV execution; omitted values bind NULL and match no rows. */
   readonly datasetId?: string;
+  /** EAV callers may apply the dataset predicate in their base relation. */
+  readonly includeDatasetFilter?: boolean;
 }
 
 export class QueryCompileError extends Error {}
@@ -22,7 +24,7 @@ export function compileQuery(ast: Expression, catalog: MetricCatalog, options: C
   const params: (number | string | null)[] = [];
   const references: string[] = [];
   const eav = options.relation === "eav";
-  if (eav) params.push(options.datasetId ?? null);
+  if (eav && options.includeDatasetFilter !== false) params.push(options.datasetId ?? null);
   const metric = (id: string): string => {
     const definition = catalog.find((item) => item.id === id);
     if (!definition || !safeIdentifier.test(definition.column)) throw new QueryCompileError(`Metric '${id}' is not in the checked catalog.`);
@@ -47,7 +49,7 @@ export function compileQuery(ast: Expression, catalog: MetricCatalog, options: C
     return `(${expression(node.left)} ${sqlOperator} ${expression(node.right)})`;
   };
   const predicate = `(${expression(ast)}) IS TRUE`;
-  return { whereSql: eav ? `(i.dataset_id = ? AND ${predicate})` : predicate, params, referencedMetricIds: references };
+  return { whereSql: eav && options.includeDatasetFilter !== false ? `(i.dataset_id = ? AND ${predicate})` : predicate, params, referencedMetricIds: references };
 }
 
 /**

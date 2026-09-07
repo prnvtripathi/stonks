@@ -3,7 +3,12 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "dependencies": {
+    "@stonks/contracts": "workspace:*",
+    "@stonks/query": "workspace:*"
+  },
   "scripts": {
+    "test": "vitest run --config vitest.config.ts",
     "lint": "tsc --noEmit",
     "typecheck": "tsc --noEmit"
   }
