@@ -62,7 +62,7 @@ export class MemoryResearchStore implements ResearchStore {
 
 export interface D1Result { readonly results?: readonly Record<string, unknown>[]; readonly success?: boolean; readonly meta?: Record<string, unknown>; }
 export interface D1Statement { bind(...values: unknown[]): D1Statement; first<T extends Record<string, unknown> = Record<string, unknown>>(): Promise<T | null>; all<T extends Record<string, unknown> = Record<string, unknown>>(): Promise<{ results: readonly T[] }>; run(): Promise<D1Result>; }
-export interface D1Database { prepare(sql: string): D1Statement; }
+export interface D1Database { prepare(sql: string): D1Statement; batch?(statements: readonly D1Statement[]): Promise<readonly D1Result[]>; }
 
 /** Thin parameterized D1 repository. It keeps all query data constrained to the active dataset. */
 export class D1ResearchStore implements ResearchStore {
@@ -88,15 +88,22 @@ export class D1ResearchStore implements ResearchStore {
     if (!checked) throw new Error("Invalid saved screen");
     const compiled = compileQuery(checked, DEFAULT_METRIC_CATALOG, { relation: "eav", includeDatasetFilter: false });
     const rows = await this.db.prepare(`SELECT i.instrument_id, (SELECT m.value FROM latest_metrics AS m WHERE m.dataset_id = i.dataset_id AND m.instrument_id = i.instrument_id AND m.metric = 'momentum_score' AND m.state = 'present') AS score FROM instruments AS i WHERE i.dataset_id = ? AND i.active = 1 AND ${compiled.whereSql} ORDER BY score DESC NULLS LAST, i.instrument_id`).bind(datasetId, ...compiled.params).all<{ instrument_id: string; score: number | null }>();
-    const prior = (await this.listRuns(screen.id)).filter((run) => run.datasetId === datasetId).find((run) => run.status === "complete");
+    const prior = (await this.listRuns(screen.id)).find((run) => run.status === "complete");
     const priorIds = new Set(prior?.matches.map((match) => match.instrumentId) ?? []);
     const currentIds = new Set(rows.results.map((row) => row.instrument_id));
     const currentMatches: RunMatch[] = rows.results.map((row, index) => ({ instrumentId: row.instrument_id, rank: index + 1, score: row.score == null ? null : Number(row.score), explanation: { matched: true, text: `Matched ${screen.source}`, metrics: compiled.referencedMetricIds }, entered: !priorIds.has(row.instrument_id), exited: false }));
     const exitedMatches: RunMatch[] = prior?.matches.filter((match) => !currentIds.has(match.instrumentId)).map((match) => ({ ...match, rank: 0, explanation: { ...match.explanation, matched: false }, entered: false, exited: true })) ?? [];
     const matches: RunMatch[] = [...currentMatches, ...exitedMatches];
     const runId = crypto.randomUUID();
-    ensureD1Success(await this.db.prepare("INSERT INTO screen_runs (dataset_id, run_id, screen_id, effective_date, status, result_count, query_version) VALUES (?, ?, ?, ?, 'complete', ?, 'v1')").bind(datasetId, runId, screen.id, effectiveDate, rows.results.length).run());
-    for (const match of matches) ensureD1Success(await this.db.prepare("INSERT INTO screen_matches (dataset_id, run_id, ordinal, instrument_id, score, explanation_json, entered, exited) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").bind(datasetId, runId, match.rank, match.instrumentId, match.score, JSON.stringify(match.explanation), match.entered ? 1 : 0, match.exited ? 1 : 0).run());
+    const matchStatements = matches.map((match, index) => this.db.prepare("INSERT INTO screen_matches (dataset_id, run_id, ordinal, instrument_id, score, explanation_json, entered, exited) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").bind(datasetId, runId, index + 1, match.instrumentId, match.score, JSON.stringify(match.explanation), match.entered ? 1 : 0, match.exited ? 1 : 0));
+    const runStatement = this.db.prepare("INSERT INTO screen_runs (dataset_id, run_id, screen_id, effective_date, status, result_count, query_version) VALUES (?, ?, ?, ?, 'complete', ?, 'v1')").bind(datasetId, runId, screen.id, effectiveDate, rows.results.length);
+    if (this.db.batch) {
+      const results = await this.db.batch([...matchStatements, runStatement]);
+      results.forEach(ensureD1Success);
+    } else {
+      for (const statement of matchStatements) ensureD1Success(await statement.run());
+      ensureD1Success(await runStatement.run());
+    }
     return { id: runId, screenId: screen.id, datasetId, effectiveDate, matchCount: rows.results.length, status: "complete", matches };
   }
   public async instrument(datasetId: string, instrumentId: string): Promise<InstrumentRow | null> { const row = await this.db.prepare("SELECT instrument_id, symbol, name, asset_class, active FROM instruments WHERE dataset_id = ? AND instrument_id = ?").bind(datasetId, instrumentId).first<Record<string, unknown>>(); if (!row) return null; const dataset = await this.db.prepare("SELECT effective_date FROM datasets WHERE dataset_id = ?").bind(datasetId).first<{ effective_date: string | null }>(); const metrics = await this.db.prepare("SELECT metric, value, state, effective_date FROM latest_metrics WHERE dataset_id = ? AND instrument_id = ? ORDER BY metric").bind(datasetId, instrumentId).all<{ metric: string; value: number | null; state: MetricRow["state"]; effective_date: string | null }>(); return { instrumentId: String(row.instrument_id), symbol: row.symbol == null ? null : String(row.symbol), name: row.name == null ? null : String(row.name), assetClass: String(row.asset_class) as AssetClass, active: Boolean(row.active), metricRows: metrics.results.map((metric) => ({ metric: metric.metric, value: metric.value, state: metric.state, effectiveDate: metric.effective_date, stale: Boolean(dataset?.effective_date && metric.effective_date && metric.effective_date < dataset.effective_date) })) }; }

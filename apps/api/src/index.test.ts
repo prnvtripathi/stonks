@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { createApi, createTestAccessVerifier, D1ResearchStore, MemoryResearchStore, type ApiEnv, type D1Database, type D1Statement } from "./index";
+import { describe, expect, it, vi } from "vitest";
+import { createApi, createTestAccessVerifier, D1ResearchStore, MemoryResearchStore, verifyAccessRequest, type ApiEnv, type D1Database, type D1Result, type D1Statement } from "./index";
 
 const env: ApiEnv = {
   accessTeamDomain: "https://access.example.com",
@@ -81,6 +81,8 @@ describe("private research API", () => {
     const history = await api.fetch(request(`/api/v1/screens/${screen.id}/runs`, { headers }));
     expect(((await history.json()) as { runs: { datasetId: string }[] }).runs).toMatchObject([{ datasetId: "dataset-old" }]);
     expect((await api.fetch(request(`/api/v1/screens/${screen.id}/runs`, { method: "POST", headers }))).status).toBe(201);
+    const crossDatasetHistory = (await (await api.fetch(request(`/api/v1/screens/${screen.id}/runs`, { headers }))).json()) as { runs: { datasetId: string; matches: { entered: boolean; exited: boolean }[] }[] };
+    expect(crossDatasetHistory.runs).toHaveLength(2);
   });
 
   it("rejects missing mutation origin, unknown fields, invalid pagination, and oversized bytes", async () => {
@@ -118,5 +120,59 @@ describe("private research API", () => {
     }
     const failingDb: D1Database = { prepare: () => new FailingStatement() };
     await expect(new D1ResearchStore(failingDb).createScreen({ name: "x", source: "Volume > 1", languageVersion: "v1", createdAt: "2026-09-07T00:00:00.000Z", updatedAt: "2026-09-07T00:00:00.000Z" })).rejects.toThrow("D1 mutation failed");
+  });
+
+  it("rejects a match-write failure without leaving a complete run", async () => {
+    const statements: string[] = [];
+    class FailingMatchStatement implements D1Statement {
+      private sql = "";
+      bind(..._values: unknown[]): D1Statement { return this; }
+      async first<T extends Record<string, unknown> = Record<string, unknown>>(): Promise<T | null> { return null; }
+      async all<T extends Record<string, unknown> = Record<string, unknown>>(): Promise<{ results: readonly T[] }> {
+        if (this.sql.includes("SELECT screen_id")) return { results: [{ screen_id: "screen-1", name: "x", expression: "Volume > 1", created_at: "2026-01-01", updated_at: "2026-01-01" }] as T[] };
+        if (this.sql.includes("SELECT run_id")) return { results: [] };
+        if (this.sql.includes("SELECT i.instrument_id")) return { results: [{ instrument_id: "one", score: 1 }, { instrument_id: "two", score: 2 }] as T[] };
+        return { results: [] };
+      }
+      async run(): Promise<D1Result> { statements.push(this.sql); return { success: this.sql.includes("screen_matches") ? false : true }; }
+      public setSql(sql: string): void { this.sql = sql; }
+    }
+    const db: D1Database = { prepare: (sql) => { const statement = new FailingMatchStatement(); statement.setSql(sql); return statement; } };
+    const store = new D1ResearchStore(db);
+    const screen = { id: "screen-1", name: "x", source: "Volume > 1", languageVersion: "v1", createdAt: "2026-01-01", updatedAt: "2026-01-01" } as const;
+    await expect(store.runScreen("dataset-1", screen, "2026-09-07")).rejects.toThrow("D1 mutation failed");
+    expect(statements.some((sql) => sql.includes("screen_runs"))).toBe(false);
+  });
+
+  it("verifies a production-style RS256 Access assertion and refreshes an unknown kid", async () => {
+    const keyPair = await crypto.subtle.generateKey({ name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, true, ["sign", "verify"]);
+    const publicJwk = await crypto.subtle.exportKey("jwk", keyPair.publicKey);
+    const encode = (value: unknown) => btoa(String.fromCharCode(...new TextEncoder().encode(JSON.stringify(value)))).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+    const secondKeyPair = await crypto.subtle.generateKey({ name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, true, ["sign", "verify"]);
+    const secondPublicJwk = await crypto.subtle.exportKey("jwk", secondKeyPair.publicKey);
+    const sign = async (kid: string, email = "owner@example.com", exp = Math.floor(Date.now() / 1000) + 300, signingKey = keyPair.privateKey) => {
+      const header = encode({ alg: "RS256", typ: "JWT", kid });
+      const claims = encode({ iss: "https://access.example.com", aud: "audience", email, exp });
+      const signature = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", signingKey, new TextEncoder().encode(`${header}.${claims}`));
+      return `${header}.${claims}.${btoa(String.fromCharCode(...new Uint8Array(signature))).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "")}`;
+    };
+    const envWithKeys = { ...env, accessJwksUrl: `https://access.example.com/certs-${crypto.randomUUID()}` };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json({ keys: [{ ...publicJwk, kid: "kid-1", alg: "RS256" }] }))
+      .mockResolvedValueOnce(Response.json({ keys: [{ ...secondPublicJwk, kid: "kid-2", alg: "RS256" }] }))
+      .mockResolvedValueOnce(Response.json({ keys: [{ ...secondPublicJwk, kid: "kid-2", alg: "RS256" }] }));
+    vi.stubGlobal("fetch", fetchMock);
+    const claims = await verifyAccessRequest(new Request("https://dashboard.example.com/api/v1/status", { headers: { "Cf-Access-Jwt-Assertion": await sign("kid-1") } }), envWithKeys);
+    expect(claims.email).toBe("owner@example.com");
+    await expect(verifyAccessRequest(new Request("https://dashboard.example.com/api/v1/status", { headers: { "Cf-Access-Jwt-Assertion": await sign("kid-1", "other@example.com") } }), envWithKeys)).rejects.toThrow();
+    const refreshed = await verifyAccessRequest(new Request("https://dashboard.example.com/api/v1/status", { headers: { "Cf-Access-Jwt-Assertion": await sign("kid-2", "owner@example.com", undefined, secondKeyPair.privateKey) } }), envWithKeys);
+    expect(refreshed.email).toBe("owner@example.com");
+    await expect(verifyAccessRequest(new Request("https://dashboard.example.com/api/v1/status", { headers: { "Cf-Access-Jwt-Assertion": await sign("unknown") } }), envWithKeys)).rejects.toThrow();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    const malformedEnv = { ...env, accessJwksUrl: `https://access.example.com/malformed-${crypto.randomUUID()}` };
+    const malformedFetch = vi.fn(async () => Response.json({ keys: [{ kid: "bad", kty: "RSA" }] }));
+    vi.stubGlobal("fetch", malformedFetch);
+    await expect(verifyAccessRequest(new Request("https://dashboard.example.com/api/v1/status", { headers: { "Cf-Access-Jwt-Assertion": await sign("bad") } }), malformedEnv)).rejects.toThrow();
+    vi.unstubAllGlobals();
   });
 });
