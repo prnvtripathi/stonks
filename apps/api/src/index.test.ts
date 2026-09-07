@@ -71,6 +71,19 @@ describe("private research API", () => {
     expect(screen).toMatchObject({ name: "Momentum", source: "Volume > 500", languageVersion: "v1" });
   });
 
+  it("updates a saved screen in place and preserves its identity and history", async () => {
+    const api = testApi();
+    const bearer = await token();
+    const headers = { Authorization: `Bearer ${bearer}`, "Content-Type": "application/json", Origin: env.allowedOrigin };
+    const created = await api.fetch(request("/api/v1/screens", { method: "POST", headers, body: JSON.stringify({ name: "Momentum", source: "Volume > 500" }) }));
+    const original = await created.json() as { id: string; createdAt: string; updatedAt: string };
+    const updated = await api.fetch(request(`/api/v1/screens/${original.id}`, { method: "PUT", headers: { ...headers, Origin: env.allowedOrigin }, body: JSON.stringify({ name: "Momentum revised", source: "Volume > 1000" }) }));
+    expect(updated.status).toBe(200);
+    const revised = await updated.json() as { id: string; name: string; source: string; createdAt: string; updatedAt: string };
+    expect(revised).toMatchObject({ id: original.id, name: "Momentum revised", source: "Volume > 1000", createdAt: original.createdAt });
+    expect(revised.updatedAt).not.toBe(original.updatedAt);
+  });
+
   it("keeps saved screens and run history visible when the active dataset changes", async () => {
     const store = new MemoryResearchStore("dataset-old");
     const api = createApi({ env, store, accessVerifier: createTestAccessVerifier("test-secret"), testAccessSecret: "test-secret" });

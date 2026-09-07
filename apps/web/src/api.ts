@@ -26,6 +26,7 @@ export interface DashboardApi {
   getScreens(): Promise<Page<SavedScreen>>;
   getRuns?(screenId: string): Promise<{ readonly screen: SavedScreen; readonly runs: readonly ScreenRunSummary[] }>;
   createScreen(input: { readonly name: string; readonly source: string }): Promise<SavedScreen>;
+  updateScreen?(screenId: string, input: { readonly name: string; readonly source: string }): Promise<SavedScreen>;
   runScreen(screenId: string): Promise<ScreenRun>;
 }
 
@@ -52,6 +53,7 @@ export function createApiClient(options: ApiClientOptions = {}): DashboardApi {
     getScreens: () => request<Page<SavedScreen>>("/api/v1/screens"),
     getRuns: (screenId) => request<{ screen: SavedScreen; runs: readonly ScreenRunSummary[] }>(`/api/v1/screens/${encodeURIComponent(screenId)}/runs`),
     createScreen: (input) => request<SavedScreen>("/api/v1/screens", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) }),
+    updateScreen: (screenId, input) => request<SavedScreen>(`/api/v1/screens/${encodeURIComponent(screenId)}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) }),
     runScreen: (screenId) => request<ScreenRun>(`/api/v1/screens/${encodeURIComponent(screenId)}/runs`, { method: "POST", headers: { "Content-Type": "application/json" } }),
   };
 }

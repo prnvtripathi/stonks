@@ -18,6 +18,7 @@ export interface ResearchStore {
   listInstruments(datasetId: string): Promise<InstrumentRow[]>;
   getScreen(screenId: string): Promise<SavedScreen | null>;
   createScreen(input: { name: string; source: string; languageVersion: string; createdAt: string; updatedAt: string }): Promise<SavedScreen>;
+  updateScreen(input: { id: string; name: string; source: string; updatedAt: string }): Promise<SavedScreen>;
   listRuns(screenId: string): Promise<RunDetail[]>;
   runScreen(datasetId: string, screen: SavedScreen, effectiveDate: string): Promise<RunDetail>;
   instrument(datasetId: string, instrumentId: string): Promise<InstrumentRow | null>;
@@ -40,6 +41,13 @@ export class MemoryResearchStore implements ResearchStore {
   public async createScreen(input: { name: string; source: string; languageVersion: string; createdAt: string; updatedAt: string }): Promise<SavedScreen> {
     const screen: SavedScreen = { id: crypto.randomUUID(), ...input };
     this.screens.set(screen.id, screen);
+    return screen;
+  }
+  public async updateScreen(input: { id: string; name: string; source: string; updatedAt: string }): Promise<SavedScreen> {
+    const existing = this.screens.get(input.id);
+    if (!existing) throw new Error("Screen not found");
+    const screen: SavedScreen = { ...existing, name: input.name, source: input.source, updatedAt: input.updatedAt };
+    this.screens.set(input.id, screen);
     return screen;
   }
   public async listRuns(screenId: string): Promise<RunDetail[]> {
@@ -84,6 +92,13 @@ export class D1ResearchStore implements ResearchStore {
   public async listInstruments(datasetId: string): Promise<InstrumentRow[]> { const result = await this.db.prepare("SELECT instrument_id, symbol, name, asset_class, active FROM instruments WHERE dataset_id = ? AND active = 1 ORDER BY symbol, instrument_id").bind(datasetId).all<Record<string, unknown>>(); return result.results.map((row) => ({ instrumentId: String(row.instrument_id), symbol: row.symbol == null ? null : String(row.symbol), name: row.name == null ? null : String(row.name), assetClass: String(row.asset_class) as AssetClass, active: Boolean(row.active) })); }
   public async getScreen(screenId: string): Promise<SavedScreen | null> { const row = await this.db.prepare("SELECT screen_id, name, expression, created_at, updated_at FROM saved_screens WHERE screen_id = ?").bind(screenId).first<Record<string, unknown>>(); return row ? this.screen(row) : null; }
   public async createScreen(input: { name: string; source: string; languageVersion: string; createdAt: string; updatedAt: string }): Promise<SavedScreen> { const id = crypto.randomUUID(); const result = await this.db.prepare("INSERT INTO saved_screens (screen_id, name, expression, created_at, updated_at) VALUES (?, ?, ?, ?, ?)").bind(id, input.name, input.source, input.createdAt, input.updatedAt).run(); ensureD1Success(result); return { id, name: input.name, source: input.source, languageVersion: input.languageVersion, createdAt: input.createdAt, updatedAt: input.updatedAt }; }
+  public async updateScreen(input: { id: string; name: string; source: string; updatedAt: string }): Promise<SavedScreen> {
+    const existing = await this.getScreen(input.id);
+    if (!existing) throw new Error("Screen not found");
+    const result = await this.db.prepare("UPDATE saved_screens SET name = ?, expression = ?, updated_at = ? WHERE screen_id = ?").bind(input.name, input.source, input.updatedAt, input.id).run();
+    ensureD1Success(result);
+    return { ...existing, name: input.name, source: input.source, updatedAt: input.updatedAt };
+  }
   public async listRuns(screenId: string): Promise<RunDetail[]> { const result = await this.db.prepare("SELECT run_id, screen_id, dataset_id, effective_date, result_count, status FROM screen_runs WHERE screen_id = ? ORDER BY effective_date DESC, run_id DESC").bind(screenId).all<Record<string, unknown>>(); return Promise.all(result.results.map(async (row) => { const matches = await this.db.prepare("SELECT instrument_id, ordinal, score, explanation_json, entered, exited FROM screen_matches WHERE dataset_id = ? AND run_id = ? ORDER BY ordinal").bind(String(row.dataset_id), String(row.run_id)).all<Record<string, unknown>>(); return { id: String(row.run_id), screenId: String(row.screen_id), datasetId: String(row.dataset_id), effectiveDate: String(row.effective_date), matchCount: Number(row.result_count), status: row.status === "failed" ? "failed" : "complete", matches: matches.results.map((match) => ({ instrumentId: String(match.instrument_id), rank: Boolean(match.exited) ? 0 : Number(match.ordinal), score: match.score == null ? null : Number(match.score), explanation: parseExplanation(match.explanation_json), entered: Boolean(match.entered), exited: Boolean(match.exited) })) }; }));
   }
   public async runScreen(datasetId: string, screen: SavedScreen, effectiveDate: string): Promise<RunDetail> {

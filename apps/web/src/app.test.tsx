@@ -1,6 +1,6 @@
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { App, type DashboardApi } from "./app";
+import { App, ScreenEditor, type DashboardApi } from "./app";
 import type { MetricDefinition, SavedScreen } from "@stonks/contracts";
 import type { StatusDto } from "./api";
 
@@ -59,5 +59,49 @@ describe("dashboard shell", () => {
     expect(screen.getByRole("dialog")).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: /stay/i }));
     expect(screen.getByRole("textbox", { name: /screen query/i })).toBeVisible();
+  });
+
+  it("replaces only the current metric fragment in a full query", async () => {
+    render(<ScreenEditor initialValue="Volume > 500000 AND Volum" metrics={metrics} />);
+    const editor = screen.getByRole("textbox", { name: /screen query/i });
+    expect(await screen.findByRole("option", { name: "Volume" })).toBeVisible();
+    fireEvent.keyDown(editor, { key: "Enter" });
+    expect(editor).toHaveValue("Volume > 500000 AND Volume");
+  });
+
+  it("uses the update API for edit mode without creating a new screen", async () => {
+    const api = fakeApi();
+    api.updateScreen = vi.fn(async (id, input) => ({ ...screens[0]!, ...input, id, updatedAt: "2026-09-05" }));
+    render(<ScreenEditor initialScreen={screens[0]!} mode="edit" metrics={metrics} api={api} />);
+    fireEvent.change(screen.getByRole("textbox", { name: /screen name/i }), { target: { value: "Momentum revised" } });
+    fireEvent.change(screen.getByRole("textbox", { name: /screen query/i }), { target: { value: "Volume > 1000" } });
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    await waitFor(() => expect(api.updateScreen).toHaveBeenCalledWith("screen-1", { name: "Momentum revised", source: "Volume > 1000" }));
+    expect(api.createScreen).not.toHaveBeenCalled();
+  });
+
+  it("protects dirty drafts from beforeunload and traps the unsaved dialog", async () => {
+    render(<App api={fakeApi()} />);
+    fireEvent.click(screen.getByRole("button", { name: /new screen/i }));
+    fireEvent.change(screen.getByRole("textbox", { name: /screen name/i }), { target: { value: "Draft" } });
+    const overview = within(screen.getByRole("navigation", { name: "Primary navigation" })).getByRole("button", { name: "Overview" });
+    fireEvent.click(overview);
+    const dialog = screen.getByRole("dialog");
+    expect(screen.getByRole("button", { name: "Stay" })).toHaveFocus();
+    expect(document.getElementById("main-content")).toHaveAttribute("aria-hidden", "true");
+    const unload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(unload);
+    expect(unload.defaultPrevented).toBe(true);
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: /screen name/i })).toHaveValue("Draft");
+  });
+
+  it("surfaces initial-load and run failures with retry actions", async () => {
+    const api = fakeApi();
+    api.getStatus = vi.fn(async () => { throw new Error("offline"); });
+    render(<App api={api} />);
+    expect(await screen.findByRole("alert")).toHaveTextContent(/unable to load/i);
+    expect(screen.getByRole("button", { name: /retry/i })).toBeVisible();
   });
 });

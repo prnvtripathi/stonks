@@ -31,7 +31,7 @@ export function createWorker(env: WorkerBindings): Api {
 export default { fetch(request: Request, bindings: Record<string, unknown>): Promise<Response> { return createWorker({ ...readApiEnv(bindings), ...bindings } as WorkerBindings).fetch(request); } };
 
 async function handle(request: Request, env: ApiEnv, store: ResearchStore, now: () => Date, accessVerifier: AccessVerifier): Promise<Response> {
-  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: { Allow: "GET, POST, OPTIONS" } });
+  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: { Allow: "GET, POST, PUT, OPTIONS" } });
   const origin = request.headers.get("Origin");
   if (origin && origin !== env.allowedOrigin) return error(403, "Origin is not allowed");
   const url = new URL(request.url);
@@ -39,8 +39,8 @@ async function handle(request: Request, env: ApiEnv, store: ResearchStore, now: 
   try { await accessVerifier(request, env); } catch (cause) { return cause instanceof AccessError ? error(cause.status, cause.message) : error(401, "Unauthenticated"); }
   const allowedMethods = allowedMethodsFor(path);
   if (!allowedMethods) return error(404, "Not found");
-  if (!allowedMethods.includes(request.method as "GET" | "POST")) return methodNotAllowed(`${allowedMethods.join(", ")}, OPTIONS`);
-  if (request.method === "POST" && origin !== env.allowedOrigin) return error(403, "Origin is required for mutations");
+  if (!allowedMethods.includes(request.method as "GET" | "POST" | "PUT")) return methodNotAllowed(`${allowedMethods.join(", ")}, OPTIONS`);
+  if ((request.method === "POST" || request.method === "PUT") && origin !== env.allowedOrigin) return error(403, "Origin is required for mutations");
   try {
     if (path === "/api/v1/status" && request.method === "GET") return json(await store.status(await store.activeDatasetId()));
     if (path === "/api/v1/metrics" && request.method === "GET") return json({ metrics: await store.metrics() });
@@ -49,6 +49,7 @@ async function handle(request: Request, env: ApiEnv, store: ResearchStore, now: 
     if (path === "/api/v1/screens" && request.method === "POST") return createScreen(request, env, store, now);
     const screenDetail = path.match(/^\/api\/v1\/screens\/([^/]+)$/);
     if (screenDetail && request.method === "GET") return getScreen(decodeURIComponent(screenDetail[1]!), store);
+    if (screenDetail && request.method === "PUT") return updateScreen(decodeURIComponent(screenDetail[1]!), request, env, store, now);
     const screenRuns = path.match(/^\/api\/v1\/screens\/([^/]+)\/runs$/);
     if (screenRuns && request.method === "GET") return getRuns(decodeURIComponent(screenRuns[1]!), store);
     if (screenRuns && request.method === "POST") return runScreen(decodeURIComponent(screenRuns[1]!), store, now);
@@ -84,7 +85,7 @@ async function listInstruments(url: URL, store: ResearchStore): Promise<Response
   return json({ data: ordered.slice(offset, offset + limit), pagination: { limit, offset, total: ordered.length } });
 }
 
-async function createScreen(request: Request, env: ApiEnv, store: ResearchStore, now: () => Date): Promise<Response> {
+async function readScreenPayload(request: Request, env: ApiEnv): Promise<{ name: string; source: string } | Response> {
   if (request.headers.get("Content-Type")?.split(";", 1)[0] !== "application/json") return error(415, "Content-Type must be application/json");
   const contentLength = request.headers.get("Content-Length");
   if (contentLength && Number(contentLength) > env.maxBodyBytes) return error(413, "Request body is too large");
@@ -97,8 +98,25 @@ async function createScreen(request: Request, env: ApiEnv, store: ResearchStore,
   if (!parsed.value || parsed.diagnostics.length > 0) return error(400, "Invalid query", parsed.diagnostics);
   const checked = typecheckQuery(parsed.value, DEFAULT_METRIC_CATALOG);
   if (!checked.valid) return error(400, "Invalid query", checked.diagnostics);
+  return { name: body.name.trim(), source: body.source };
+}
+async function createScreen(request: Request, env: ApiEnv, store: ResearchStore, now: () => Date): Promise<Response> {
+  const payload = await readScreenPayload(request, env);
+  if (payload instanceof Response) return payload;
   const timestamp = now().toISOString();
-  return json(await store.createScreen({ name: body.name.trim(), source: body.source, languageVersion: "v1", createdAt: timestamp, updatedAt: timestamp }), 201);
+  return json(await store.createScreen({ name: payload.name, source: payload.source, languageVersion: "v1", createdAt: timestamp, updatedAt: timestamp }), 201);
+}
+async function updateScreen(screenId: string, request: Request, env: ApiEnv, store: ResearchStore, now: () => Date): Promise<Response> {
+  const existing = await store.getScreen(screenId);
+  if (!existing) return error(404, "Screen not found");
+  const payload = await readScreenPayload(request, env);
+  if (payload instanceof Response) return payload;
+  const timestamp = now();
+  const previousTimestamp = Date.parse(existing.updatedAt);
+  const updatedAt = Number.isFinite(previousTimestamp) && timestamp.getTime() <= previousTimestamp
+    ? new Date(previousTimestamp + 1).toISOString()
+    : timestamp.toISOString();
+  return json(await store.updateScreen({ id: screenId, name: payload.name, source: payload.source, updatedAt }));
 }
 
 async function getRuns(screenId: string, store: ResearchStore): Promise<Response> {
@@ -140,10 +158,10 @@ function readPagination(url: URL): { readonly limit: number; readonly offset: nu
   return Number.isSafeInteger(limit) && Number.isSafeInteger(offset) && limit > 0 && limit <= 100 && offset >= 0 ? { limit, offset } : null;
 }
 function methodNotAllowed(allow: string): Response { return new Response(JSON.stringify({ error: { code: "METHOD_NOT_ALLOWED", message: "Method not allowed" } }), { status: 405, headers: { ...jsonHeaders, Allow: allow } }); }
-function allowedMethodsFor(path: string): readonly ("GET" | "POST")[] | null {
+function allowedMethodsFor(path: string): readonly ("GET" | "POST" | "PUT")[] | null {
   if (["/api/v1/status", "/api/v1/metrics", "/api/v1/instruments"].includes(path)) return ["GET"];
   if (path === "/api/v1/screens") return ["GET", "POST"];
-  if (/^\/api\/v1\/screens\/[^/]+$/.test(path)) return ["GET"];
+  if (/^\/api\/v1\/screens\/[^/]+$/.test(path)) return ["GET", "PUT"];
   if (/^\/api\/v1\/screens\/[^/]+\/runs$/.test(path)) return ["GET", "POST"];
   if (/^\/api\/v1\/instruments\/[^/]+(?:\/chart)?$/.test(path)) return ["GET"];
   return null;
