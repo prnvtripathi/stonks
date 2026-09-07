@@ -10,7 +10,7 @@
   "scripts": {
     "lint": "pnpm --recursive --if-present lint",
     "typecheck": "pnpm --recursive --if-present typecheck",
-    "test": "vitest run --workspace vitest.workspace.ts"
+    "test": "vitest run"
   },
   "devDependencies": {
     "@types/node": "^24.3.0",
