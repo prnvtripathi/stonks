@@ -57,6 +57,8 @@ async function handle(request: Request, env: ApiEnv, store: ResearchStore, now: 
     const screenRuns = path.match(/^\/api\/v1\/screens\/([^/]+)\/runs$/);
     if (screenRuns && request.method === "GET") return getRuns(decodeURIComponent(screenRuns[1]!), store);
     if (screenRuns && request.method === "POST") return runScreen(decodeURIComponent(screenRuns[1]!), store, now);
+    const screenResults = path.match(/^\/api\/v1\/screens\/([^/]+)\/results$/);
+    if (screenResults && request.method === "GET") return getResults(decodeURIComponent(screenResults[1]!), url, store);
     const chart = path.match(/^\/api\/v1\/instruments\/([^/]+)\/chart$/);
     if (chart && request.method === "GET") return getChart(decodeURIComponent(chart[1]!), store);
     const instrument = path.match(/^\/api\/v1\/instruments\/([^/]+)$/);
@@ -128,6 +130,33 @@ async function getRuns(screenId: string, store: ResearchStore): Promise<Response
   if (!screen) return error(404, "Screen not found");
   return json({ screen, runs: await store.listRuns(screenId) });
 }
+async function getResults(screenId: string, url: URL, store: ResearchStore): Promise<Response> {
+  const screen = await store.getScreen(screenId);
+  if (!screen) return error(404, "Screen not found");
+  const datasetId = await store.activeDatasetId();
+  if (!datasetId) return error(503, "No active dataset");
+  const pagination = readPagination(url);
+  if (!pagination) return error(400, "Invalid pagination");
+  const sort = url.searchParams.get("sort") ?? "rank";
+  if (!(new Set(["rank", "score", "symbol", "assetClass"])).has(sort)) return error(400, "Invalid sort");
+  const runs = (await store.listRuns(screenId)).filter((candidate) => candidate.datasetId === datasetId && candidate.status === "complete");
+  const requestedRunId = url.searchParams.get("runId");
+  const run = (requestedRunId ? runs.find((candidate) => candidate.id === requestedRunId) : runs[0]) ?? null;
+  if (!run) return error(404, "Run not found");
+  const enriched = await Promise.all(run.matches.filter((match) => !match.exited).map(async (match) => {
+    const instrument = await store.instrument(datasetId, match.instrumentId);
+    const explanation = match.explanation;
+    const momentum = match.momentum ?? explanation.momentum;
+    return { ...match, symbol: instrument?.symbol ?? null, name: instrument?.name ?? null, ...(instrument?.assetClass ? { assetClass: instrument.assetClass } : {}), explanation, ...(momentum ? { momentum } : {}) };
+  }));
+  const ordered = [...enriched].sort((left, right) => {
+    const leftValue = sort === "symbol" ? left.symbol ?? "" : sort === "assetClass" ? left.assetClass ?? "" : left[sort as "rank" | "score"] ?? -Infinity;
+    const rightValue = sort === "symbol" ? right.symbol ?? "" : sort === "assetClass" ? right.assetClass ?? "" : right[sort as "rank" | "score"] ?? -Infinity;
+    return typeof leftValue === "string" ? leftValue.localeCompare(String(rightValue)) || left.instrumentId.localeCompare(right.instrumentId) : Number(rightValue) - Number(leftValue) || left.instrumentId.localeCompare(right.instrumentId);
+  });
+  const { limit, offset } = pagination;
+  return json({ screen, run: { ...run, matches: ordered.slice(offset, offset + limit) }, pagination: { limit, offset, total: ordered.length } });
+}
 async function getScreen(screenId: string, store: ResearchStore): Promise<Response> {
   const screen = await store.getScreen(screenId);
   return screen ? json(screen) : error(404, "Screen not found");
@@ -167,6 +196,7 @@ function allowedMethodsFor(path: string): readonly ("GET" | "POST" | "PUT")[] | 
   if (path === "/api/v1/screens") return ["GET", "POST"];
   if (/^\/api\/v1\/screens\/[^/]+$/.test(path)) return ["GET", "PUT"];
   if (/^\/api\/v1\/screens\/[^/]+\/runs$/.test(path)) return ["GET", "POST"];
+  if (/^\/api\/v1\/screens\/[^/]+\/results$/.test(path)) return ["GET"];
   if (/^\/api\/v1\/instruments\/[^/]+(?:\/chart)?$/.test(path)) return ["GET"];
   return null;
 }

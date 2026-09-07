@@ -177,6 +177,22 @@ describe("private research API", () => {
     expect((await api.fetch(request("/api/v1/instruments/MISSING/chart", { headers }))).status).toBe(404);
   });
 
+  it("returns active-dataset results with clause and momentum explanations", async () => {
+    const store = new MemoryResearchStore("dataset-1");
+    store.instruments.set("INFY", { instrumentId: "INFY", symbol: "INFY", name: "Infosys", assetClass: "equity", active: true, metrics: { volume: 10, momentum_score: 82, rs_rating: 82, return_6m: 70, return_3m: 60, trend_strength: 90, high_52w_proximity: 80, volume_confirmation: 75 }, metricRows: [{ metric: "momentum_score", value: 82, state: "present", effectiveDate: "2026-09-04" }] });
+    const api = createApi({ env, store, accessVerifier: createTestAccessVerifier("test-secret"), testAccessSecret: "test-secret" });
+    const bearer = await api.issueTestToken({ email: "owner@example.com" });
+    const headers = { Authorization: `Bearer ${bearer}`, "Content-Type": "application/json", Origin: env.allowedOrigin };
+    const saved = await api.fetch(request("/api/v1/screens", { method: "POST", headers, body: JSON.stringify({ name: "Volume", source: "Volume > 1" }) }));
+    const screen = await saved.json() as { id: string };
+    await api.fetch(request(`/api/v1/screens/${screen.id}/runs`, { method: "POST", headers }));
+    const result = await api.fetch(request(`/api/v1/screens/${screen.id}/results?limit=1&sort=score`, { headers }));
+    expect(result.status).toBe(200);
+    const body = await result.json() as { run: { matches: { symbol: string; explanation: { clauses: unknown[]; momentum: { coverage: number } } }[] }; pagination: { total: number } };
+    expect(body.pagination.total).toBe(1);
+    expect(body.run.matches[0]).toMatchObject({ symbol: "INFY", explanation: { clauses: expect.any(Array), momentum: { coverage: 1 } } });
+  });
+
   it("surfaces a D1 mutation failure instead of reporting a saved screen", async () => {
     class FailingStatement implements D1Statement {
       bind(..._values: unknown[]): D1Statement { return this; }

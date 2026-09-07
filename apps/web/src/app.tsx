@@ -3,12 +3,13 @@ import type { MetricDefinition, SavedScreen } from "@stonks/contracts";
 import { DEFAULT_METRIC_CATALOG } from "@stonks/contracts";
 import { parseQuery, typecheckQuery } from "@stonks/query";
 import { createApiClient, type DashboardApi, type ScreenRunSummary, type StatusDto } from "./api";
+import { InstrumentView, ScreenResultsView } from "./research";
 import "./styles.css";
 
 export type { DashboardApi } from "./api";
 
 interface AppProps { readonly api?: DashboardApi; }
-type View = "overview" | "editor";
+type View = "overview" | "editor" | "results" | "instrument";
 type EditorMode = "new" | "edit" | "duplicate";
 
 const fallbackStatus: StatusDto = { effectiveDate: null, datasetId: null, sources: [] };
@@ -32,7 +33,10 @@ export function App({ api }: AppProps) {
   const defaultApiRef = useRef<DashboardApi | undefined>(undefined);
   if (!defaultApiRef.current) defaultApiRef.current = createApiClient();
   const resolvedApi = api ?? defaultApiRef.current;
-  const [view, setView] = useState<View>("overview");
+  const initialPath = typeof window === "undefined" ? "/" : window.location.pathname;
+  const initialParts = initialPath.split("/").filter(Boolean);
+  const [view, setView] = useState<View>(initialParts[0] === "instruments" ? "instrument" : initialParts[0] === "screens" ? (initialParts[1] === "new" ? "editor" : "results") : "overview");
+  const [routeId, setRouteId] = useState(initialParts[1] ?? "");
   const [status, setStatus] = useState<StatusDto>(fallbackStatus);
   const [metrics, setMetrics] = useState<readonly MetricDefinition[]>(DEFAULT_METRIC_CATALOG);
   const [screens, setScreens] = useState<readonly SavedScreen[]>([]);
@@ -74,22 +78,25 @@ export function App({ api }: AppProps) {
     return () => window.removeEventListener("beforeunload", beforeUnload);
   }, [dirty]);
 
-  const openOverview = () => { if (dirty) setShowGuard(true); else setView("overview"); };
-  const openEditor = (mode: EditorMode, screen?: SavedScreen) => { setEditorMode(mode); setEditing(screen); setDirty(false); setView("editor"); };
-  const confirmLeave = () => { setShowGuard(false); setDirty(false); setView("overview"); };
+  const navigate = useCallback((path: string, nextView: View, id = "") => { window.history.pushState({}, "", path); setView(nextView); setRouteId(id); }, []);
+  useEffect(() => { const onPopState = () => { const parts = window.location.pathname.split("/").filter(Boolean); setRouteId(parts[1] ?? ""); setView(parts[0] === "instruments" ? "instrument" : parts[0] === "screens" && parts[1] && parts[1] !== "new" ? "results" : parts[0] === "screens" ? "editor" : "overview"); }; window.addEventListener("popstate", onPopState); return () => window.removeEventListener("popstate", onPopState); }, []);
+  const openOverview = () => { if (dirty) setShowGuard(true); else navigate("/", "overview"); };
+  const openEditor = (mode: EditorMode, screen?: SavedScreen) => { setEditorMode(mode); setEditing(screen); setDirty(false); navigate(screen && mode === "edit" ? `/screens/${encodeURIComponent(screen.id)}/edit` : "/screens/new", "editor", screen?.id ?? ""); };
+  const confirmLeave = () => { setShowGuard(false); setDirty(false); navigate("/", "overview"); };
   const onSaved = (screen: SavedScreen) => { setScreens((current) => [screen, ...current.filter((item) => item.id !== screen.id)]); setEditing(screen); setDirty(false); };
   const onRun = async (screen: SavedScreen) => {
     try { const run = await resolvedApi.runScreen(screen.id); setRuns((current) => ({ ...current, [screen.id]: run })); setActionError(null); }
     catch { setActionError(`Unable to run ${screen.name}. Your saved screen is unchanged.`); }
   };
 
+  const resolvedScreenId = screens.find((screen) => screen.id === routeId || screen.name.toLocaleLowerCase("en-IN").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") === routeId)?.id ?? routeId;
   return <div className="app-shell">
     <a className="skip-link" href="#main-content">Skip to main content</a>
     <header className="site-header" aria-hidden={showGuard ? true : undefined}>
       <div className="brand-lockup"><span className="brand-mark" aria-hidden="true">S</span><span><strong>STONKS</strong><small>INDIA RESEARCH</small></span></div>
       <nav aria-label="Primary navigation" className="primary-nav">
         <button className={view === "overview" ? "nav-link active" : "nav-link"} onClick={openOverview}>Overview</button>
-        <button className={view === "editor" ? "nav-link active" : "nav-link"} onClick={() => openEditor("new")}>Screens</button>
+        <button className={view === "editor" || view === "results" ? "nav-link active" : "nav-link"} onClick={() => openEditor("new")}>Screens</button>
         <button className="nav-link" type="button" disabled aria-disabled="true" title="Glossary content is coming soon">Learn</button>
       </nav>
       <div className="private-badge"><span className="status-dot" aria-hidden="true" />Private workspace</div>
@@ -97,7 +104,7 @@ export function App({ api }: AppProps) {
 
     <main id="main-content" tabIndex={-1} aria-hidden={showGuard ? true : undefined}>
       <div className="page-frame">
-        {view === "overview" ? <Overview status={status} screens={screens} runs={runs} loading={loading} historyLoading={historyLoading} loadError={loadError} historyError={historyError} actionError={actionError} onRetry={() => void loadWorkspace()} onNew={() => openEditor("new")} onEdit={(screen) => openEditor("edit", screen)} onDuplicate={(screen) => openEditor("duplicate", screen)} onRun={onRun} /> : <ScreenEditor {...(editing ? { initialScreen: editing } : {})} metrics={metrics} mode={editorMode} api={resolvedApi} onDirtyChange={setDirty} onSaved={onSaved} onRun={onRun} onBack={openOverview} />}
+        {view === "overview" ? <Overview status={status} screens={screens} runs={runs} loading={loading} historyLoading={historyLoading} loadError={loadError} historyError={historyError} actionError={actionError} onRetry={() => void loadWorkspace()} onNew={() => openEditor("new")} onEdit={(screen) => openEditor("edit", screen)} onDuplicate={(screen) => openEditor("duplicate", screen)} onRun={onRun} onResults={(screen) => navigate(`/screens/${encodeURIComponent(screen.id)}`, "results", screen.id)} /> : view === "editor" ? <ScreenEditor {...(editing ? { initialScreen: editing } : {})} metrics={metrics} mode={editorMode} api={resolvedApi} onDirtyChange={setDirty} onSaved={onSaved} onRun={onRun} onBack={openOverview} /> : view === "results" ? <ScreenResultsView screenId={resolvedScreenId} api={resolvedApi} onBack={openOverview} onOpenInstrument={(instrumentId) => navigate(`/instruments/${encodeURIComponent(instrumentId)}`, "instrument", instrumentId)} /> : <InstrumentView instrumentId={routeId} api={resolvedApi} onBack={() => navigate(`/screens/${encodeURIComponent(resolvedScreenId)}`, "results", resolvedScreenId)} />}
       </div>
     </main>
     <div aria-hidden={showGuard ? true : undefined}><Disclosure effectiveDate={status.effectiveDate} /></div>
@@ -105,8 +112,8 @@ export function App({ api }: AppProps) {
   </div>;
 }
 
-interface OverviewProps { readonly status?: StatusDto; readonly screens?: readonly SavedScreen[]; readonly runs?: Readonly<Record<string, ScreenRunSummary | undefined>>; readonly loading?: boolean; readonly historyLoading?: boolean; readonly loadError?: string | null; readonly historyError?: string | null; readonly actionError?: string | null; readonly onRetry?: () => void; readonly onNew?: () => void; readonly onEdit?: (screen: SavedScreen) => void; readonly onDuplicate?: (screen: SavedScreen) => void; readonly onRun?: (screen: SavedScreen) => Promise<void>; }
-export function Overview({ status = fallbackStatus, screens = [], runs = {}, loading = false, historyLoading = false, loadError = null, historyError = null, actionError = null, onRetry = () => undefined, onNew = () => undefined, onEdit = () => undefined, onDuplicate = () => undefined, onRun = async () => undefined }: OverviewProps) {
+interface OverviewProps { readonly status?: StatusDto; readonly screens?: readonly SavedScreen[]; readonly runs?: Readonly<Record<string, ScreenRunSummary | undefined>>; readonly loading?: boolean; readonly historyLoading?: boolean; readonly loadError?: string | null; readonly historyError?: string | null; readonly actionError?: string | null; readonly onRetry?: () => void; readonly onNew?: () => void; readonly onEdit?: (screen: SavedScreen) => void; readonly onDuplicate?: (screen: SavedScreen) => void; readonly onRun?: (screen: SavedScreen) => Promise<void>; readonly onResults?: (screen: SavedScreen) => void; }
+export function Overview({ status = fallbackStatus, screens = [], runs = {}, loading = false, historyLoading = false, loadError = null, historyError = null, actionError = null, onRetry = () => undefined, onNew = () => undefined, onEdit = () => undefined, onDuplicate = () => undefined, onRun = async () => undefined, onResults = () => undefined }: OverviewProps) {
   const totalMatches = Object.values(runs).reduce((sum, run) => sum + (run?.matchCount ?? 0), 0);
   return <>
     {loadError ? <div className="error-banner" role="alert"><span>{loadError}</span><button className="button button-quiet small" onClick={onRetry}>Retry</button></div> : null}
@@ -123,7 +130,7 @@ export function Overview({ status = fallbackStatus, screens = [], runs = {}, loa
       <div><span className="context-label">Refresh cadence</span><strong>End of day</strong></div>
     </section>
     <section className="section-block" aria-labelledby="health-title"><div className="section-heading"><div><p className="eyebrow">LINEAGE</p><h2 id="health-title">Source health</h2></div><span className="section-note">Independent freshness by source</span></div><div className="health-grid">{status.sources.length ? status.sources.map((source) => <SourceCard key={source.sourceId} source={source} />) : <div className="empty-card">No source status available yet.</div>}</div></section>
-    <section className="section-block" aria-labelledby="screens-title"><div className="section-heading"><div><p className="eyebrow">MECHANICAL FILTERS</p><h2 id="screens-title">Saved screens</h2></div><span className="result-summary">{screens.length} saved · {totalMatches} top matches</span></div>{loading ? <div className="loading-card" aria-live="polite">Loading your research workspace…</div> : screens.length ? <div className="screen-grid">{screens.map((screen) => <ScreenCard key={screen.id} screen={screen} run={runs[screen.id]} onEdit={onEdit} onDuplicate={onDuplicate} onRun={onRun} />)}</div> : <div className="empty-card"><h3>Start with a question</h3><p>Build a Screener-style query to find the strongest candidates in your universe.</p><button className="button button-secondary" onClick={onNew}>Create your first screen</button></div>}</section>
+    <section className="section-block" aria-labelledby="screens-title"><div className="section-heading"><div><p className="eyebrow">MECHANICAL FILTERS</p><h2 id="screens-title">Saved screens</h2></div><span className="result-summary">{screens.length} saved · {totalMatches} top matches</span></div>{loading ? <div className="loading-card" aria-live="polite">Loading your research workspace…</div> : screens.length ? <div className="screen-grid">{screens.map((screen) => <ScreenCard key={screen.id} screen={screen} run={runs[screen.id]} onEdit={onEdit} onDuplicate={onDuplicate} onRun={onRun} onResults={onResults} />)}</div> : <div className="empty-card"><h3>Start with a question</h3><p>Build a Screener-style query to find the strongest candidates in your universe.</p><button className="button button-secondary" onClick={onNew}>Create your first screen</button></div>}</section>
   </>;
 }
 
@@ -132,14 +139,14 @@ function SourceCard({ source }: { readonly source: StatusDto["sources"][number] 
   return <article className="source-card"><div className="card-topline"><span className={healthy ? "source-state healthy" : "source-state delayed"}><span className="status-dot" aria-hidden="true" />{sourceLabel(source.sourceId)} {state}</span><span className="source-kind">OFFICIAL</span></div><dl className="date-list"><div><dt>Expected</dt><dd>{formatDate(source.expectedDate)}</dd></div><div><dt>Loaded</dt><dd>{formatDate(source.loadedDate)}</dd></div></dl>{source.coverage !== undefined && source.coverage !== null ? <div className="coverage"><span>Coverage</span><strong>{Math.round(source.coverage * 100)}%</strong></div> : null}</article>;
 }
 
-interface ScreenCardProps { readonly screen: SavedScreen; readonly run: ScreenRunSummary | undefined; readonly onEdit: (screen: SavedScreen) => void; readonly onDuplicate: (screen: SavedScreen) => void; readonly onRun: (screen: SavedScreen) => Promise<void>; }
-function ScreenCard({ screen, run, onEdit, onDuplicate, onRun }: ScreenCardProps) {
+interface ScreenCardProps { readonly screen: SavedScreen; readonly run: ScreenRunSummary | undefined; readonly onEdit: (screen: SavedScreen) => void; readonly onDuplicate: (screen: SavedScreen) => void; readonly onRun: (screen: SavedScreen) => Promise<void>; readonly onResults: (screen: SavedScreen) => void; }
+function ScreenCard({ screen, run, onEdit, onDuplicate, onRun, onResults }: ScreenCardProps) {
   const [running, setRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
   const runNow = async () => { setRunning(true); setRunError(null); try { await onRun(screen); } catch { setRunError(`Unable to run ${screen.name}. Try again.`); } finally { setRunning(false); } };
   const entries = run?.matches?.filter((match) => match.entered).length ?? 0;
   const exits = run?.matches?.filter((match) => match.exited).length ?? 0;
-  return <article className="screen-card"><div className="screen-card-head"><div><span className="screen-label">SAVED SCREEN</span><h3>{screen.name}</h3></div><button className="icon-button" aria-label={`Edit ${screen.name}`} onClick={() => onEdit(screen)}>Edit</button></div><code className="query-preview">{screen.source}</code>{runError ? <div className="inline-error" role="alert">{runError}</div> : null}<div className="screen-card-meta"><div><span className="context-label">Last run</span><strong>{run ? formatDate(run.effectiveDate) : "Not run"}</strong></div><div><span className="context-label">Top matches</span><strong>{run?.matchCount ?? "—"}</strong></div><div><span className="context-label">Since prior run</span><strong className={entries || exits ? "text-positive" : ""}>{run ? `+${entries} / −${exits}` : "—"}</strong></div></div><div className="card-actions"><button className="button button-primary small" onClick={() => void runNow()} disabled={running}>{running ? "Running…" : "Run screen"}</button><button className="button button-quiet small" onClick={() => onDuplicate(screen)}>Duplicate</button></div></article>;
+  return <article className="screen-card"><div className="screen-card-head"><div><span className="screen-label">SAVED SCREEN</span><h3>{screen.name}</h3></div><button className="icon-button" aria-label={`Edit ${screen.name}`} onClick={() => onEdit(screen)}>Edit</button></div><code className="query-preview">{screen.source}</code>{runError ? <div className="inline-error" role="alert">{runError}</div> : null}<div className="screen-card-meta"><div><span className="context-label">Last run</span><strong>{run ? formatDate(run.effectiveDate) : "Not run"}</strong></div><div><span className="context-label">Top matches</span><strong>{run?.matchCount ?? "—"}</strong></div><div><span className="context-label">Since prior run</span><strong className={entries || exits ? "text-positive" : ""}>{run ? `+${entries} / −${exits}` : "—"}</strong></div></div><div className="card-actions"><button className="button button-primary small" onClick={() => void runNow()} disabled={running}>{running ? "Running…" : "Run screen"}</button>{run ? <button className="button button-secondary small" onClick={() => onResults(screen)}>View results</button> : null}<button className="button button-quiet small" onClick={() => onDuplicate(screen)}>Duplicate</button></div>{run?.matches?.find((match) => !match.exited) ? <a className="result-link" href={`/screens/${encodeURIComponent(screen.id)}`} onClick={(event) => { event.preventDefault(); onResults(screen); }}>View first match</a> : null}</article>;
 }
 
 interface EditorProps { readonly metrics?: readonly MetricDefinition[]; readonly initialScreen?: SavedScreen; readonly initialValue?: string; readonly mode?: EditorMode; readonly api?: DashboardApi; readonly onDirtyChange?: (dirty: boolean) => void; readonly onSaved?: (screen: SavedScreen) => void; readonly onRun?: (screen: SavedScreen) => Promise<void>; readonly onBack?: () => void; }
