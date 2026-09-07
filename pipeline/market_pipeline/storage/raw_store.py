@@ -11,6 +11,7 @@ from typing import Protocol
 
 from market_pipeline.domain.models import SourceArtifact
 from market_pipeline.sources.base import RawStore
+from market_pipeline.sources.registry import assert_artifact_policy
 
 __all__ = ["ImmutableRawStoreError", "LocalRawStore", "ObjectClient", "R2RawStore", "RawStore"]
 
@@ -20,7 +21,7 @@ class ImmutableRawStoreError(RuntimeError):
 
 
 class ObjectClient(Protocol):
-    def put(self, key: str, body: bytes) -> None: ...
+    def put_if_absent(self, key: str, body: bytes) -> bool: ...
 
     def get(self, key: str) -> bytes | None: ...
 
@@ -40,7 +41,7 @@ def _object_key(artifact: SourceArtifact) -> str:
 
 
 def _metadata_key(key: str) -> str:
-    return f"{key.rsplit('/', 1)[0]}/metadata.json"
+    return f"{key}.metadata.json"
 
 
 def _metadata_body(artifact: SourceArtifact) -> bytes:
@@ -60,23 +61,30 @@ class LocalRawStore:
         self.root = Path(root)
 
     def put(self, artifact: SourceArtifact, body: bytes) -> str:
+        assert_artifact_policy(
+            source_id=artifact.source_id,
+            source_url=artifact.source_url,
+            terms_url=artifact.terms_url,
+        )
         _check_body(artifact, body)
         key = _object_key(artifact)
         path = self.root / key
-        metadata_path = path.parent / "metadata.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
+        metadata_path = self.root / _metadata_key(key)
+        # Preflight both immutable objects before writing either one. This makes a
+        # metadata conflict failure-safe even when the body does not yet exist.
         if path.exists():
             if path.read_bytes() != body:
                 raise ImmutableRawStoreError(f"immutable object already contains different bytes: {key}")
-        else:
+        metadata = _metadata_body(artifact)
+        if metadata_path.exists() and metadata_path.read_bytes() != metadata:
+            raise ImmutableRawStoreError(f"immutable metadata already differs: {metadata_path}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
             temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
             temporary.write_bytes(body)
             temporary.replace(path)
-        metadata = _metadata_body(artifact)
-        if metadata_path.exists():
-            if metadata_path.read_bytes() != metadata:
-                raise ImmutableRawStoreError(f"immutable metadata already differs: {metadata_path}")
-        else:
+        if not metadata_path.exists():
+            metadata_path.parent.mkdir(parents=True, exist_ok=True)
             metadata_path.write_bytes(metadata)
         return key
 
@@ -100,23 +108,34 @@ class R2RawStore:
         self.client = client
 
     def put(self, artifact: SourceArtifact, body: bytes) -> str:
+        assert_artifact_policy(
+            source_id=artifact.source_id,
+            source_url=artifact.source_url,
+            terms_url=artifact.terms_url,
+        )
         _check_body(artifact, body)
         key = _object_key(artifact)
-        existing = self.client.get(key)
-        if existing is not None:
-            if existing != body:
-                raise ImmutableRawStoreError(f"immutable object already contains different bytes: {key}")
-        else:
-            self.client.put(key, body)
         metadata_key = _metadata_key(key)
         metadata = _metadata_body(artifact)
+        # Check metadata before creating the body. A conflicting metadata object
+        # must not leave a newly-created, uncommitted body behind.
         existing_metadata = self.client.get(metadata_key)
-        if existing_metadata is not None:
-            if existing_metadata != metadata:
-                raise ImmutableRawStoreError(f"immutable metadata already differs: {metadata_key}")
-        else:
-            self.client.put(metadata_key, metadata)
+        if existing_metadata is not None and existing_metadata != metadata:
+            raise ImmutableRawStoreError(f"immutable metadata already differs: {metadata_key}")
+        self._put_immutable(key, body)
+        self._put_immutable(metadata_key, metadata)
         return key
+
+    def _put_immutable(self, key: str, body: bytes) -> None:
+        """Use a conditional create; never overwrite an object after a race."""
+
+        if self.client.put_if_absent(key, body):
+            return
+        existing = self.client.get(key)
+        if existing is None:
+            raise ImmutableRawStoreError(f"object creation raced with an unavailable object: {key}")
+        if existing != body:
+            raise ImmutableRawStoreError(f"immutable object already contains different bytes: {key}")
 
     def get(self, object_key: str) -> bytes:
         body = self.client.get(object_key)

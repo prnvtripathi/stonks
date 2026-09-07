@@ -20,3 +20,12 @@ class RawStore(Protocol):
     def put(self, artifact: SourceArtifact, body: bytes) -> str: ...
 
     def get(self, object_key: str) -> bytes: ...
+
+
+def fetch_with_policy(adapter: SourceAdapter, effective_date: date) -> list[FetchedArtifact]:
+    """Run an adapter only after resolving its canonical registry policy."""
+
+    from market_pipeline.sources.registry import assert_adapter_enabled
+
+    assert_adapter_enabled(adapter)
+    return adapter.fetch(effective_date)

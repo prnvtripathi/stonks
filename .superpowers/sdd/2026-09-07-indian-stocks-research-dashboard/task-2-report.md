@@ -103,3 +103,90 @@ Success: no issues found in 12 source files
 - The injected R2 client intentionally exposes a small `put/get` contract. The
   deployment adapter will need to wrap the chosen Cloudflare S3-compatible SDK to
   this contract.
+
+## Fix round 1/5
+
+### Findings addressed
+
+- `nse-eod` and `nse-filings-xbrl` are now disabled in the canonical registry by
+  default because systematic NSE website collection is not permitted by the current
+  terms. They can still be parsed as user-supplied official downloads by a future
+  explicit workflow. Automation is enabled only when the canonical policy contains
+  a recorded `permission_reference`/written license; AMFI and Nifty entries currently
+  carry their official terms references.
+- `assert_source_enabled` now resolves the canonical registry entry and requires a
+  complete policy equality match. `assert_adapter_enabled`/`fetch_with_policy` gate
+  adapter fetches, and raw stores validate artifact URL/terms provenance against the
+  canonical entry before persistence. Forged terms, URLs, and unknown IDs fail closed.
+- Metadata is now keyed per artifact filename (`{object_key}.metadata.json`). Local
+  storage preflights body and metadata before creating either file; R2 preflights
+  metadata before body creation, preventing a known metadata conflict from leaving
+  a body behind.
+- The injected R2 client now requires atomic `put_if_absent`. Existing objects are
+  compared after a conditional-create race, and different bytes are rejected without
+  any overwrite.
+
+### Fix-round RED evidence
+
+Command:
+
+```text
+UV_CACHE_DIR=/private/tmp/stonks-uv-cache uv run pytest pipeline/tests/sources/test_registry.py pipeline/tests/storage/test_raw_store.py -q
+```
+
+Output before the fixes:
+
+```text
+8 failed, 8 passed in 0.12s
+```
+
+Failures covered enabled NSE policies, forged policy acceptance, shared metadata,
+and the old unconditional R2 client method.
+
+### Fix-round GREEN evidence
+
+```text
+UV_CACHE_DIR=/private/tmp/stonks-uv-cache uv run pytest pipeline/tests/sources/test_registry.py pipeline/tests/storage/test_raw_store.py -q
+.................                                                        [100%]
+17 passed in 0.10s
+```
+
+After adding adapter-fetch and preflight conflict coverage:
+
+```text
+UV_CACHE_DIR=/private/tmp/stonks-uv-cache uv run pytest pipeline/tests/sources/test_registry.py pipeline/tests/storage/test_raw_store.py -q
+...................                                                      [100%]
+19 passed in 0.11s
+```
+
+### Fix-round final verification
+
+```text
+UV_CACHE_DIR=/private/tmp/stonks-uv-cache uv run pytest -q
+........................                                                 [100%]
+24 passed in 0.12s
+```
+
+```text
+UV_CACHE_DIR=/private/tmp/stonks-uv-cache uv run ruff check pipeline/market_pipeline pipeline/tests
+All checks passed!
+```
+
+```text
+UV_CACHE_DIR=/private/tmp/stonks-uv-cache uv run mypy pipeline
+Success: no issues found in 12 source files
+```
+
+No existing Python tests were intentionally removed.
+
+### Fix-round self-review and concerns
+
+- Verified disabled NSE policies cannot pass adapter or raw-store gates, while policy
+  equality rejects same-ID objects with changed URL, terms, or permission metadata.
+- Verified same-content artifacts with different filenames receive independent
+  metadata, and pre-existing metadata conflicts do not create a body.
+- Verified R2 writes use conditional create for both body and metadata and compare
+  the winner's bytes after a race; no unconditional overwrite path remains.
+- Remaining concern: production must obtain and record an actual written permission or
+  license before changing a disabled NSE canonical entry to enabled. The registry is
+  deliberately fail-closed until that evidence exists.

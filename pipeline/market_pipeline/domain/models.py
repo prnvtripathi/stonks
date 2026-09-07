@@ -128,6 +128,7 @@ class SourcePolicy(BaseModel):
     source_url: str = ""
     terms_url: str
     retention_allowed: bool = True
+    permission_reference: str | None = None
     description: str = ""
 
 
