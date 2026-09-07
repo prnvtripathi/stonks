@@ -89,6 +89,39 @@ describe("private research API", () => {
     expect(crossDatasetHistory.runs).toHaveLength(2);
   });
 
+  it("uses the immediately prior successful run across dataset promotions for entries and exits", async () => {
+    const store = new MemoryResearchStore("dataset-old");
+    const instrument = (instrumentId: string, active: boolean) => store.instruments.set(instrumentId, {
+      instrumentId,
+      symbol: instrumentId,
+      name: instrumentId,
+      assetClass: "equity",
+      active,
+      metrics: { volume: 10 },
+    });
+    instrument("one", true);
+    instrument("two", false);
+    const screen = await store.createScreen({ name: "Volume", source: "Volume > 1", languageVersion: "v1", createdAt: "2026-01-01", updatedAt: "2026-01-01" });
+    const first = await store.runScreen("dataset-old", screen, "2026-01-01");
+
+    store.setActiveDataset("dataset-new");
+    instrument("one", false);
+    instrument("two", true);
+    const second = await store.runScreen("dataset-new", screen, "2026-02-01");
+
+    instrument("one", true);
+    instrument("two", false);
+    const third = await store.runScreen("dataset-new", screen, "2026-03-01");
+    const flags = (run: typeof first) => Object.fromEntries(run.matches.map((match) => [match.instrumentId, { entered: match.entered, exited: match.exited }]));
+
+    expect(flags(first)).toEqual({ one: { entered: true, exited: false } });
+    expect(flags(second)).toEqual({ two: { entered: true, exited: false }, one: { entered: false, exited: true } });
+    expect(flags(third)).toEqual({ one: { entered: true, exited: false }, two: { entered: false, exited: true } });
+    expect(second.matches.find((match) => match.instrumentId === "one")?.rank).toBe(0);
+    expect(third.matches.find((match) => match.instrumentId === "two")?.rank).toBe(0);
+    expect((await store.listRuns(screen.id)).map((run) => run.effectiveDate)).toEqual(["2026-03-01", "2026-02-01", "2026-01-01"]);
+  });
+
   it("rejects missing mutation origin, unknown fields, invalid pagination, and oversized bytes", async () => {
     const api = testApi();
     const bearer = await api.issueTestToken({ email: "owner@example.com" });
@@ -126,6 +159,26 @@ describe("private research API", () => {
     await expect(new D1ResearchStore(failingDb).createScreen({ name: "x", source: "Volume > 1", languageVersion: "v1", createdAt: "2026-09-07T00:00:00.000Z", updatedAt: "2026-09-07T00:00:00.000Z" })).rejects.toThrow("D1 mutation failed");
   });
 
+  it("maps persisted exit ordinals to API rank zero", async () => {
+    class RunHistoryStatement implements D1Statement {
+      public constructor(private readonly sql: string) {}
+      bind(..._values: unknown[]): D1Statement { return this; }
+      async first<T extends Record<string, unknown> = Record<string, unknown>>(): Promise<T | null> { return null; }
+      async all<T extends Record<string, unknown> = Record<string, unknown>>(): Promise<{ results: readonly T[] }> {
+        if (this.sql.includes("FROM screen_runs")) return { results: [{ run_id: "run-1", screen_id: "screen-1", dataset_id: "dataset-1", effective_date: "2026-09-07", result_count: 1, status: "complete" }] as unknown as readonly T[] };
+        if (this.sql.includes("FROM screen_matches")) return { results: [{ instrument_id: "one", ordinal: 1, score: 2, explanation_json: JSON.stringify({ matched: true, text: "matched", metrics: ["volume"] }), entered: 1, exited: 0 }, { instrument_id: "two", ordinal: 2, score: 1, explanation_json: JSON.stringify({ matched: false, text: "exited", metrics: ["volume"] }), entered: 0, exited: 1 }] as unknown as readonly T[] };
+        return { results: [] };
+      }
+      async run(): Promise<D1Result> { return { success: true }; }
+    }
+    const db: D1Database = { prepare: (sql) => new RunHistoryStatement(sql) };
+    const [run] = await new D1ResearchStore(db).listRuns("screen-1");
+    expect(run?.matches.map((match) => ({ instrumentId: match.instrumentId, rank: match.rank, exited: match.exited }))).toEqual([
+      { instrumentId: "one", rank: 1, exited: false },
+      { instrumentId: "two", rank: 0, exited: true },
+    ]);
+  });
+
   it("rejects a match-write failure without leaving a complete run", async () => {
     const statements: string[] = [];
     class FailingMatchStatement implements D1Statement {
@@ -155,10 +208,10 @@ describe("private research API", () => {
     const encode = (value: unknown) => btoa(String.fromCharCode(...new TextEncoder().encode(JSON.stringify(value)))).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
     const secondKeyPair = await crypto.subtle.generateKey(rsaKeyParams, true, ["sign", "verify"]);
     const secondPublicJwk = await crypto.subtle.exportKey("jwk", secondKeyPair.publicKey);
-    const sign = async (kid: string, email = "owner@example.com", exp = Math.floor(Date.now() / 1000) + 300, signingKey = keyPair.privateKey) => {
+    const sign = async (kid: string, options: { readonly email?: string; readonly exp?: number; readonly iss?: string; readonly aud?: string; readonly signingKey?: typeof keyPair.privateKey } = {}) => {
       const header = encode({ alg: "RS256", typ: "JWT", kid });
-      const claims = encode({ iss: "https://access.example.com", aud: "audience", email, exp });
-      const signature = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", signingKey, new TextEncoder().encode(`${header}.${claims}`));
+      const claims = encode({ iss: options.iss ?? "https://access.example.com", aud: options.aud ?? "audience", email: options.email ?? "owner@example.com", exp: options.exp ?? Math.floor(Date.now() / 1000) + 300 });
+      const signature = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", options.signingKey ?? keyPair.privateKey, new TextEncoder().encode(`${header}.${claims}`));
       return `${header}.${claims}.${btoa(String.fromCharCode(...new Uint8Array(signature))).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "")}`;
     };
     const envWithKeys = { ...env, accessJwksUrl: `https://access.example.com/certs-${crypto.randomUUID()}` };
@@ -167,10 +220,20 @@ describe("private research API", () => {
       .mockResolvedValueOnce(Response.json({ keys: [{ ...secondPublicJwk, kid: "kid-2", alg: "RS256" }] }))
       .mockResolvedValueOnce(Response.json({ keys: [{ ...secondPublicJwk, kid: "kid-2", alg: "RS256" }] }));
     vi.stubGlobal("fetch", fetchMock);
-    const claims = await verifyAccessRequest(new Request("https://dashboard.example.com/api/v1/status", { headers: { "Cf-Access-Jwt-Assertion": await sign("kid-1") } }), envWithKeys);
+    const validToken = await sign("kid-1");
+    const claims = await verifyAccessRequest(new Request("https://dashboard.example.com/api/v1/status", { headers: { "Cf-Access-Jwt-Assertion": validToken } }), envWithKeys);
     expect(claims.email).toBe("owner@example.com");
-    await expect(verifyAccessRequest(new Request("https://dashboard.example.com/api/v1/status", { headers: { "Cf-Access-Jwt-Assertion": await sign("kid-1", "other@example.com") } }), envWithKeys)).rejects.toThrow();
-    const refreshed = await verifyAccessRequest(new Request("https://dashboard.example.com/api/v1/status", { headers: { "Cf-Access-Jwt-Assertion": await sign("kid-2", "owner@example.com", undefined, secondKeyPair.privateKey) } }), envWithKeys);
+    for (const invalidToken of [
+      await sign("kid-1", { iss: "https://other.example.com" }),
+      await sign("kid-1", { aud: "wrong-audience" }),
+      await sign("kid-1", { exp: Math.floor(Date.now() / 1000) - 1 }),
+    ]) {
+      await expect(verifyAccessRequest(new Request("https://dashboard.example.com/api/v1/status", { headers: { "Cf-Access-Jwt-Assertion": invalidToken } }), envWithKeys)).rejects.toThrow();
+    }
+    const [validHeader, validClaims, validSignature] = validToken.split(".");
+    const tamperedToken = `${validHeader}.${validClaims}.${validSignature!.startsWith("A") ? "B" : "A"}${validSignature!.slice(1)}`;
+    await expect(verifyAccessRequest(new Request("https://dashboard.example.com/api/v1/status", { headers: { "Cf-Access-Jwt-Assertion": tamperedToken } }), envWithKeys)).rejects.toThrow();
+    const refreshed = await verifyAccessRequest(new Request("https://dashboard.example.com/api/v1/status", { headers: { "Cf-Access-Jwt-Assertion": await sign("kid-2", { signingKey: secondKeyPair.privateKey }) } }), envWithKeys);
     expect(refreshed.email).toBe("owner@example.com");
     await expect(verifyAccessRequest(new Request("https://dashboard.example.com/api/v1/status", { headers: { "Cf-Access-Jwt-Assertion": await sign("unknown") } }), envWithKeys)).rejects.toThrow();
     expect(fetchMock).toHaveBeenCalledTimes(3);
