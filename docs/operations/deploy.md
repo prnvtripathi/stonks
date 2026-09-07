@@ -147,9 +147,10 @@ real credentials this environment does not have:
    Environment, plus `CLOUDFLARE_ACCOUNT_ID` (not secret, but environment
    scoped for clarity).
 4. **Two repository/environment variables**, `PREVIEW_URL` and
-   `PRODUCTION_URL` (e.g. `https://stonks-research-api-preview.<account>.workers.dev`
-   and the eventual custom production domain), used only by the smoke-test
-   curls.
+   `PRODUCTION_URL` (e.g. `https://preview.stonks-research.example` and
+   `https://stonks-research.example` -- the same two custom-domain hostnames
+   from item 7 below, never a `*.workers.dev` URL), used only by the
+   smoke-test curls.
 5. **A required-reviewer protection rule on the `production` GitHub
    Environment** (repository Settings > Environments > production > "Required
    reviewers"). This is the actual human approval gate between preview and
@@ -157,9 +158,38 @@ real credentials this environment does not have:
    not a pause for sign-off.
 6. **Real `database_id` values** in `apps/api/wrangler.jsonc`, replacing the
    `replace-in-deployment*` placeholders, once the D1 databases exist.
-7. **A production custom domain** (a `routes` entry in `env.production`),
-   once one is registered -- until then, production is reachable at its
-   `*.workers.dev` URL, which is also gated by Access.
+7. **Two custom domains, one per environment -- REQUIRED before the first
+   deploy of either environment, not an optional nicety.** Both
+   `env.preview` and `env.production` in `apps/api/wrangler.jsonc` set
+   `workers_dev: false` with no `routes` entry yet. That combination means
+   the Worker is bound to **no reachable hostname at all** until a `routes`
+   entry naming a real domain is added -- attempting to reach it before then
+   fails with a connection error, it is not "reachable at its `*.workers.dev`
+   URL" as a stopgap. Cloudflare Access is a hostname/application-level
+   gate: it can only ever front a **custom-domain route bound to a zone
+   already on this Cloudflare account**, never a `*.workers.dev` subdomain
+   (that subdomain belongs to Cloudflare's own shared zone, not one you
+   control, so no Access application can be created against it). Concretely,
+   before the first deploy of each environment:
+   - Register or reuse a zone on this Cloudflare account (e.g.
+     `stonks-research.example`).
+   - Add a `routes` entry to that environment's block in
+     `apps/api/wrangler.jsonc`, e.g.
+     `"routes": [{ "pattern": "stonks-research.example", "custom_domain": true }]`
+     for production and a distinct subdomain (e.g.
+     `preview.stonks-research.example`) for preview -- both are templated as
+     commented-out examples directly in `wrangler.jsonc` next to each
+     environment's `workers_dev` setting.
+   - Create that environment's Access application against the *same*
+     hostname the route publishes (see security-checklist.md §1-2), and
+     point `PREVIEW_URL` / `PRODUCTION_URL` at `https://<that hostname>`.
+
+   **Do not "fix" an unreachable preview/production by setting
+   `workers_dev: true` instead.** That publishes the Worker at a public
+   `*.workers.dev` URL with no Access application in front of it at all --
+   directly violating the "keep all pages and APIs private behind Cloudflare
+   Access" requirement this task exists to satisfy. `workers_dev` must stay
+   `false` in both environments.
 
 ### Known caveat: the smoke tests are not a full end-to-end auth check yet
 

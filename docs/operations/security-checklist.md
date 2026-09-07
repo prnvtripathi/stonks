@@ -135,9 +135,16 @@ per-account):
 | `Account.R2:Edit` | Scoped to the one environment's R2 bucket | Reserved for future direct-publish tooling; not currently exercised by `deploy.yml`, but the bucket binding is part of what a deploy validates |
 | `Account:Read` | This account | Required by Wrangler to resolve the account ID and validate the token itself |
 
-Neither token needs `Zone` permissions unless/until a custom domain `routes`
-entry is added to `env.production` (see deploy.md item 7); a `*.workers.dev`
-deployment needs no zone-level access at all.
+Both tokens additionally need `Zone.DNS:Edit` (or the narrower
+custom-domain-route permission the Cloudflare dashboard's token UI offers)
+scoped to the zone each environment's `routes` entry names. This is
+**required from the first deploy of either environment**, not an
+optional/deferred addition: `apps/api/wrangler.jsonc` sets `workers_dev:
+false` in both `env.preview` and `env.production`, and Cloudflare Access can
+only ever gate a custom-domain route bound to a zone you control -- never a
+`*.workers.dev` subdomain, which is not a zone on this account at all. See
+deploy.md item 7 for the exact `routes` config each environment needs before
+it is reachable.
 
 **Manual:** create both tokens in the Cloudflare dashboard (My Profile > API
 Tokens > Create Token > Custom Token) with exactly this permission set, and
@@ -145,3 +152,38 @@ store them as each environment's `CLOUDFLARE_API_TOKEN` GitHub secret. Do
 not reuse Cloudflare's "Edit Cloudflare Workers" template token as-is -- it
 is broader than this list (it typically also grants Workers KV and Workers
 Routes edit, which this deployment does not use).
+
+## 8. Supply-chain cooldown: no `minimumReleaseAgeExclude` bypass
+
+`pnpm` enforces a minimum-release-age cooldown on every dependency by
+default (currently 24 hours) specifically to defend against a package
+compromised and republished the same day CI would otherwise pull it. Task
+14's first draft added `apps/api`'s `wrangler` devDependency pinned to
+`4.129.1` -- published the same day it was added -- which pulled in five
+`workerd` platform binaries and `miniflare` at versions also published that
+same day, and `pnpm-workspace.yaml` grew a `minimumReleaseAgeExclude` list
+bypassing the cooldown for all eight, undocumented.
+
+**Fix Round 1 resolved this by pinning older versions instead of bypassing
+the check:** `apps/api/package.json` now pins `wrangler` to `4.129.0`
+(released 2026-09-03, four days before `4.129.1`) rather than the
+bleeding-edge patch release. Re-resolving the lockfile against that pin
+(`pnpm clean --lockfile && pnpm install`, with zero
+`minimumReleaseAgeExclude` entries present) picked up `workerd@1.20260903.1`
+and `miniflare@5.20260903.0-alpha` -- both comfortably past the cooldown
+window at authoring time -- with no `minimumReleaseAgeExclude` bypass
+required anywhere in `pnpm-workspace.yaml`. The full verification suite
+(`uv run ruff/mypy/pytest`, `pnpm lint/typecheck/test`,
+`pnpm --filter @stonks/web test:e2e`, and `wrangler deploy --dry-run` for
+both environments) was re-run against this pin and passed identically to
+the `4.129.1` pin -- this is a patch-version downgrade with no functional
+difference for anything this repository uses.
+
+If a future dependency bump genuinely needs a feature that only exists in a
+same-day release and no older, cooled-down version will do, the correct
+process is: (1) verify the exact published artifact against the registry's
+own checksum/provenance before excluding it, (2) add a
+`minimumReleaseAgeExclude` entry, and (3) document, right here, which
+package, why it needed the bypass, what was checked, and a note to
+re-evaluate the exclusion at the next dependency bump -- not add the
+exclusion silently as a side effect of `pnpm install`.

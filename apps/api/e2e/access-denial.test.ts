@@ -1,6 +1,6 @@
 import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createApi, MemoryResearchStore, type ApiEnv } from "../src/index";
+import worker from "../src/index";
 
 /**
  * Black-box HTTP acceptance test for Task 14's Final Verification Gate item
@@ -17,31 +17,39 @@ import { createApi, MemoryResearchStore, type ApiEnv } from "../src/index";
  * runtime, not by test code, is rejected.
  *
  * This test therefore spins up a real Node `http` server that mounts the
- * exact same `Api.fetch` handler used in production (`createApi(...).fetch`,
- * the same function `createWorker`/the Worker's `export default` delegate
- * to), and drives it with the platform `fetch()` over a real loopback
- * socket. We chose a plain Node HTTP server over `wrangler dev` because
- * `wrangler dev` needs to reach the Cloudflare API / a local Miniflare
- * runtime and bind a listening port from a fresh process, which is not
- * reliably available in a sandboxed CI-like environment; a same-process
- * Node server wrapping the identical Worker `fetch` contract gives an
- * equivalent black-box guarantee (real sockets, real HTTP semantics) without
- * that dependency. See docs/operations/deploy.md for the full rationale.
+ * exact exported Worker entry point (`import worker from "../src/index"`,
+ * i.e. the same `export default { fetch(request, bindings) { ... } }` that
+ * Cloudflare invokes for a real deployment, driven through `readApiEnv()`
+ * with a plain bindings object rather than a hand-built `ApiEnv`), and
+ * drives it with the platform `fetch()` over a real loopback socket. This
+ * covers the actual deployed binding path -- including `readApiEnv()`'s own
+ * parsing/validation of the raw string/number bindings Cloudflare would
+ * inject -- rather than only the lower-level `createApi()` helper. We chose
+ * a plain Node HTTP server over `wrangler dev` because `wrangler dev` needs
+ * to reach the Cloudflare API / a local Miniflare runtime and bind a
+ * listening port from a fresh process, which is not reliably available in a
+ * sandboxed CI-like environment; a same-process Node server wrapping the
+ * identical Worker `fetch` contract gives an equivalent black-box guarantee
+ * (real sockets, real HTTP semantics) without that dependency. See
+ * docs/operations/deploy.md for the full rationale.
  */
 describe("deployed API shape: anonymous access", () => {
   let server: Server;
   let baseUrl: string;
 
   beforeAll(async () => {
-    const env: ApiEnv = {
-      accessTeamDomain: "https://access.example.com",
-      accessAudience: "audience",
-      allowedEmails: ["owner@example.com"],
-      allowedOrigin: "https://dashboard.example.com",
-      maxBodyBytes: 16_384,
+    // The exact shape of bindings Cloudflare would inject for this Worker
+    // (see apps/api/wrangler.jsonc `vars` plus the `ACCESS_ALLOWED_EMAILS`
+    // secret) -- no DB/CHARTS bindings, so `createWorker()` falls back to
+    // `MemoryResearchStore`, same as the previous version of this test.
+    const bindings: Record<string, unknown> = {
+      ACCESS_TEAM_DOMAIN: "access.example.com",
+      ACCESS_AUD: "audience",
+      ACCESS_ALLOWED_EMAILS: "owner@example.com",
+      ALLOWED_ORIGIN: "https://dashboard.example.com",
+      MAX_BODY_BYTES: 16_384,
       activeDatasetId: "dataset-1",
     };
-    const api = createApi({ env, store: new MemoryResearchStore() });
 
     server = createServer((req, res) => {
       void (async () => {
@@ -51,11 +59,19 @@ describe("deployed API shape: anonymous access", () => {
           for (const single of Array.isArray(value) ? value : [value]) headers.append(key, single);
         }
         const request = new Request(`http://127.0.0.1${req.url}`, { method: req.method ?? "GET", headers });
-        const response = await api.fetch(request);
+        const response = await worker.fetch(request, bindings);
         const body = Buffer.from(await response.arrayBuffer());
         res.writeHead(response.status, Object.fromEntries(response.headers));
         res.end(body);
-      })();
+      })().catch((cause: unknown) => {
+        // Without this, a rejection inside the async IIFE (e.g. a thrown
+        // error from `worker.fetch`) would be a silently swallowed
+        // unhandled rejection, and the HTTP client would hang until the
+        // test's own timeout rather than failing with a legible cause.
+        console.error("access-denial.test.ts request handler failed", cause);
+        if (!res.headersSent) res.writeHead(500);
+        res.end(JSON.stringify({ error: { code: "TEST_SERVER_ERROR", message: String(cause) } }));
+      });
     });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const address = server.address();

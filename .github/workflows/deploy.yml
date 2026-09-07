@@ -107,14 +107,14 @@ jobs:
         run: pnpm exec wrangler d1 migrations apply stonks-research-preview --env preview --remote
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
 
       - name: Deploy preview Worker
         working-directory: apps/api
         run: pnpm exec wrangler deploy --env preview
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
 
       - name: Authenticated smoke test (preview)
         # CF_ACCESS_SERVICE_TOKEN_ID / _SECRET are a Cloudflare Access
@@ -139,6 +139,17 @@ jobs:
         # misconfigured); a full 200 additionally requires that follow-up
         # allowlist change. See launch-checklist.md for the manual
         # verification this step does not yet fully automate.
+        #
+        # This step ALSO runs scripts/ci/assert-anonymous-denied.sh, a
+        # second, credential-free check that sends a plain GET with no
+        # Access/Authorization headers at all and fails the step if that
+        # gets a bare 200. This is the fail-open half of the gate: it does
+        # not require the common_name follow-up above and catches a
+        # different, more dangerous class of bug -- Access itself
+        # misconfigured to allow anyone, or accessVerifier() accidentally
+        # removed from apps/api/src/index.ts -- which the 200-or-401
+        # authenticated check above cannot detect on its own (see that
+        # script's header comment for the full rationale).
         run: |
           set -euo pipefail
           status=$(curl -s -o /tmp/preview-smoke.json -w '%{http_code}' \
@@ -150,6 +161,7 @@ jobs:
             echo "::error::Unexpected status $status from preview smoke test (expected 200, or 401 pending the common_name allowlist follow-up documented above)"
             exit 1
           fi
+          bash "${GITHUB_WORKSPACE}/scripts/ci/assert-anonymous-denied.sh" "${{ vars.PREVIEW_URL }}/api/v1/status"
 
   # ---------------------------------------------------------------------
   # Job 2: migrate+deploy+smoke-test PRODUCTION. Depends on `preview`
@@ -191,19 +203,23 @@ jobs:
         run: pnpm exec wrangler d1 migrations apply stonks-research --env production --remote
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
 
       - name: Deploy production Worker
         working-directory: apps/api
         run: pnpm exec wrangler deploy --env production
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
 
       - name: Read-only production smoke test
         # GET only -- this step must never call a mutating route (no POST
         # /api/v1/screens, no PUT, no /runs). Same known email-vs-common_name
-        # caveat as the preview smoke test above.
+        # caveat as the preview smoke test above, and the same fail-open
+        # detector (scripts/ci/assert-anonymous-denied.sh) run against
+        # production -- this is the single most important place for that
+        # check to run, since a fail-open bug here means the live,
+        # already-launched application is serving anonymous requests.
         run: |
           set -euo pipefail
           status=$(curl -s -o /tmp/production-smoke.json -w '%{http_code}' \
@@ -215,3 +231,4 @@ jobs:
             echo "::error::Unexpected status $status from production smoke test (expected 200, or 401 pending the common_name allowlist follow-up documented above)"
             exit 1
           fi
+          bash "${GITHUB_WORKSPACE}/scripts/ci/assert-anonymous-denied.sh" "${{ vars.PRODUCTION_URL }}/api/v1/status"

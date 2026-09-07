@@ -8,7 +8,7 @@
     "@stonks/query": "workspace:*"
   },
   "devDependencies": {
-    "wrangler": "4.129.1"
+    "wrangler": "4.129.0"
   },
   "scripts": {
     "test": "vitest run --config vitest.config.ts",

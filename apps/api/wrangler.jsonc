@@ -47,6 +47,22 @@
     "preview": {
       "name": "stonks-research-api-preview",
       "workers_dev": false,
+      // REQUIRED before the first deploy: a `routes` entry bound to a zone
+      // already on this Cloudflare account. `workers_dev: false` with no
+      // `routes` means this Worker is bound to NO reachable hostname at
+      // all -- Cloudflare Access is a hostname/application-level gate, and
+      // it can only ever front a custom-domain route on a zone you control,
+      // never a `*.workers.dev` subdomain (that's Cloudflare's own shared
+      // domain, not a zone in your account, so no Access application can
+      // bind to it). Do NOT "fix" an unreachable preview by flipping
+      // `workers_dev` to `true`: that publishes a public, completely
+      // ungated `*.workers.dev` endpoint, which is exactly the private-app
+      // requirement this task exists to enforce. Register (or reuse) a
+      // zone, add a preview subdomain here, e.g.:
+      //   "routes": [{ "pattern": "preview.stonks-research.example", "custom_domain": true }]
+      // then create the preview Access application against that same
+      // hostname (see security-checklist.md) and set PREVIEW_URL to
+      // `https://preview.stonks-research.example`.
       "d1_databases": [
         { "binding": "DB", "database_name": "stonks-research-preview", "database_id": "replace-in-deployment-preview", "migrations_dir": "../../db/migrations" }
       ],
@@ -62,7 +78,7 @@
       "vars": {
         "ACCESS_TEAM_DOMAIN": "replace-in-deployment.cloudflareaccess.com",
         "ACCESS_AUD": "replace-in-deployment-preview-access-aud",
-        "ALLOWED_ORIGIN": "https://stonks-research-api-preview.replace-in-deployment.workers.dev",
+        "ALLOWED_ORIGIN": "https://preview.stonks-research.example",
         "MAX_BODY_BYTES": 16384
       }
       // ACCESS_ALLOWED_EMAILS is a secret, not a var: set once via
@@ -76,6 +92,17 @@
     "production": {
       "name": "stonks-research-api",
       "workers_dev": false,
+      // REQUIRED before the first deploy -- same reasoning as env.preview
+      // above: `workers_dev: false` with no `routes` leaves this Worker
+      // reachable at NO hostname at all, and Access can never gate a
+      // `*.workers.dev` URL (it is not a zone on this account). Register a
+      // zone/subdomain for the production hostname and add its route here
+      // before deploying, e.g.:
+      //   "routes": [{ "pattern": "stonks-research.example", "custom_domain": true }]
+      // then create the production Access application against that same
+      // hostname and set PRODUCTION_URL to `https://stonks-research.example`.
+      // Flipping `workers_dev` to `true` instead would make the API and SPA
+      // publicly reachable with no Access gate at all -- never do this.
       "d1_databases": [
         { "binding": "DB", "database_name": "stonks-research", "database_id": "replace-in-deployment", "migrations_dir": "../../db/migrations" }
       ],
@@ -95,8 +122,6 @@
         "MAX_BODY_BYTES": 16384
       }
       // ACCESS_ALLOWED_EMAILS is a secret: `wrangler secret put ACCESS_ALLOWED_EMAILS --env production`.
-      // A custom domain (replacing the *.workers.dev default) should be
-      // bound via `routes` once one is registered; see deploy.md.
     }
   }
 }

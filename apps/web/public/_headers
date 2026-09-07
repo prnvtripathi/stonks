@@ -18,3 +18,19 @@
   X-Content-Type-Options: nosniff
   Referrer-Policy: no-referrer
   Cache-Control: private, no-store
+
+# Vite content-hashes every file it emits under /assets/* (e.g.
+# assets/index-<hash>.js, assets/index-<hash>.css) -- a filename only ever
+# refers to one immutable set of bytes, so a stale cached copy is
+# impossible: a code change always ships under a new hashed filename. The
+# blanket `/*` rule above (still applied for the security headers, matched
+# together with this more specific rule per Cloudflare's "most specific
+# path wins per header" merge) sets `no-store` for everything, which is
+# correct for index.html (must always be revalidated so it picks up the
+# latest hashed asset filenames) but needlessly forces a network round trip
+# for every hashed bundle on every request. This still keeps caching
+# `private` (this is an Access-gated app, never a shared/public cache) --
+# only the freshness window changes, from "never cache" to "cache exactly
+# as long as the filename is guaranteed to mean the same bytes."
+/assets/*
+  Cache-Control: private, max-age=31536000, immutable
