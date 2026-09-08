@@ -33,6 +33,9 @@ def test_history_store_exposes_injected_object_usage() -> None:
         def put_if_absent(self, key: str, body: bytes) -> bool:
             return False
 
+        def put(self, key: str, body: bytes) -> None:
+            return None
+
         def get(self, key: str) -> bytes | None:
             return None
 

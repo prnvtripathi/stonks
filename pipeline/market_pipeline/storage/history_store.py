@@ -5,7 +5,9 @@ from __future__ import annotations
 import gzip
 import io
 import json
+import os
 import re
+import tempfile
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -24,6 +26,8 @@ class HistoryStoreError(RuntimeError):
 
 class HistoryObjectClient(Protocol):
     def put_if_absent(self, key: str, body: bytes) -> bool: ...
+
+    def put(self, key: str, body: bytes) -> None: ...
 
     def get(self, key: str) -> bytes | None: ...
 
@@ -58,6 +62,22 @@ class _LocalObjectClient:
             if path.read_bytes() != body:
                 raise HistoryStoreError(f"immutable history object differs: {key}")
             return False
+
+    def put(self, key: str, body: bytes) -> None:
+        """Atomically replace a local object without exposing a partial file."""
+
+        path = self._path(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        temporary_path = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
 
     def get(self, key: str) -> bytes | None:
         try:
@@ -114,7 +134,7 @@ def chart_key(dataset_id: str, instrument_id: str | UUID) -> str:
 
 
 class HistoryStore:
-    """Write immutable yearly Parquet and dataset-scoped gzip chart objects."""
+    """Write a mutable newest-series partition and immutable earlier years/charts."""
 
     def __init__(
         self,
@@ -152,6 +172,15 @@ class HistoryStore:
                 raise HistoryStoreError(f"immutable history object differs: {key}")
         return key
 
+    def put_mutable_partition(self, key: str, body: bytes) -> str:
+        """Replace the newest partition in a supplied series through the object client."""
+
+        replace = getattr(self.client, "put", None)
+        if not callable(replace):
+            raise HistoryStoreError("the newest history partition requires an object client with replacement support")
+        replace(key, body)
+        return key
+
     def write_history(
         self,
         asset_class: str,
@@ -165,6 +194,7 @@ class HistoryStore:
             row = _safe(record)
             grouped.setdefault(_row_date(record).year, []).append(row)
         keys: list[str] = []
+        mutable_year = max(grouped)
         for year in sorted(grouped):
             rows = sorted(grouped[year], key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")))
             try:
@@ -182,7 +212,12 @@ class HistoryStore:
                 body = output.getvalue().to_pybytes()
             except (pa.ArrowException, TypeError, ValueError) as exc:
                 raise HistoryStoreError("history records cannot be encoded as Parquet") from exc
-            keys.append(self.put_if_absent(history_key(asset_class, instrument_id, year), body))
+            key = history_key(asset_class, instrument_id, year)
+            keys.append(
+                self.put_mutable_partition(key, body)
+                if year == mutable_year
+                else self.put_if_absent(key, body)
+            )
         return keys
 
     def read_history(self, asset_class: str, instrument_id: str | UUID, year: int) -> list[dict[str, Any]]:

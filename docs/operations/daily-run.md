@@ -111,9 +111,9 @@ manifest, gated by the reconciliation and storage-budget checks in
     object ... --remote` commands before D1 import. The workflow rejects a
     missing, malformed, or root-escaping manifest path; cached charts for old
     datasets are not re-uploaded on every run. Every active-manifest object,
-    including mutable current-year history, is PUT and then byte-verified. A history or chart
+    including the mutable newest history partition, is PUT and then byte-verified. A history or chart
     upload/verification failure stops the job before D1 can change. This is
-    deliberately not a remote-existence probe: a current-year history object
+    deliberately not a remote-existence probe: the newest history partition
     changes as daily points are appended, so it must be overwritten and
     verified just like a chart.
 12. Import `active-dataset.sql` with `wrangler d1 execute --remote --file`,
@@ -123,21 +123,35 @@ manifest, gated by the reconciliation and storage-budget checks in
     original state, and the generated SQL performs the status/pointer switch
     as its final statements.
 
-Before any R2 or D1 remote command, the workflow validates an exported
-operation plan. It counts D1 indexed-row amplification (not merely SQL
-statements) and rejects more than 50,000 D1 mutations per run, half of the
-100,000 free daily allowance. It also projects 22 weekday runs/month and caps
+Before any R2 or D1 **mutation**, the workflow captures production D1's
+read-only `wrangler d1 info --json` response. The local preflight accepts only
+non-negative numeric `database_size` and `rows_written_24h` values, never logs
+the response or credentials, and validates the exported operation plan. It
+counts D1 indexed-row amplification (not merely SQL statements): each
+`source_runs` write includes its table, primary-key, and date-index effects;
+each compact snapshot UPSERT accounts for its table/primary-key/secondary-index
+write, and only the exact stale ID set contributes deletes. It rejects
+more than 50,000 planned mutations per run and rejects planned mutations plus
+the current 24-hour remote write count above 90,000, preserving room below the
+100,000 free daily allowance for same-day retries.
+
+The preflight also rejects a projected remote database size above 400 MB, below
+the 500 MB free per-database limit. `database_size` already includes global
+saved screens/runs/matches; because D1 does not reveal the reclaimable bytes of
+the old active snapshot, the projection conservatively adds twice the new SQL
+import (payload plus table/index overhead) and takes no storage credit for the
+bounded snapshot replacement. It also projects 22 weekday runs/month and caps
 R2 Class A at 500,000/month and Class B at 5,000,000/month, each below the
-free-tier monthly allowance. The remote import uses one `instrument_snapshots`
-JSON row per instrument rather than the local EAV metric rows, so a typical
-full universe is near one snapshot write per instrument instead of roughly a
-dozen metric writes per instrument. The Worker executes saved-screen filters
-with checked JSON extraction from that snapshot and retains saved screens/runs
-as global D1 tables.
+free-tier monthly allowance. The
+remote import uses one `instrument_snapshots` JSON row per instrument rather
+than the local EAV metric rows, so a typical full universe is near one snapshot
+write per instrument instead of roughly a dozen metric writes per instrument.
+The Worker executes saved-screen filters with checked JSON extraction from that
+snapshot and retains saved screens/runs as global D1 tables.
 
 The remote serving projection is intentionally bounded: `instrument_snapshots`
-is keyed by `instrument_id`, and each import uses `INSERT OR REPLACE` then
-removes rows outside the candidate dataset before the final active-pointer
+is keyed by `instrument_id`, and each import UPSERTs by that key then removes
+only rows outside the candidate dataset before the final active-pointer
 change. It therefore retains only the active universe; historical screen
 matches remain in `screen_matches` and historical charts/history remain in R2.
 The exporter rejects any individual SQL statement above 90,000 UTF-8 bytes
@@ -145,6 +159,13 @@ The exporter rejects any individual SQL statement above 90,000 UTF-8 bytes
 enabling production publication, the owner must size a representative full
 universe export and keep the D1 storage alert below the 500 MB free per-database
 limit; monitor that usage as retained global screen history grows.
+
+The newest local history partition in the supplied series is deliberately
+mutable: the pipeline atomically replaces its yearly Parquet after rebuilding
+the full series for that run. Earlier years and dataset-scoped charts retain
+immutable put-if-absent behavior. The workflow still PUTs and byte-verifies
+every active manifest object, so the growing newest R2 object is verified before D1's
+active pointer can change.
 
 ## Coverage baseline persistence
 

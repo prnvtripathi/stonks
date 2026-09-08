@@ -299,16 +299,27 @@ jobs:
             --object-manifest active-history-objects.json \
             --publication-plan active-publication-plan.json > active-dataset-id.txt
 
+      - name: Read production D1 publication capacity
+        if: steps.params.outputs.manifest_present == 'true'
+        run: |
+          set -euo pipefail
+          pnpm --dir apps/api exec wrangler d1 info stonks-research --env production --json > d1-publication-info.json
+
       - name: Preflight remote publication budget
         if: steps.params.outputs.manifest_present == 'true'
         run: |
           set -euo pipefail
           MAX_D1_MUTATIONS_PER_RUN=50000
+          MAX_D1_ROWS_WRITTEN_24H=90000
+          MAX_D1_DATABASE_BYTES=400000000
           MAX_R2_CLASS_A_PER_MONTH=500000
           MAX_R2_CLASS_B_PER_MONTH=5000000
           WEEKDAY_RUNS_PER_MONTH=22
           if ! uv run python -m market_pipeline.publication.preflight --plan active-publication-plan.json \
+            --d1-info d1-publication-info.json \
             --max-d1-mutations-per-run "${MAX_D1_MUTATIONS_PER_RUN}" \
+            --max-d1-rows-written-24h "${MAX_D1_ROWS_WRITTEN_24H}" \
+            --max-d1-database-bytes "${MAX_D1_DATABASE_BYTES}" \
             --max-r2-class-a-per-month "${MAX_R2_CLASS_A_PER_MONTH}" \
             --max-r2-class-b-per-month "${MAX_R2_CLASS_B_PER_MONTH}" \
             --weekday-runs-per-month "${WEEKDAY_RUNS_PER_MONTH}"; then

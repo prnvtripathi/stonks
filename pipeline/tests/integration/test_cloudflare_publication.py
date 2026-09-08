@@ -14,11 +14,12 @@ def test_daily_workflow_uploads_and_verifies_history_before_d1_pointer_switch() 
 
     install = workflow.index("Install pinned Wrangler dependency")
     export = workflow.index("Export locally active dataset for D1")
+    d1_info = workflow.index("Read production D1 publication capacity")
     preflight = workflow.index("Preflight remote publication budget")
     r2 = workflow.index("Upload and verify private R2 history objects")
     d1 = workflow.index("Import active dataset into production D1")
     verify = workflow.index("Verify remote active dataset")
-    assert install < export < preflight < r2 < d1 < verify
+    assert install < export < d1_info < preflight < r2 < d1 < verify
     assert "pnpm install --frozen-lockfile" in workflow
     assert "--object-manifest active-history-objects.json" in workflow
     assert "active-history-objects.json" in workflow
@@ -30,6 +31,8 @@ def test_daily_workflow_uploads_and_verifies_history_before_d1_pointer_switch() 
     assert "MAX_D1_MUTATIONS_PER_RUN=50000" in workflow
     assert "WEEKDAY_RUNS_PER_MONTH=22" in workflow
     assert "market_pipeline.publication.preflight --plan active-publication-plan.json" in workflow
+    assert "--d1-info d1-publication-info.json" in workflow
+    assert "wrangler d1 info stonks-research --env production --json > d1-publication-info.json" in workflow
     assert '[[ "${object_key}" == history/* ]]' not in workflow
     assert workflow.count('wrangler r2 object put "${remote_object}"') == 1
     assert "remote publication plan exceeds the free-tier safety envelope" in workflow

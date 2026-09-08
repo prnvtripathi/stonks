@@ -37,7 +37,7 @@ _DATASET_TABLES = (
 # import at a single serving row per instrument rather than one EAV row per
 # metric; the multipliers below count the primary and secondary index writes.
 _REMOTE_TABLES = ("sources", "source_runs")
-_WRITE_AMPLIFICATION = {"datasets": 2, "sources": 2, "source_runs": 2, "instrument_snapshots": 3}
+_WRITE_AMPLIFICATION = {"datasets": 2, "sources": 2, "source_runs": 3, "instrument_snapshots": 3}
 _WEEKDAY_RUNS_PER_MONTH = 22
 _MAX_D1_MUTATIONS_PER_RUN = 50_000
 _MAX_R2_CLASS_A_PER_MONTH = 500_000
@@ -140,13 +140,17 @@ def _insert(table: str, columns: Sequence[str], values: Sequence[Any]) -> str:
     return f"INSERT OR IGNORE INTO {table} ({names}) VALUES ({encoded});"
 
 
-def _replace(table: str, columns: Sequence[str], values: Sequence[Any]) -> str:
+def _upsert_snapshot(columns: Sequence[str], values: Sequence[Any]) -> str:
     names = ", ".join(columns)
     encoded = ", ".join(_literal(value) for value in values)
-    return f"INSERT OR REPLACE INTO {table} ({names}) VALUES ({encoded});"
+    updates = ", ".join(f"{column} = excluded.{column}" for column in columns if column != "instrument_id")
+    return (
+        f"INSERT INTO instrument_snapshots ({names}) VALUES ({encoded}) "
+        f"ON CONFLICT(instrument_id) DO UPDATE SET {updates};"
+    )
 
 
-def _assert_sql_size(statements: Sequence[str]) -> None:
+def _assert_sql_size(statements: Sequence[str]) -> int:
     total = 0
     for statement in statements:
         size = len(statement.encode("utf-8"))
@@ -157,6 +161,7 @@ def _assert_sql_size(statements: Sequence[str]) -> None:
         total += size + 1
     if total > _MAX_D1_IMPORT_BYTES:
         raise DatasetExportError(f"remote D1 import exceeds {_MAX_D1_IMPORT_BYTES} UTF-8 bytes")
+    return total
 
 
 def _rows(connection: sqlite3.Connection, table: str, dataset_id: str) -> Iterable[tuple[Any, ...]]:
@@ -222,13 +227,28 @@ def _snapshot_rows(connection: sqlite3.Connection, dataset_id: str) -> list[tupl
     ]
 
 
-def _publication_plan(snapshot_count: int, source_count: int, source_run_count: int, history_keys: Sequence[str]) -> dict[str, int]:
+def _publication_plan(
+    snapshot_count: int,
+    stale_snapshot_count: int,
+    source_count: int,
+    source_run_count: int,
+    history_keys: Sequence[str],
+    *,
+    d1_import_bytes: int,
+    snapshot_bytes: int,
+) -> dict[str, int]:
     history_count = sum(key.startswith("history/") for key in history_keys)
     chart_count = len(history_keys) - history_count
     # Current-year history grows on every session, so every manifest object is
     # PUT and then read back once for byte verification.
     return {
-        "d1_mutations": 5 + _WRITE_AMPLIFICATION["datasets"] + source_count * _WRITE_AMPLIFICATION["sources"] + source_run_count * _WRITE_AMPLIFICATION["source_runs"] + snapshot_count * _WRITE_AMPLIFICATION["instrument_snapshots"] * 2,
+        # Six control writes cover two indexed dataset-status updates and the
+        # indexed active pointer. An UPSERT changes each current snapshot once;
+        # only IDs absent from the candidate are deleted as stale rows.
+        "d1_mutations": 6 + _WRITE_AMPLIFICATION["datasets"] + source_count * _WRITE_AMPLIFICATION["sources"] + source_run_count * _WRITE_AMPLIFICATION["source_runs"] + snapshot_count * _WRITE_AMPLIFICATION["instrument_snapshots"] + stale_snapshot_count * _WRITE_AMPLIFICATION["instrument_snapshots"],
+        "d1_import_bytes": d1_import_bytes,
+        "snapshot_bytes": snapshot_bytes,
+        "stale_snapshot_rows": stale_snapshot_count,
         "r2_class_a": history_count + chart_count,
         "r2_class_b": history_count + chart_count,
         "weekday_runs_per_month": _WEEKDAY_RUNS_PER_MONTH,
@@ -236,6 +256,31 @@ def _publication_plan(snapshot_count: int, source_count: int, source_run_count: 
         "max_r2_class_a_per_month": _MAX_R2_CLASS_A_PER_MONTH,
         "max_r2_class_b_per_month": _MAX_R2_CLASS_B_PER_MONTH,
     }
+
+
+def _stale_snapshot_count(
+    connection: sqlite3.Connection,
+    dataset_id: str,
+    snapshots: Sequence[Sequence[Any]],
+) -> int:
+    """Count exact stale IDs against the last locally promoted universe."""
+
+    previous = connection.execute(
+        "SELECT dataset_id FROM datasets WHERE status = 'superseded' AND dataset_id <> ? "
+        "ORDER BY promoted_at DESC, created_at DESC LIMIT 1",
+        (dataset_id,),
+    ).fetchone()
+    if previous is None:
+        return 0
+    prior_ids = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT instrument_id FROM instruments WHERE dataset_id = ?",
+            (previous[0],),
+        )
+    }
+    current_ids = {str(row[0]) for row in snapshots}
+    return len(prior_ids - current_ids)
 
 
 def _manifest_keys(connection: sqlite3.Connection, dataset_id: str, history_root: Path) -> list[str]:
@@ -323,7 +368,8 @@ def export_active_dataset(
     for table in _REMOTE_TABLES:
         columns = _columns(connection, table)
         statements.extend(_insert(table, columns, row) for row in _rows(connection, table, dataset_id))
-    statements.extend(_replace("instrument_snapshots", snapshot_columns, row) for row in snapshots)
+    snapshot_statements = [_upsert_snapshot(snapshot_columns, row) for row in snapshots]
+    statements.extend(snapshot_statements)
     statements.extend((
         f"DELETE FROM instrument_snapshots WHERE dataset_id <> {_literal(dataset_id)};",
         f"UPDATE datasets SET status = 'superseded' WHERE status = 'active' AND dataset_id <> {_literal(dataset_id)};",
@@ -334,14 +380,24 @@ def export_active_dataset(
         "dataset_id = excluded.dataset_id, changed_at = excluded.changed_at;",
         "",
     ))
-    _assert_sql_size(statements)
+    import_bytes = _assert_sql_size(statements)
     Path(output).write_text("\n".join(statements), encoding="utf-8")
     if manifest is not None and object_manifest is not None:
         Path(object_manifest).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     if publication_plan is not None:
         source_count = sum(1 for _ in _rows(connection, "sources", dataset_id))
         source_run_count = sum(1 for _ in _rows(connection, "source_runs", dataset_id))
-        plan = _publication_plan(len(snapshots), source_count, source_run_count, manifest or ())
+        stale_snapshot_count = _stale_snapshot_count(connection, dataset_id, snapshots)
+        snapshot_bytes = sum(len(statement.encode("utf-8")) + 1 for statement in snapshot_statements)
+        plan = _publication_plan(
+            len(snapshots),
+            stale_snapshot_count,
+            source_count,
+            source_run_count,
+            manifest or (),
+            d1_import_bytes=import_bytes,
+            snapshot_bytes=snapshot_bytes,
+        )
         Path(publication_plan).write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return dataset_id
 

@@ -162,7 +162,8 @@ def test_active_dataset_export_imports_complete_snapshot_and_preserves_global_sc
     assert "saved_screens" not in sql
     assert "screen_runs" not in sql
     assert "screen_matches" not in sql
-    assert "INSERT OR REPLACE INTO instrument_snapshots" in sql
+    assert "INSERT INTO instrument_snapshots" in sql
+    assert "ON CONFLICT(instrument_id) DO UPDATE SET" in sql
     assert "DELETE FROM instrument_snapshots WHERE dataset_id <>" in sql
     assert "INSERT OR IGNORE INTO latest_metrics" not in sql
 
@@ -231,7 +232,94 @@ def test_remote_publication_preflight_rejects_a_weekday_month_over_budget() -> N
     )
 
     with pytest.raises(RemotePublicationBudgetError, match="free-tier safety envelope"):
-        assert_plan_within_free_tier({"d1_mutations": 1, "r2_class_a": 30_000, "r2_class_b": 1, "weekday_runs_per_month": 22})
+        assert_plan_within_free_tier(
+            {
+                "d1_mutations": 1,
+                "r2_class_a": 30_000,
+                "r2_class_b": 1,
+                "weekday_runs_per_month": 22,
+                "d1_import_bytes": 1,
+                "snapshot_bytes": 1,
+            },
+            d1_info={"database_size": 1, "rows_written_24h": 1},
+        )
+
+
+def test_remote_publication_preflight_rejects_current_remote_storage_and_same_day_writes() -> None:
+    from market_pipeline.publication.preflight import (
+        RemotePublicationBudgetError,
+        assert_plan_within_free_tier,
+    )
+
+    plan = {
+        "d1_mutations": 10_000,
+        "r2_class_a": 1,
+        "r2_class_b": 1,
+        "weekday_runs_per_month": 22,
+        "d1_import_bytes": 60_000_000,
+        "snapshot_bytes": 40_000_000,
+    }
+    with pytest.raises(RemotePublicationBudgetError, match="storage"):
+        assert_plan_within_free_tier(
+            plan,
+            d1_info={"database_size": 290_000_000, "rows_written_24h": 0},
+        )
+    with pytest.raises(RemotePublicationBudgetError, match="same-day"):
+        assert_plan_within_free_tier(
+            plan,
+            d1_info={"database_size": 1, "rows_written_24h": 85_000},
+        )
+
+
+def test_active_export_plan_counts_snapshot_replacement_stale_delete_and_source_run_index(
+    tmp_path: Path,
+) -> None:
+    from market_pipeline.publication.d1_export import export_active_dataset
+
+    connection = sqlite3.connect(":memory:")
+    publisher = D1Publisher(connection)
+    publisher.initialize_schema()
+    publish(_complete_candidate("previous"), publisher)
+    publish(_complete_candidate("planned"), publisher)
+    plan_path = tmp_path / "active-publication-plan.json"
+
+    export_active_dataset(
+        connection,
+        tmp_path / "active-dataset.sql",
+        publication_plan=plan_path,
+    )
+
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    assert plan["d1_mutations"] == 16  # dataset/pointer control + source-run index + in-place snapshot update
+    assert plan["stale_snapshot_rows"] == 0
+    assert 0 < plan["snapshot_bytes"] <= plan["d1_import_bytes"]
+
+
+def test_stable_large_compact_universe_stays_within_daily_write_budget() -> None:
+    from market_pipeline.publication.d1_export import _publication_plan
+
+    stable = _publication_plan(
+        snapshot_count=12_000,
+        stale_snapshot_count=0,
+        source_count=1,
+        source_run_count=1,
+        history_keys=(),
+        d1_import_bytes=1,
+        snapshot_bytes=1,
+    )
+    stale = _publication_plan(
+        snapshot_count=12_000,
+        stale_snapshot_count=2,
+        source_count=1,
+        source_run_count=1,
+        history_keys=(),
+        d1_import_bytes=1,
+        snapshot_bytes=1,
+    )
+
+    assert stable["d1_mutations"] < 50_000
+    assert stale["d1_mutations"] == stable["d1_mutations"] + 6
+    assert stale["stale_snapshot_rows"] == 2
 
 
 def test_active_dataset_export_rejects_a_remote_d1_statement_over_90kb(tmp_path: Path) -> None:

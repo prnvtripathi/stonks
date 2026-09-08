@@ -116,7 +116,7 @@ export class D1ResearchStore implements ResearchStore {
     const checked = typecheckScreen(parsed.value);
     if (!checked) throw new Error("Invalid saved screen");
     const compiled = compileQuery(checked, DEFAULT_METRIC_CATALOG, { relation: "snapshot", includeDatasetFilter: false });
-    const rows = await this.db.prepare(`SELECT i.instrument_id, json_extract(s.metric_values_json, '$.momentum_score') AS score FROM instrument_snapshots AS i JOIN instrument_snapshots AS s ON s.dataset_id = i.dataset_id AND s.instrument_id = i.instrument_id WHERE i.dataset_id = ? AND i.active = 1 AND ${compiled.whereSql} ORDER BY score DESC NULLS LAST, i.instrument_id`).bind(datasetId, ...compiled.params).all<{ instrument_id: string; score: number | null }>();
+    const rows = await this.db.prepare(`SELECT i.instrument_id, json_extract(i.metric_values_json, '$.momentum_score') AS score FROM instrument_snapshots AS i WHERE i.dataset_id = ? AND i.active = 1 AND ${compiled.whereSql} ORDER BY score DESC NULLS LAST, i.instrument_id`).bind(datasetId, ...compiled.params).all<{ instrument_id: string; score: number | null }>();
     const prior = (await this.listRuns(screen.id)).find((run) => run.status === "complete");
     const priorIds = new Set(prior?.matches.filter((match) => !match.exited).map((match) => match.instrumentId) ?? []);
     const currentIds = new Set(rows.results.map((row) => row.instrument_id));
