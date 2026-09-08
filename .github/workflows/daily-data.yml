@@ -168,8 +168,8 @@ jobs:
         if: steps.params.outputs.manifest_present == 'true'
         uses: actions/cache/restore@v4
         with:
-          # `raw/` and `history/` hold the immutable artifact bodies and
-          # published history objects. The publication stage re-reads `raw/`
+          # `raw/` holds immutable artifact bodies; `history/` holds published
+          # history objects. The publication stage re-reads `raw/`
           # to rebuild the three-year NAV series a twelve-month return needs,
           # so losing it would silently reduce every run to one session of
           # history.
@@ -272,7 +272,7 @@ jobs:
           cat summary.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload redacted report artifact
-        if: always() && steps.params.outputs.manifest_present == 'true' 
+        if: always() && steps.params.outputs.manifest_present == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: daily-data-reconciliation-report
@@ -296,7 +296,25 @@ jobs:
           set -euo pipefail
           uv run python -m market_pipeline.publication.d1_export \
             --db market.db --output active-dataset.sql --history-root history \
-            --object-manifest active-history-objects.json > active-dataset-id.txt
+            --object-manifest active-history-objects.json \
+            --publication-plan active-publication-plan.json > active-dataset-id.txt
+
+      - name: Preflight remote publication budget
+        if: steps.params.outputs.manifest_present == 'true'
+        run: |
+          set -euo pipefail
+          MAX_D1_MUTATIONS_PER_RUN=50000
+          MAX_R2_CLASS_A_PER_MONTH=500000
+          MAX_R2_CLASS_B_PER_MONTH=5000000
+          WEEKDAY_RUNS_PER_MONTH=22
+          if ! uv run python -m market_pipeline.publication.preflight --plan active-publication-plan.json \
+            --max-d1-mutations-per-run "${MAX_D1_MUTATIONS_PER_RUN}" \
+            --max-r2-class-a-per-month "${MAX_R2_CLASS_A_PER_MONTH}" \
+            --max-r2-class-b-per-month "${MAX_R2_CLASS_B_PER_MONTH}" \
+            --weekday-runs-per-month "${WEEKDAY_RUNS_PER_MONTH}"; then
+            echo "::error::remote publication plan exceeds the free-tier safety envelope"
+            exit 1
+          fi
 
       - name: Upload and verify private R2 history objects
         if: steps.params.outputs.manifest_present == 'true'
@@ -305,9 +323,9 @@ jobs:
           while IFS= read -r object_key; do
             history_file="history/${object_key}"
             remote_object="stonks-private-history/${object_key}"
-            pnpm --dir apps/api exec wrangler r2 object put "${remote_object}" --file "${history_file}" --remote --env production
             verified_file="$(mktemp)"
             trap 'rm -f "${verified_file}"' EXIT
+            pnpm --dir apps/api exec wrangler r2 object put "${remote_object}" --file "${history_file}" --remote --env production
             pnpm --dir apps/api exec wrangler r2 object get "${remote_object}" --file "${verified_file}" --remote --env production
             cmp --silent "${history_file}" "${verified_file}"
             rm -f "${verified_file}"

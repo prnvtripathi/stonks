@@ -14,10 +14,11 @@ def test_daily_workflow_uploads_and_verifies_history_before_d1_pointer_switch() 
 
     install = workflow.index("Install pinned Wrangler dependency")
     export = workflow.index("Export locally active dataset for D1")
+    preflight = workflow.index("Preflight remote publication budget")
     r2 = workflow.index("Upload and verify private R2 history objects")
     d1 = workflow.index("Import active dataset into production D1")
     verify = workflow.index("Verify remote active dataset")
-    assert install < export < r2 < d1 < verify
+    assert install < export < preflight < r2 < d1 < verify
     assert "pnpm install --frozen-lockfile" in workflow
     assert "--object-manifest active-history-objects.json" in workflow
     assert "active-history-objects.json" in workflow
@@ -26,6 +27,12 @@ def test_daily_workflow_uploads_and_verifies_history_before_d1_pointer_switch() 
     assert 'wrangler r2 object get "${remote_object}" --file "${verified_file}" --remote --env production' in workflow
     assert "cmp --silent" in workflow
     assert "find history -type f" not in workflow
+    assert "MAX_D1_MUTATIONS_PER_RUN=50000" in workflow
+    assert "WEEKDAY_RUNS_PER_MONTH=22" in workflow
+    assert "market_pipeline.publication.preflight --plan active-publication-plan.json" in workflow
+    assert '[[ "${object_key}" == history/* ]]' not in workflow
+    assert workflow.count('wrangler r2 object put "${remote_object}"') == 1
+    assert "remote publication plan exceeds the free-tier safety envelope" in workflow
     assert "wrangler d1 execute stonks-research --env production --remote --file active-dataset.sql" in workflow
     assert "SELECT dataset_id FROM active_dataset WHERE singleton = 1" in workflow
     assert "CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}" in workflow
@@ -36,3 +43,16 @@ def test_daily_workflow_uploads_and_verifies_history_before_d1_pointer_switch() 
     assert "--env preview" not in publication
     assert "stonks-research-preview" not in publication
     assert "stonks-private-history-preview" not in publication
+
+
+def test_daily_workflow_always_reuploads_mutable_current_year_history() -> None:
+    """A successful probe cannot prove a current year's append-only file is current."""
+
+    workflow = (Path(__file__).resolve().parents[3] / ".github/workflows/daily-data.yml").read_text(
+        encoding="utf-8"
+    )
+
+    upload_loop = workflow[workflow.index("Upload and verify private R2 history objects"):]
+    assert 'wrangler r2 object put "${remote_object}"' in upload_loop
+    assert 'wrangler r2 object get "${remote_object}"' in upload_loop
+    assert '[[ "${object_key}" == history/* ]]' not in upload_loop

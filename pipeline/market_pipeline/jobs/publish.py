@@ -423,7 +423,7 @@ def _write_history(
                 {"points": [{"date": row["effective_date"], "value": float(row["value"])} for row in records]},
             )
             written += 1
-        except HistoryStoreError as exc:
+        except (HistoryStoreError, OSError) as exc:
             warnings.append(f"{instrument_id}: history object was not written ({exc})")
     return written, warnings
 

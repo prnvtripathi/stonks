@@ -115,6 +115,10 @@ class D1Publisher:
         # databases receive the governed table without rewriting 0001.
         corporate_actions_migration = Path(__file__).resolve().parents[3] / "db" / "migrations" / "0004_corporate_actions.sql"
         self.connection.executescript(corporate_actions_migration.read_text(encoding="utf-8"))
+        snapshots_migration = Path(__file__).resolve().parents[3] / "db" / "migrations" / "0005_instrument_snapshots.sql"
+        self.connection.executescript(snapshots_migration.read_text(encoding="utf-8"))
+        bounded_snapshots_migration = Path(__file__).resolve().parents[3] / "db" / "migrations" / "0006_bounded_instrument_snapshots.sql"
+        self.connection.executescript(bounded_snapshots_migration.read_text(encoding="utf-8"))
         self.connection.commit()
 
     def active_dataset_id(self) -> str | None:

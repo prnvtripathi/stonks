@@ -110,14 +110,41 @@ manifest, gated by the reconciliation and storage-budget checks in
     Upload and byte-verify only those entries with explicit `wrangler r2
     object ... --remote` commands before D1 import. The workflow rejects a
     missing, malformed, or root-escaping manifest path; cached charts for old
-    datasets are not re-uploaded on every run. A history or chart
-    upload/verification failure stops the job before D1 can change.
+    datasets are not re-uploaded on every run. Every active-manifest object,
+    including mutable current-year history, is PUT and then byte-verified. A history or chart
+    upload/verification failure stops the job before D1 can change. This is
+    deliberately not a remote-existence probe: a current-year history object
+    changes as daily points are appended, so it must be overwritten and
+    verified just like a chart.
 12. Import `active-dataset.sql` with `wrangler d1 execute --remote --file`,
     then query production D1 and require its `active_dataset` to equal the
     local dataset ID. The SQL importer deliberately has no `BEGIN`/`COMMIT`
     wrapper: a failed Cloudflare D1 file import restores the database to its
     original state, and the generated SQL performs the status/pointer switch
     as its final statements.
+
+Before any R2 or D1 remote command, the workflow validates an exported
+operation plan. It counts D1 indexed-row amplification (not merely SQL
+statements) and rejects more than 50,000 D1 mutations per run, half of the
+100,000 free daily allowance. It also projects 22 weekday runs/month and caps
+R2 Class A at 500,000/month and Class B at 5,000,000/month, each below the
+free-tier monthly allowance. The remote import uses one `instrument_snapshots`
+JSON row per instrument rather than the local EAV metric rows, so a typical
+full universe is near one snapshot write per instrument instead of roughly a
+dozen metric writes per instrument. The Worker executes saved-screen filters
+with checked JSON extraction from that snapshot and retains saved screens/runs
+as global D1 tables.
+
+The remote serving projection is intentionally bounded: `instrument_snapshots`
+is keyed by `instrument_id`, and each import uses `INSERT OR REPLACE` then
+removes rows outside the candidate dataset before the final active-pointer
+change. It therefore retains only the active universe; historical screen
+matches remain in `screen_matches` and historical charts/history remain in R2.
+The exporter rejects any individual SQL statement above 90,000 UTF-8 bytes
+(below D1's 100,000-byte ceiling) and rejects an import above 100 MB. Before
+enabling production publication, the owner must size a representative full
+universe export and keep the D1 storage alert below the 500 MB free per-database
+limit; monitor that usage as retained global screen history grows.
 
 ## Coverage baseline persistence
 
@@ -166,7 +193,7 @@ be treated as the new known-good dataset. Concretely:
   `docs/operations/recovery.md` for the retry command.
 
 Note on scope: `market-pipeline daily`/`backfill` now perform the local
-publication first. `safe_to_promote` is the interlock: immutable history/chart
+publication first. `safe_to_promote` is the interlock: required history/chart
 objects must finish before `D1Publisher.stage` is reached, so a history
 failure, blocked candidate, or failed local publication leaves the previous
 local active dataset untouched. The workflow's caches therefore carry three

@@ -112,6 +112,31 @@ def test_history_failure_leaves_previous_dataset_active(monkeypatch: pytest.Monk
     assert publisher.active_dataset_id() == "known-good"
 
 
+def test_filesystem_history_failure_leaves_previous_dataset_active(monkeypatch: pytest.MonkeyPatch) -> None:
+    connection = sqlite3.connect(":memory:")
+    publisher = D1Publisher(connection)
+    publisher.initialize_schema()
+    publisher.seed_active("known-good")
+    build = DatasetBuild(_complete_candidate("candidate"), {}, {}, {"instrument-1": ("mutual_fund", ())}, ())
+    monkeypatch.setattr("market_pipeline.jobs.publish.build_candidate", lambda *args, **kwargs: build)
+
+    class PermissionDeniedHistoryStore:
+        def write_history(self, *args: Any, **kwargs: Any) -> list[str]:
+            raise PermissionError("history root is read-only")
+
+        def write_chart(self, *args: Any, **kwargs: Any) -> str:
+            raise AssertionError("chart writing must not follow a filesystem write failure")
+
+    result = publish_checkpointed_dataset(
+        connection, publisher, object(), ["amfi-nav"], effective_date=__import__("datetime").date(2026, 9, 1),
+        safe_to_promote=True, history_store=PermissionDeniedHistoryStore(),  # type: ignore[arg-type]
+    )
+
+    assert result.promoted is False
+    assert "history" in (result.reason or "")
+    assert publisher.active_dataset_id() == "known-good"
+
+
 def test_active_dataset_export_imports_complete_snapshot_and_preserves_global_screens(
     tmp_path: Path,
 ) -> None:
@@ -137,6 +162,9 @@ def test_active_dataset_export_imports_complete_snapshot_and_preserves_global_sc
     assert "saved_screens" not in sql
     assert "screen_runs" not in sql
     assert "screen_matches" not in sql
+    assert "INSERT OR REPLACE INTO instrument_snapshots" in sql
+    assert "DELETE FROM instrument_snapshots WHERE dataset_id <>" in sql
+    assert "INSERT OR IGNORE INTO latest_metrics" not in sql
 
     remote = sqlite3.connect(":memory:")
     remote_publisher = D1Publisher(remote)
@@ -154,7 +182,7 @@ def test_active_dataset_export_imports_complete_snapshot_and_preserves_global_sc
     assert remote_publisher.active_dataset_id() == "published"
     assert remote.execute("SELECT status FROM datasets WHERE dataset_id='published'").fetchone() == ("active",)
     assert remote.execute("SELECT name FROM saved_screens WHERE screen_id='screen-1'").fetchone() == ("Keep me",)
-    assert remote.execute("SELECT name FROM instruments WHERE dataset_id='published'").fetchone() == ("O'Connor Fund",)
+    assert remote.execute("SELECT name FROM instrument_snapshots WHERE dataset_id='published'").fetchone() == ("O'Connor Fund",)
 
 
 def test_active_dataset_export_fails_closed_for_incomplete_active_data(tmp_path: Path) -> None:
@@ -194,6 +222,48 @@ def test_active_dataset_object_manifest_excludes_old_dataset_charts(tmp_path: Pa
         chart_key("published", "instrument-1"),
         history_key("mutual_fund", "instrument-1", 2026),
     ]
+
+
+def test_remote_publication_preflight_rejects_a_weekday_month_over_budget() -> None:
+    from market_pipeline.publication.preflight import (
+        RemotePublicationBudgetError,
+        assert_plan_within_free_tier,
+    )
+
+    with pytest.raises(RemotePublicationBudgetError, match="free-tier safety envelope"):
+        assert_plan_within_free_tier({"d1_mutations": 1, "r2_class_a": 30_000, "r2_class_b": 1, "weekday_runs_per_month": 22})
+
+
+def test_active_dataset_export_rejects_a_remote_d1_statement_over_90kb(tmp_path: Path) -> None:
+    from market_pipeline.publication.d1_export import DatasetExportError, export_active_dataset
+
+    connection = sqlite3.connect(":memory:")
+    publisher = D1Publisher(connection)
+    publisher.initialize_schema()
+    candidate = _complete_candidate("oversized")
+    candidate["tables"]["instruments"][0]["name"] = "x" * 90_000
+    publish(candidate, publisher)
+
+    with pytest.raises(DatasetExportError, match="statement exceeds"):
+        export_active_dataset(connection, tmp_path / "active-dataset.sql")
+
+
+def test_remote_compact_projection_replaces_the_prior_dataset_snapshot(tmp_path: Path) -> None:
+    from market_pipeline.publication.d1_export import export_active_dataset
+
+    remote = sqlite3.connect(":memory:")
+    remote_publisher = D1Publisher(remote)
+    remote_publisher.initialize_schema()
+    for dataset_id in ("first", "second"):
+        local = sqlite3.connect(":memory:")
+        local_publisher = D1Publisher(local)
+        local_publisher.initialize_schema()
+        publish(_complete_candidate(dataset_id), local_publisher)
+        sql_path = tmp_path / f"{dataset_id}.sql"
+        export_active_dataset(local, sql_path)
+        remote.executescript(sql_path.read_text(encoding="utf-8"))
+
+    assert remote.execute("SELECT dataset_id FROM instrument_snapshots").fetchall() == [("second",)]
 
 
 def _complete_candidate(dataset_id: str) -> dict[str, Any]:

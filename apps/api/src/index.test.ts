@@ -327,7 +327,7 @@ describe("private research API", () => {
       bind(...values: unknown[]): D1Statement { this.values = values; return this; }
       async first<T extends Record<string, unknown> = Record<string, unknown>>(): Promise<T | null> { return null; }
       async all<T extends Record<string, unknown> = Record<string, unknown>>(): Promise<{ results: readonly T[] }> {
-        if (this.sql.includes("FROM instruments AS i")) return { results: (state.present ? [{ instrument_id: "one", score: 10 }] : []) as unknown as readonly T[] };
+        if (this.sql.includes("FROM instrument_snapshots AS i")) return { results: (state.present ? [{ instrument_id: "one", score: 10 }] : []) as unknown as readonly T[] };
         if (this.sql.includes("FROM screen_runs")) return { results: [...state.runs].sort((left, right) => right.effectiveDate.localeCompare(left.effectiveDate) || right.runId.localeCompare(left.runId)).map((run) => ({ run_id: run.runId, screen_id: run.screenId, dataset_id: run.datasetId, effective_date: run.effectiveDate, result_count: run.resultCount, status: run.status })) as unknown as readonly T[] };
         if (this.sql.includes("FROM screen_matches")) return { results: state.matches.filter((match) => match.runId === String(this.values[1])).map((match) => ({ instrument_id: match.instrumentId, ordinal: match.ordinal, score: match.score, explanation_json: match.explanation, entered: match.entered, exited: match.exited })) as unknown as readonly T[] };
         return { results: [] };

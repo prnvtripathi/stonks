@@ -8,8 +8,8 @@ export interface CompiledQuery {
 }
 
 export interface CompileOptions {
-  /** `wide` is a checked projection; `eav` targets Task 7's latest_metrics table. */
-  readonly relation?: "wide" | "eav";
+  /** `wide` is a checked projection; `eav` targets local latest_metrics; `snapshot` targets the compact remote JSON projection. */
+  readonly relation?: "wide" | "eav" | "snapshot";
   /** Required by D1/EAV execution; omitted values bind NULL and match no rows. */
   readonly datasetId?: string;
   /** EAV callers may apply the dataset predicate in their base relation. */
@@ -24,6 +24,7 @@ export function compileQuery(ast: Expression, catalog: MetricCatalog, options: C
   const params: (number | string | null)[] = [];
   const references: string[] = [];
   const eav = options.relation === "eav";
+  const snapshot = options.relation === "snapshot";
   if (eav && options.includeDatasetFilter !== false) params.push(options.datasetId ?? null);
   const metric = (id: string): string => {
     const definition = catalog.find((item) => item.id === id);
@@ -33,6 +34,7 @@ export function compileQuery(ast: Expression, catalog: MetricCatalog, options: C
       params.push(id);
       return `(SELECT CASE WHEN m.state = 'present' THEN m.value END FROM latest_metrics AS m WHERE m.dataset_id = i.dataset_id AND m.instrument_id = i.instrument_id AND m.metric = ?)`;
     }
+    if (snapshot) return `json_extract(s.metric_values_json, '$.${id}')`;
     return `"${definition.column}"`;
   };
   const expression = (node: Expression): string => {

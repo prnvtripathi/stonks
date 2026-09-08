@@ -44,6 +44,14 @@ describe("safe screener language", () => {
     expect(compiled.referencedMetricIds).toEqual(["return_1d", "volume", "volume_1w_avg"]);
   });
 
+  it("compiles checked metrics for the compact remote snapshot", () => {
+    const checked = typecheckQuery(parseQuery("Return over 1day > 3%").value!, DEFAULT_METRIC_CATALOG, ["equity"]);
+    expect(checked.valid).toBe(true);
+    const compiled = compileQuery(checked.ast, DEFAULT_METRIC_CATALOG, { relation: "snapshot", includeDatasetFilter: false });
+    expect(compiled.whereSql).toContain("json_extract(s.metric_values_json, '$.return_1d')");
+    expect(compiled.params).toEqual([0.03]);
+  });
+
   it("enforces percentage-point units while allowing dimensionless thresholds", () => {
     const invalid = typecheckQuery(parseQuery("Volume > 10%").value!, DEFAULT_METRIC_CATALOG, ["equity"]);
     expect(invalid.valid).toBe(false);

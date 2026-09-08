@@ -33,6 +33,22 @@ _DATASET_TABLES = (
     "corporate_actions",
 )
 
+# Cloudflare's daily D1 write billing includes indexed-row updates. Keep the
+# import at a single serving row per instrument rather than one EAV row per
+# metric; the multipliers below count the primary and secondary index writes.
+_REMOTE_TABLES = ("sources", "source_runs")
+_WRITE_AMPLIFICATION = {"datasets": 2, "sources": 2, "source_runs": 2, "instrument_snapshots": 3}
+_WEEKDAY_RUNS_PER_MONTH = 22
+_MAX_D1_MUTATIONS_PER_RUN = 50_000
+_MAX_R2_CLASS_A_PER_MONTH = 500_000
+_MAX_R2_CLASS_B_PER_MONTH = 5_000_000
+# D1's remote executor caps a single SQL statement at 100,000 bytes. Keep a
+# margin for transport/implementation differences and reject before any R2
+# upload can begin. A 100 MB import cap is also deliberately well below the
+# 500 MB free database allowance; operators still monitor remote storage.
+_MAX_D1_STATEMENT_BYTES = 90_000
+_MAX_D1_IMPORT_BYTES = 100_000_000
+
 
 def _literal(value: Any) -> str:
     """Return a SQLite literal for values read from our local SQLite database."""
@@ -124,12 +140,102 @@ def _insert(table: str, columns: Sequence[str], values: Sequence[Any]) -> str:
     return f"INSERT OR IGNORE INTO {table} ({names}) VALUES ({encoded});"
 
 
+def _replace(table: str, columns: Sequence[str], values: Sequence[Any]) -> str:
+    names = ", ".join(columns)
+    encoded = ", ".join(_literal(value) for value in values)
+    return f"INSERT OR REPLACE INTO {table} ({names}) VALUES ({encoded});"
+
+
+def _assert_sql_size(statements: Sequence[str]) -> None:
+    total = 0
+    for statement in statements:
+        size = len(statement.encode("utf-8"))
+        if size > _MAX_D1_STATEMENT_BYTES:
+            raise DatasetExportError(
+                f"remote D1 statement exceeds {_MAX_D1_STATEMENT_BYTES} UTF-8 bytes"
+            )
+        total += size + 1
+    if total > _MAX_D1_IMPORT_BYTES:
+        raise DatasetExportError(f"remote D1 import exceeds {_MAX_D1_IMPORT_BYTES} UTF-8 bytes")
+
+
 def _rows(connection: sqlite3.Connection, table: str, dataset_id: str) -> Iterable[tuple[Any, ...]]:
     columns = _columns(connection, table)
     order = ", ".join(columns)
     yield from connection.execute(
         f"SELECT {order} FROM {table} WHERE dataset_id = ? ORDER BY {order}", (dataset_id,)
     )
+
+
+def _json_value(value: Any) -> Any:
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    return value
+
+
+def _snapshot_rows(connection: sqlite3.Connection, dataset_id: str) -> list[tuple[Any, ...]]:
+    """Collapse local EAV/supporting rows into the remote serving projection."""
+
+    groups: dict[str, dict[str, Any]] = {}
+    for row in connection.execute(
+        "SELECT instrument_id,symbol,name,asset_class,active,metadata_json FROM instruments "
+        "WHERE dataset_id=? ORDER BY instrument_id",
+        (dataset_id,),
+    ):
+        instrument_id = str(row[0])
+        groups[instrument_id] = {
+            "base": (instrument_id, dataset_id, row[1], row[2], row[3], row[4], row[5]),
+            "values": {}, "metrics": [], "aliases": [], "periods": [], "actions": [],
+        }
+    for row in connection.execute(
+        "SELECT instrument_id,metric,value,state,effective_date,raw_value,normalized_value,formula_version,"
+        "source_artifact_id,metadata_json FROM latest_metrics WHERE dataset_id=? ORDER BY instrument_id,metric",
+        (dataset_id,),
+    ):
+        group = groups.get(str(row[0]))
+        if group is None:
+            raise DatasetExportError("metric references an unknown active instrument")
+        metric = str(row[1])
+        group["values"][metric] = row[2] if row[3] == "present" else None
+        group["metrics"].append({"metric": metric, "value": row[2], "state": row[3], "effectiveDate": row[4], "rawValue": row[5], "normalizedValue": row[6], "formulaVersion": row[7], "sourceArtifactId": row[8], "metadata": _json_value(row[9])})
+    for table, columns, destination in (
+        ("instrument_aliases", "instrument_id,provider,alias,valid_from,valid_to", "aliases"),
+        ("fundamental_periods", "instrument_id,period_id,period_end,period_type,filing_id,filed_at,metrics_json,source_artifact_id,restates_id,supersedes_id", "periods"),
+        ("corporate_actions", "instrument_id,action_id,action_date,action_type,numerator,denominator,metadata_json,source_artifact_id", "actions"),
+    ):
+        for row in connection.execute(f"SELECT {columns} FROM {table} WHERE dataset_id=? ORDER BY instrument_id", (dataset_id,)):
+            group = groups.get(str(row[0]))
+            if group is None:
+                raise DatasetExportError(f"{table} references an unknown active instrument")
+            if destination == "aliases":
+                group[destination].append({"provider": row[1], "alias": row[2], "validFrom": row[3], "validTo": row[4]})
+            elif destination == "periods":
+                group[destination].append({"periodId": row[1], "periodEnd": row[2], "periodType": row[3], "filingId": row[4], "filedAt": row[5], "metrics": _json_value(row[6]), "sourceArtifactId": row[7], "restatesId": row[8], "supersedesId": row[9]})
+            else:
+                group[destination].append({"actionId": row[1], "actionDate": row[2], "actionType": row[3], "numerator": row[4], "denominator": row[5], "metadata": _json_value(row[6]), "sourceArtifactId": row[7]})
+    return [
+        (*group["base"], json.dumps(group["values"], sort_keys=True, separators=(",", ":")), json.dumps(group["metrics"], sort_keys=True, separators=(",", ":")), json.dumps(group["aliases"], sort_keys=True, separators=(",", ":")), json.dumps(group["periods"], sort_keys=True, separators=(",", ":")), json.dumps(group["actions"], sort_keys=True, separators=(",", ":")))
+        for _, group in sorted(groups.items())
+    ]
+
+
+def _publication_plan(snapshot_count: int, source_count: int, source_run_count: int, history_keys: Sequence[str]) -> dict[str, int]:
+    history_count = sum(key.startswith("history/") for key in history_keys)
+    chart_count = len(history_keys) - history_count
+    # Current-year history grows on every session, so every manifest object is
+    # PUT and then read back once for byte verification.
+    return {
+        "d1_mutations": 5 + _WRITE_AMPLIFICATION["datasets"] + source_count * _WRITE_AMPLIFICATION["sources"] + source_run_count * _WRITE_AMPLIFICATION["source_runs"] + snapshot_count * _WRITE_AMPLIFICATION["instrument_snapshots"] * 2,
+        "r2_class_a": history_count + chart_count,
+        "r2_class_b": history_count + chart_count,
+        "weekday_runs_per_month": _WEEKDAY_RUNS_PER_MONTH,
+        "max_d1_mutations_per_run": _MAX_D1_MUTATIONS_PER_RUN,
+        "max_r2_class_a_per_month": _MAX_R2_CLASS_A_PER_MONTH,
+        "max_r2_class_b_per_month": _MAX_R2_CLASS_B_PER_MONTH,
+    }
 
 
 def _manifest_keys(connection: sqlite3.Connection, dataset_id: str, history_root: Path) -> list[str]:
@@ -180,6 +286,7 @@ def export_active_dataset(
     *,
     history_root: str | Path | None = None,
     object_manifest: str | Path | None = None,
+    publication_plan: str | Path | None = None,
 ) -> str:
     """Write the complete active snapshot and return its dataset ID.
 
@@ -200,6 +307,11 @@ def export_active_dataset(
     if pointer is None:
         raise DatasetExportError("active_dataset pointer is missing")
 
+    snapshots = _snapshot_rows(connection, dataset_id)
+    snapshot_columns = (
+        "instrument_id", "dataset_id", "symbol", "name", "asset_class", "active", "metadata_json",
+        "metric_values_json", "metric_rows_json", "aliases_json", "fundamental_periods_json", "corporate_actions_json",
+    )
     statements = [
         "-- Generated from a locally reconciled active dataset. Do not add transaction wrappers.",
         _insert(
@@ -208,10 +320,12 @@ def export_active_dataset(
             (dataset[0], "staging", dataset[2], None, dataset[4], dataset[5]),
         ),
     ]
-    for table in _DATASET_TABLES:
+    for table in _REMOTE_TABLES:
         columns = _columns(connection, table)
         statements.extend(_insert(table, columns, row) for row in _rows(connection, table, dataset_id))
+    statements.extend(_replace("instrument_snapshots", snapshot_columns, row) for row in snapshots)
     statements.extend((
+        f"DELETE FROM instrument_snapshots WHERE dataset_id <> {_literal(dataset_id)};",
         f"UPDATE datasets SET status = 'superseded' WHERE status = 'active' AND dataset_id <> {_literal(dataset_id)};",
         f"UPDATE datasets SET status = 'active', promoted_at = {_literal(dataset[3])} WHERE dataset_id = {_literal(dataset_id)};",
         "INSERT INTO active_dataset (singleton, dataset_id, changed_at) VALUES "
@@ -220,9 +334,15 @@ def export_active_dataset(
         "dataset_id = excluded.dataset_id, changed_at = excluded.changed_at;",
         "",
     ))
+    _assert_sql_size(statements)
     Path(output).write_text("\n".join(statements), encoding="utf-8")
     if manifest is not None and object_manifest is not None:
         Path(object_manifest).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    if publication_plan is not None:
+        source_count = sum(1 for _ in _rows(connection, "sources", dataset_id))
+        source_run_count = sum(1 for _ in _rows(connection, "source_runs", dataset_id))
+        plan = _publication_plan(len(snapshots), source_count, source_run_count, manifest or ())
+        Path(publication_plan).write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return dataset_id
 
 
@@ -232,6 +352,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--output", required=True, help="generated SQL path")
     parser.add_argument("--history-root", help="local root containing history/ and charts/ objects")
     parser.add_argument("--object-manifest", help="write the active dataset's verified R2 object keys here")
+    parser.add_argument("--publication-plan", help="write the local-only remote-operation budget plan here")
     args = parser.parse_args(argv)
     connection = sqlite3.connect(args.db)
     try:
@@ -240,6 +361,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.output,
             history_root=args.history_root,
             object_manifest=args.object_manifest,
+            publication_plan=args.publication_plan,
         )
     except DatasetExportError as exc:
         parser.error(str(exc))
