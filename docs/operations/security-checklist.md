@@ -124,6 +124,27 @@ these headers are present).
 
 ## 7. Cloudflare API token scope (documented, not created)
 
+### Daily production-data publication token
+
+`daily-data.yml` uses a separate token stored only as
+`daily-data-refresh`'s `CLOUDFLARE_API_TOKEN` secret. It is not a deploy
+token. Create it only after the owner has created the production D1 database
+named `stonks-research` and private R2 bucket named
+`stonks-private-history`, then scope it to exactly:
+
+| Permission | Resource |
+| --- | --- |
+| `Account.D1:Edit` | `stonks-research` only |
+| `Account.R2:Edit` | `stonks-private-history` only |
+| `Account:Read` | the owning account, solely for Wrangler account resolution |
+
+The matching `CLOUDFLARE_ACCOUNT_ID` belongs in that same GitHub Environment
+as a variable. Do not grant this token Worker Scripts, Workers Routes, Zone,
+Access, KV, or any preview/other D1/R2 resource permission. The workflow
+never prints either credential. No live Cloudflare call was made while this
+bridge was implemented; the owner supplying this configuration is what enables
+the first remote R2 upload and D1 import.
+
 Two tokens, one per environment, each scoped to only that environment's own
 resources (Cloudflare API Tokens support per-resource scoping, not just
 per-account):

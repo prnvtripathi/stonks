@@ -1,4 +1,0 @@
-hypothesis<7,>=6.138
-pydantic<3,>=2.11
-polars<2,>=1.32
-pyarrow<21,>=20

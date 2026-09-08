@@ -1,2 +1,0 @@
-[console_scripts]
-market-pipeline = market_pipeline.cli:main

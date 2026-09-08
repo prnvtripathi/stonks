@@ -7,7 +7,14 @@ from typing import Any
 
 import pytest
 from market_pipeline.analytics.momentum import NormalizedMomentumInput, momentum_score
+from market_pipeline.jobs.publish import DatasetBuild, publish_checkpointed_dataset
 from market_pipeline.storage.d1_publisher import D1Publisher, ReconciliationError, publish
+from market_pipeline.storage.history_store import (
+    HistoryStore,
+    HistoryStoreError,
+    chart_key,
+    history_key,
+)
 
 
 def test_corporate_actions_forward_migration_upgrades_existing_and_fresh_databases() -> None:
@@ -64,6 +71,129 @@ def test_bad_candidate_does_not_replace_active() -> None:
         publish({"dataset_id": "bad", "valid": False}, publisher)
 
     assert publisher.active_dataset_id() == "good"
+
+
+def test_history_failure_leaves_previous_dataset_active(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A new active pointer must never refer to history that failed to persist."""
+
+    connection = sqlite3.connect(":memory:")
+    publisher = D1Publisher(connection)
+    publisher.initialize_schema()
+    publisher.seed_active("known-good")
+    candidate = _complete_candidate("candidate")
+    build = DatasetBuild(
+        candidate=candidate,
+        momentum={},
+        source_artifact_ids={},
+        histories={"instrument-1": ("mutual_fund", ())},
+        warnings=(),
+    )
+    monkeypatch.setattr("market_pipeline.jobs.publish.build_candidate", lambda *args, **kwargs: build)
+
+    class FailingHistoryStore:
+        def write_history(self, *args: Any, **kwargs: Any) -> list[str]:
+            raise HistoryStoreError("R2 write failed")
+
+        def write_chart(self, *args: Any, **kwargs: Any) -> str:
+            raise AssertionError("chart writing must not follow a failed history write")
+
+    result = publish_checkpointed_dataset(
+        connection,
+        publisher,
+        raw_store=object(),
+        source_ids=["amfi-nav"],
+        effective_date=__import__("datetime").date(2026, 9, 1),
+        safe_to_promote=True,
+        history_store=FailingHistoryStore(),  # type: ignore[arg-type]
+    )
+
+    assert result.promoted is False
+    assert "history" in (result.reason or "")
+    assert publisher.active_dataset_id() == "known-good"
+
+
+def test_active_dataset_export_imports_complete_snapshot_and_preserves_global_screens(
+    tmp_path: Path,
+) -> None:
+    """The remote import is repeatable and switches the active pointer last."""
+
+    from market_pipeline.publication.d1_export import export_active_dataset
+
+    local = sqlite3.connect(":memory:")
+    local_publisher = D1Publisher(local)
+    local_publisher.initialize_schema()
+    candidate = _complete_candidate("published")
+    candidate["tables"]["instruments"][0]["name"] = "O'Connor Fund"
+    publish(candidate, local_publisher)
+    sql_path = tmp_path / "active-dataset.sql"
+    assert export_active_dataset(local, sql_path) == "published"
+    sql = sql_path.read_text(encoding="utf-8")
+
+    assert "BEGIN" not in sql
+    assert "COMMIT" not in sql
+    assert "INSERT OR IGNORE INTO datasets" in sql
+    assert "INSERT INTO active_dataset" in sql
+    assert "O''Connor Fund" in sql
+    assert "saved_screens" not in sql
+    assert "screen_runs" not in sql
+    assert "screen_matches" not in sql
+
+    remote = sqlite3.connect(":memory:")
+    remote_publisher = D1Publisher(remote)
+    remote_publisher.initialize_schema()
+    remote_publisher.seed_active("remote-old")
+    remote.execute(
+        "INSERT INTO saved_screens(screen_id,name,expression,created_at,updated_at) VALUES(?,?,?,?,?)",
+        ("screen-1", "Keep me", "return_1d > 0", "2026-09-01", "2026-09-01"),
+    )
+    remote.commit()
+
+    remote.executescript(sql)
+    remote.executescript(sql)
+
+    assert remote_publisher.active_dataset_id() == "published"
+    assert remote.execute("SELECT status FROM datasets WHERE dataset_id='published'").fetchone() == ("active",)
+    assert remote.execute("SELECT name FROM saved_screens WHERE screen_id='screen-1'").fetchone() == ("Keep me",)
+    assert remote.execute("SELECT name FROM instruments WHERE dataset_id='published'").fetchone() == ("O'Connor Fund",)
+
+
+def test_active_dataset_export_fails_closed_for_incomplete_active_data(tmp_path: Path) -> None:
+    from market_pipeline.publication.d1_export import DatasetExportError, export_active_dataset
+
+    connection = sqlite3.connect(":memory:")
+    publisher = D1Publisher(connection)
+    publisher.initialize_schema()
+    publisher.seed_active("incomplete")
+
+    with pytest.raises(DatasetExportError, match="effective date"):
+        export_active_dataset(connection, tmp_path / "must-not-exist.sql")
+
+
+def test_active_dataset_object_manifest_excludes_old_dataset_charts(tmp_path: Path) -> None:
+    from market_pipeline.publication.d1_export import export_active_dataset
+
+    connection = sqlite3.connect(":memory:")
+    publisher = D1Publisher(connection)
+    publisher.initialize_schema()
+    publish(_complete_candidate("published"), publisher)
+    history_root = tmp_path / "history"
+    store = HistoryStore(history_root)
+    store.write_history("mutual_fund", "instrument-1", [{"effective_date": "2026-09-01", "value": "1"}])
+    store.write_chart("published", "instrument-1", {"points": []})
+    store.write_chart("old-dataset", "instrument-1", {"points": []})
+    manifest_path = tmp_path / "active-history-objects.json"
+
+    export_active_dataset(
+        connection,
+        tmp_path / "active-dataset.sql",
+        history_root=history_root,
+        object_manifest=manifest_path,
+    )
+
+    assert json.loads(manifest_path.read_text(encoding="utf-8")) == [
+        chart_key("published", "instrument-1"),
+        history_key("mutual_fund", "instrument-1", 2026),
+    ]
 
 
 def _complete_candidate(dataset_id: str) -> dict[str, Any]:

@@ -68,7 +68,7 @@ describe("safe screener language", () => {
     // A negated literal is the same mistake and gets the same suggestion.
     const negated = typecheckQuery(parseQuery("Maximum Drawdown 1year < -20").value!, DEFAULT_METRIC_CATALOG, ["equity"]);
     expect(negated.valid).toBe(false);
-    expect(negated.diagnostics.find((diagnostic) => diagnostic.code === "UNIT_MISMATCH")?.suggestions).toContain("20%");
+    expect(negated.diagnostics.find((diagnostic) => diagnostic.code === "UNIT_MISMATCH")?.suggestions).toContain("-20%");
 
     // Dimensionless metrics keep accepting bare thresholds.
     expect(typecheckQuery(parseQuery("Volume > 500000").value!, DEFAULT_METRIC_CATALOG, ["equity"]).valid).toBe(true);

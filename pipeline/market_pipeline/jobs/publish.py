@@ -468,14 +468,26 @@ def publish_checkpointed_dataset(
             reason="dataset for these artifacts has already been published",
             warnings=tuple(warnings),
         )
-    try:
-        publish(candidate, publisher, momentum_scores=scores, source_artifact_ids=artifact_ids)
-    except ReconciliationError as exc:
-        return PublicationResult(promoted=False, dataset_id=dataset_id, reason=f"publication rejected: {exc}", warnings=tuple(warnings))
     history_objects = 0
     if history_store is not None:
         history_objects, history_warnings = _write_history(history_store, dataset_id, build)
         warnings.extend(history_warnings)
+        if history_warnings:
+            # History/chart objects are what the Worker serves alongside the
+            # active D1 rows. They must exist before the pointer can move;
+            # otherwise readers could observe an active dataset with missing
+            # charts. Immutable objects written before this failure are safe
+            # orphans and make a retry deterministic.
+            return PublicationResult(
+                promoted=False,
+                dataset_id=dataset_id,
+                reason="history publication failed; active dataset was left untouched",
+                warnings=tuple(warnings),
+            )
+    try:
+        publish(candidate, publisher, momentum_scores=scores, source_artifact_ids=artifact_ids)
+    except ReconciliationError as exc:
+        return PublicationResult(promoted=False, dataset_id=dataset_id, reason=f"publication rejected: {exc}", warnings=tuple(warnings))
     tables = candidate["tables"]
     return PublicationResult(
         promoted=True,

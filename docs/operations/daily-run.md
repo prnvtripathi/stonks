@@ -100,8 +100,24 @@ manifest, gated by the reconciliation and storage-budget checks in
    and as the job's step summary.
 9. If the CLI's exit code is non-zero, the workflow step "Stop before
    promotion on blocking failure" fails the job with that same exit code.
-   **No promotion step runs after this point** -- see the note below on the
-   current scope of promotion.
+   **No remote publication step runs after this point.**
+10. On a successful local publication only, export the complete locally active
+    dataset to `active-dataset.sql`; this contains only dataset-scoped market
+    tables and ends with the active-pointer change. It never exports the
+    global `saved_screens`, `screen_runs`, or `screen_matches` tables.
+11. Export a deterministic active-object manifest: the current dataset's
+    chart objects plus every yearly history object for its active instruments.
+    Upload and byte-verify only those entries with explicit `wrangler r2
+    object ... --remote` commands before D1 import. The workflow rejects a
+    missing, malformed, or root-escaping manifest path; cached charts for old
+    datasets are not re-uploaded on every run. A history or chart
+    upload/verification failure stops the job before D1 can change.
+12. Import `active-dataset.sql` with `wrangler d1 execute --remote --file`,
+    then query production D1 and require its `active_dataset` to equal the
+    local dataset ID. The SQL importer deliberately has no `BEGIN`/`COMMIT`
+    wrapper: a failed Cloudflare D1 file import restores the database to its
+    original state, and the generated SQL performs the status/pointer switch
+    as its final statements.
 
 ## Coverage baseline persistence
 
@@ -149,14 +165,36 @@ be treated as the new known-good dataset. Concretely:
   a retry does not need to re-fetch anything that already succeeded -- see
   `docs/operations/recovery.md` for the retry command.
 
-Note on scope: `market-pipeline daily`/`backfill` now perform publication
-themselves. `safe_to_promote` is the interlock: `D1Publisher.stage` is not
-reached at all unless the gate passes, so a blocked candidate never becomes a
-staged dataset, let alone the active one. The workflow's caches therefore
-carry three things between runs -- `market.db` (checkpoints and the coverage
-baseline), `raw/` (immutable artifact bodies, re-read to rebuild the
-three-year series a twelve-month return needs), and `history/` (published
-Parquet history and chart objects).
+Note on scope: `market-pipeline daily`/`backfill` now perform the local
+publication first. `safe_to_promote` is the interlock: immutable history/chart
+objects must finish before `D1Publisher.stage` is reached, so a history
+failure, blocked candidate, or failed local publication leaves the previous
+local active dataset untouched. The workflow's caches therefore carry three
+things between runs -- `market.db` (checkpoints and the coverage baseline),
+`raw/` (immutable artifact bodies, re-read to rebuild the three-year series a
+twelve-month return needs), and `history/` (published Parquet history and
+chart objects).
+
+## Production Cloudflare publication: one-time operator setup
+
+This implementation made **no real Cloudflare API call, deployment, D1
+import, or R2 upload**. Remote publication begins only after the owner creates
+the following production resources and supplies environment-scoped account
+configuration:
+
+| Item | Exact value / minimum scope |
+| --- | --- |
+| D1 database | Create `stonks-research`; replace the production `database_id` placeholder in `apps/api/wrangler.jsonc` with its real ID before running the workflow. |
+| R2 bucket | Create the private bucket `stonks-private-history`; keep public access disabled. It is the production `CHARTS` binding. |
+| GitHub Environment | Use `daily-data-refresh`, with `CLOUDFLARE_API_TOKEN` as a secret and `CLOUDFLARE_ACCOUNT_ID` as an environment variable. Do not put either in a manifest, repository variable, or workflow output. |
+| API token | Scope it to this account and only `stonks-research` / `stonks-private-history`: `Account.D1:Edit` on that D1 database, `Account.R2:Edit` on that R2 bucket, and `Account:Read` for Wrangler account resolution. It needs no Worker Scripts, Zone, Access, KV, or unrelated database/bucket permission. |
+
+The workflow always passes `--env production`, uploads through the literal
+`stonks-private-history` bucket path, and imports into the literal
+`stonks-research` D1 name. Preview resources (`stonks-research-preview` and
+`stonks-private-history-preview`) are not in this data-publication path.
+This job still has no automated NSE collection: it can publish only artifacts
+the governed local pipeline admitted from an operator-supplied manifest.
 
 ## Concurrency lock
 

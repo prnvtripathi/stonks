@@ -32,7 +32,10 @@ const combineQuotient = (left: ValueUnit, right: ValueUnit): ValueUnit | null =>
  */
 const bareNumberLiteral = (node: Expression): number | null => {
   if (node.kind === "number") return node.percent ? null : node.value;
-  if (node.kind === "unary" && node.operator === "-") return bareNumberLiteral(node.operand);
+  if (node.kind === "unary" && node.operator === "-") {
+    const value = bareNumberLiteral(node.operand);
+    return value === null ? null : -value;
+  }
   return null;
 };
 
@@ -107,7 +110,7 @@ export function typecheckQuery(ast: QueryAst, catalog: MetricCatalog, classes: r
         const percentSide = left.unit === "percent" ? right : right.unit === "percent" ? left : null;
         const literalNode = left.unit === "percent" ? node.right : node.left;
         const literal = percentSide?.kind === "number" && percentSide.unit === "scalar" ? bareNumberLiteral(literalNode) : null;
-        if (literal !== null) diagnostics.push({ code: "UNIT_MISMATCH", message: `Percent values are fractions, so ${literal} means ${literal * 100}%. Add a % suffix to compare against a percentage.`, span: literalNode.span, suggestions: [`${Math.abs(literal)}%`] });
+        if (literal !== null) diagnostics.push({ code: "UNIT_MISMATCH", message: `Percent values are fractions, so ${literal} means ${literal * 100}%. Add a % suffix to compare against a percentage.`, span: literalNode.span, suggestions: [`${literal}%`] });
       }
       return left.kind === "invalid" || right.kind === "invalid" ? { kind: "invalid" } : { kind: "boolean" };
     }
