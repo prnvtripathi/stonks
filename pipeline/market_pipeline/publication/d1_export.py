@@ -14,7 +14,7 @@ import json
 import math
 import sqlite3
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from market_pipeline.storage.history_store import HistoryStoreError, chart_key, history_key
 
@@ -40,7 +40,7 @@ _REMOTE_TABLES = ("sources", "source_runs")
 _WRITE_AMPLIFICATION = {"datasets": 2, "sources": 2, "source_runs": 3, "instrument_snapshots": 3}
 _WEEKDAY_RUNS_PER_MONTH = 22
 _MAX_D1_MUTATIONS_PER_RUN = 50_000
-_MAX_R2_CLASS_A_PER_MONTH = 500_000
+_MAX_R2_CLASS_A_PER_MONTH = 800_000
 _MAX_R2_CLASS_B_PER_MONTH = 5_000_000
 # D1's remote executor caps a single SQL statement at 100,000 bytes. Keep a
 # margin for transport/implementation differences and reject before any R2
@@ -228,29 +228,33 @@ def _snapshot_rows(connection: sqlite3.Connection, dataset_id: str) -> list[tupl
 
 
 def _publication_plan(
-    snapshot_count: int,
-    stale_snapshot_count: int,
+    snapshot_ids: Sequence[str],
     source_count: int,
     source_run_count: int,
-    history_keys: Sequence[str],
+    manifest: Mapping[str, Sequence[str]],
     *,
     d1_import_bytes: int,
     snapshot_bytes: int,
-) -> dict[str, int]:
-    history_count = sum(key.startswith("history/") for key in history_keys)
-    chart_count = len(history_keys) - history_count
-    # Current-year history grows on every session, so every manifest object is
-    # PUT and then read back once for byte verification.
+) -> dict[str, Any]:
+    mutable = list(manifest["mutable"])
+    immutable = list(manifest["immutable"])
+    immutable_by_instrument: dict[str, int] = {}
+    for key in immutable:
+        parts = key.split("/")
+        if len(parts) != 4 or parts[0] != "history":
+            raise DatasetExportError("immutable manifest key is invalid")
+        immutable_by_instrument[parts[2]] = immutable_by_instrument.get(parts[2], 0) + 1
     return {
         # Six control writes cover two indexed dataset-status updates and the
         # indexed active pointer. An UPSERT changes each current snapshot once;
         # only IDs absent from the candidate are deleted as stale rows.
-        "d1_mutations": 6 + _WRITE_AMPLIFICATION["datasets"] + source_count * _WRITE_AMPLIFICATION["sources"] + source_run_count * _WRITE_AMPLIFICATION["source_runs"] + snapshot_count * _WRITE_AMPLIFICATION["instrument_snapshots"] + stale_snapshot_count * _WRITE_AMPLIFICATION["instrument_snapshots"],
+        "d1_mutations": 6 + _WRITE_AMPLIFICATION["datasets"] + source_count * _WRITE_AMPLIFICATION["sources"] + source_run_count * _WRITE_AMPLIFICATION["source_runs"] + len(snapshot_ids) * _WRITE_AMPLIFICATION["instrument_snapshots"],
         "d1_import_bytes": d1_import_bytes,
         "snapshot_bytes": snapshot_bytes,
-        "stale_snapshot_rows": stale_snapshot_count,
-        "r2_class_a": history_count + chart_count,
-        "r2_class_b": history_count + chart_count,
+        "snapshot_ids": list(snapshot_ids),
+        "r2_mutable_objects": len(mutable),
+        "r2_immutable_objects": len(immutable),
+        "immutable_objects_by_instrument": immutable_by_instrument,
         "weekday_runs_per_month": _WEEKDAY_RUNS_PER_MONTH,
         "max_d1_mutations_per_run": _MAX_D1_MUTATIONS_PER_RUN,
         "max_r2_class_a_per_month": _MAX_R2_CLASS_A_PER_MONTH,
@@ -258,38 +262,14 @@ def _publication_plan(
     }
 
 
-def _stale_snapshot_count(
-    connection: sqlite3.Connection,
-    dataset_id: str,
-    snapshots: Sequence[Sequence[Any]],
-) -> int:
-    """Count exact stale IDs against the last locally promoted universe."""
-
-    previous = connection.execute(
-        "SELECT dataset_id FROM datasets WHERE status = 'superseded' AND dataset_id <> ? "
-        "ORDER BY promoted_at DESC, created_at DESC LIMIT 1",
-        (dataset_id,),
-    ).fetchone()
-    if previous is None:
-        return 0
-    prior_ids = {
-        str(row[0])
-        for row in connection.execute(
-            "SELECT instrument_id FROM instruments WHERE dataset_id = ?",
-            (previous[0],),
-        )
-    }
-    current_ids = {str(row[0]) for row in snapshots}
-    return len(prior_ids - current_ids)
-
-
-def _manifest_keys(connection: sqlite3.Connection, dataset_id: str, history_root: Path) -> list[str]:
+def _manifest_keys(connection: sqlite3.Connection, dataset_id: str, history_root: Path) -> dict[str, list[str]]:
     """Return exactly the active dataset's chart and active instruments' history keys."""
 
     root = history_root.resolve()
     if not root.is_dir():
         raise DatasetExportError("history root is missing")
-    keys: list[str] = []
+    mutable: list[str] = []
+    immutable: list[str] = []
     instruments = connection.execute(
         "SELECT instrument_id, asset_class FROM instruments WHERE dataset_id = ? "
         "ORDER BY asset_class, instrument_id",
@@ -301,7 +281,7 @@ def _manifest_keys(connection: sqlite3.Connection, dataset_id: str, history_root
             chart_path = (root / chart).resolve()
             if not chart_path.is_file() or not chart_path.is_relative_to(root):
                 raise DatasetExportError(f"active dataset chart is missing: {chart}")
-            keys.append(chart)
+            mutable.append(chart)
             history_dir = (root / Path(history_key(str(asset_class), str(instrument_id), 2000)).parent).resolve()
             if not history_dir.is_relative_to(root):
                 raise DatasetExportError(f"history directory escapes configured root: {instrument_id}")
@@ -311,6 +291,7 @@ def _manifest_keys(connection: sqlite3.Connection, dataset_id: str, history_root
                 raise DatasetExportError(f"active instrument history is unreadable: {instrument_id}") from exc
             if not history_files:
                 raise DatasetExportError(f"active instrument has no history: {instrument_id}")
+            newest = max(int(item.stem) for item in history_files)
             for item in history_files:
                 try:
                     key = history_key(str(asset_class), str(instrument_id), int(item.stem))
@@ -319,10 +300,10 @@ def _manifest_keys(connection: sqlite3.Connection, dataset_id: str, history_root
                 expected = (root / key).resolve()
                 if not expected.is_file() or expected != item.resolve() or not expected.is_relative_to(root):
                     raise DatasetExportError(f"history object escapes configured root: {item}")
-                keys.append(key)
+                (mutable if int(item.stem) == newest else immutable).append(key)
     except HistoryStoreError as exc:
         raise DatasetExportError("active dataset contains an unsafe history key") from exc
-    return sorted(keys)
+    return {"mutable": sorted(mutable), "immutable": sorted(immutable)}
 
 
 def export_active_dataset(
@@ -343,7 +324,7 @@ def export_active_dataset(
     _assert_complete(connection, dataset_id, dataset)
     if (history_root is None) != (object_manifest is None):
         raise DatasetExportError("history_root and object_manifest must be supplied together")
-    manifest: list[str] | None = None
+    manifest: dict[str, list[str]] | None = None
     if history_root is not None:
         manifest = _manifest_keys(connection, dataset_id, Path(history_root))
     pointer = connection.execute(
@@ -387,14 +368,12 @@ def export_active_dataset(
     if publication_plan is not None:
         source_count = sum(1 for _ in _rows(connection, "sources", dataset_id))
         source_run_count = sum(1 for _ in _rows(connection, "source_runs", dataset_id))
-        stale_snapshot_count = _stale_snapshot_count(connection, dataset_id, snapshots)
         snapshot_bytes = sum(len(statement.encode("utf-8")) + 1 for statement in snapshot_statements)
         plan = _publication_plan(
-            len(snapshots),
-            stale_snapshot_count,
+            [str(row[0]) for row in snapshots],
             source_count,
             source_run_count,
-            manifest or (),
+            manifest or {"mutable": [], "immutable": []},
             d1_import_bytes=import_bytes,
             snapshot_bytes=snapshot_bytes,
         )

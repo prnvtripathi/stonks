@@ -219,10 +219,10 @@ def test_active_dataset_object_manifest_excludes_old_dataset_charts(tmp_path: Pa
         object_manifest=manifest_path,
     )
 
-    assert json.loads(manifest_path.read_text(encoding="utf-8")) == [
-        chart_key("published", "instrument-1"),
-        history_key("mutual_fund", "instrument-1", 2026),
-    ]
+    assert json.loads(manifest_path.read_text(encoding="utf-8")) == {
+        "immutable": [],
+        "mutable": [chart_key("published", "instrument-1"), history_key("mutual_fund", "instrument-1", 2026)],
+    }
 
 
 def test_remote_publication_preflight_rejects_a_weekday_month_over_budget() -> None:
@@ -235,13 +235,16 @@ def test_remote_publication_preflight_rejects_a_weekday_month_over_budget() -> N
         assert_plan_within_free_tier(
             {
                 "d1_mutations": 1,
-                "r2_class_a": 30_000,
-                "r2_class_b": 1,
+                "r2_mutable_objects": 40_000,
+                "r2_immutable_objects": 0,
                 "weekday_runs_per_month": 22,
                 "d1_import_bytes": 1,
                 "snapshot_bytes": 1,
+                "snapshot_ids": ["instrument-1"],
+                "immutable_objects_by_instrument": {},
             },
             d1_info={"database_size": 1, "rows_written_24h": 1},
+            remote_snapshot_ids=set(), remote_active_dataset_id="old",
         )
 
 
@@ -253,8 +256,10 @@ def test_remote_publication_preflight_rejects_current_remote_storage_and_same_da
 
     plan = {
         "d1_mutations": 10_000,
-        "r2_class_a": 1,
-        "r2_class_b": 1,
+        "r2_mutable_objects": 1,
+        "r2_immutable_objects": 0,
+        "snapshot_ids": ["instrument-1"],
+        "immutable_objects_by_instrument": {},
         "weekday_runs_per_month": 22,
         "d1_import_bytes": 60_000_000,
         "snapshot_bytes": 40_000_000,
@@ -263,11 +268,13 @@ def test_remote_publication_preflight_rejects_current_remote_storage_and_same_da
         assert_plan_within_free_tier(
             plan,
             d1_info={"database_size": 290_000_000, "rows_written_24h": 0},
+            remote_snapshot_ids=set(), remote_active_dataset_id="old",
         )
     with pytest.raises(RemotePublicationBudgetError, match="same-day"):
         assert_plan_within_free_tier(
             plan,
             d1_info={"database_size": 1, "rows_written_24h": 85_000},
+            remote_snapshot_ids=set(), remote_active_dataset_id="old",
         )
 
 
@@ -291,35 +298,58 @@ def test_active_export_plan_counts_snapshot_replacement_stale_delete_and_source_
 
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     assert plan["d1_mutations"] == 16  # dataset/pointer control + source-run index + in-place snapshot update
-    assert plan["stale_snapshot_rows"] == 0
+    assert plan["snapshot_ids"] == ["instrument-1"]
     assert 0 < plan["snapshot_bytes"] <= plan["d1_import_bytes"]
 
 
 def test_stable_large_compact_universe_stays_within_daily_write_budget() -> None:
     from market_pipeline.publication.d1_export import _publication_plan
+    from market_pipeline.publication.preflight import (
+        RemotePublicationBudgetError,
+        assert_plan_within_free_tier,
+    )
 
+    ids = [f"instrument-{index}" for index in range(12_000)]
+    mutable = [f"charts/current/{item}.json.gz" for item in ids] + [f"history/equity/{item}/2026.parquet" for item in ids]
+    immutable = [f"history/equity/{item}/2024.parquet" for item in ids] + [f"history/equity/{item}/2025.parquet" for item in ids]
     stable = _publication_plan(
-        snapshot_count=12_000,
-        stale_snapshot_count=0,
+        snapshot_ids=ids,
         source_count=1,
         source_run_count=1,
-        history_keys=(),
+        manifest={"mutable": mutable, "immutable": immutable},
         d1_import_bytes=1,
         snapshot_bytes=1,
     )
-    stale = _publication_plan(
-        snapshot_count=12_000,
-        stale_snapshot_count=2,
-        source_count=1,
-        source_run_count=1,
-        history_keys=(),
-        d1_import_bytes=1,
-        snapshot_bytes=1,
+    assert stable["r2_mutable_objects"] == 24_000
+    assert stable["r2_immutable_objects"] == 24_000
+    assert stable["d1_mutations"] < 50_000
+    assert_plan_within_free_tier(stable, d1_info={"database_size": 1, "rows_written_24h": 1}, remote_snapshot_ids=set(ids), remote_active_dataset_id="old")
+    assert_plan_within_free_tier(stable, d1_info={"database_size": 1, "rows_written_24h": 1}, remote_snapshot_ids=set(), remote_active_dataset_id=None)
+    with pytest.raises(RemotePublicationBudgetError):
+        assert_plan_within_free_tier({**stable, "r2_mutable_objects": 40_000}, d1_info={"database_size": 1, "rows_written_24h": 1}, remote_snapshot_ids=set(ids), remote_active_dataset_id="old")
+
+
+def test_established_remote_new_instrument_bootstraps_only_its_closed_history() -> None:
+    from market_pipeline.publication.preflight import assert_plan_within_free_tier
+
+    plan = {"d1_mutations": 16, "d1_import_bytes": 1, "snapshot_bytes": 1, "snapshot_ids": ["old", "new"], "immutable_objects_by_instrument": {"new": 2}, "r2_mutable_objects": 4, "r2_immutable_objects": 2, "weekday_runs_per_month": 22}
+    resolved = assert_plan_within_free_tier(plan, d1_info={"database_size": 1, "rows_written_24h": 1}, remote_snapshot_ids={"old"}, remote_active_dataset_id="old-dataset")
+    assert resolved["new_snapshot_ids"] == ["new"]
+    assert resolved["r2_class_a_monthly"] == 4 * 22 + 2
+
+
+def test_remote_publication_state_rejects_duplicate_or_failed_wrangle_output() -> None:
+    from market_pipeline.publication.preflight import (
+        RemotePublicationBudgetError,
+        parse_remote_publication_state,
     )
 
-    assert stable["d1_mutations"] < 50_000
-    assert stale["d1_mutations"] == stable["d1_mutations"] + 6
-    assert stale["stale_snapshot_rows"] == 2
+    with pytest.raises(RemotePublicationBudgetError):
+        parse_remote_publication_state(
+            [{"success": True, "results": [{"kind": "snapshot", "value": "duplicate"}, {"kind": "snapshot", "value": "duplicate"}]}]
+        )
+    with pytest.raises(RemotePublicationBudgetError):
+        parse_remote_publication_state([{"success": False, "results": []}])
 
 
 def test_active_dataset_export_rejects_a_remote_d1_statement_over_90kb(tmp_path: Path) -> None:

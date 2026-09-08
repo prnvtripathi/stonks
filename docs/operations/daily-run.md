@@ -141,13 +141,25 @@ saved screens/runs/matches; because D1 does not reveal the reclaimable bytes of
 the old active snapshot, the projection conservatively adds twice the new SQL
 import (payload plus table/index overhead) and takes no storage credit for the
 bounded snapshot replacement. It also projects 22 weekday runs/month and caps
-R2 Class A at 500,000/month and Class B at 5,000,000/month, each below the
+R2 Class A at 800,000/month and Class B at 5,000,000/month, each below the
 free-tier monthly allowance. The
 remote import uses one `instrument_snapshots` JSON row per instrument rather
 than the local EAV metric rows, so a typical full universe is near one snapshot
 write per instrument instead of roughly a dozen metric writes per instrument.
 The Worker executes saved-screen filters with checked JSON extraction from that
 snapshot and retains saved screens/runs as global D1 tables.
+
+Before preflight, the workflow reads the remote snapshot IDs and active pointer
+with a production D1 read-only query. Preflight strictly validates Wrangler's
+successful JSON response, derives stale deletes from the remote-minus-candidate
+ID set, and rejects malformed, failed, duplicate, or non-string values. The
+object manifest separates mutable charts/newest history partitions from closed
+history: mutable objects always PUT+GET/compare; closed history is GET/compare
+for instruments already present remotely. A true no-active-pointer bootstrap,
+or a newly introduced instrument identified from the remote snapshot-ID set,
+PUTs that instrument's closed history once and then GETs/compares it. Any
+established-object GET failure stops publication; it is never treated as a
+missing object.
 
 The remote serving projection is intentionally bounded: `instrument_snapshots`
 is keyed by `instrument_id`, and each import UPSERTs by that key then removes
@@ -163,9 +175,10 @@ limit; monitor that usage as retained global screen history grows.
 The newest local history partition in the supplied series is deliberately
 mutable: the pipeline atomically replaces its yearly Parquet after rebuilding
 the full series for that run. Earlier years and dataset-scoped charts retain
-immutable put-if-absent behavior. The workflow still PUTs and byte-verifies
-every active manifest object, so the growing newest R2 object is verified before D1's
-active pointer can change.
+immutable put-if-absent behavior. The workflow PUTs and byte-verifies every
+mutable active-manifest object, so the growing newest R2 object is verified
+before D1's active pointer can change. Closed partitions are byte-verified on
+every run and re-uploaded only for bootstrap/new-instrument initialization.
 
 ## Coverage baseline persistence
 

@@ -305,6 +305,12 @@ jobs:
           set -euo pipefail
           pnpm --dir apps/api exec wrangler d1 info stonks-research --env production --json > d1-publication-info.json
 
+      - name: Read production snapshot publication state
+        if: steps.params.outputs.manifest_present == 'true'
+        run: |
+          set -euo pipefail
+          pnpm --dir apps/api exec wrangler d1 execute stonks-research --env production --remote --command "SELECT 'snapshot' AS kind, instrument_id AS value FROM instrument_snapshots UNION ALL SELECT 'active_dataset' AS kind, dataset_id AS value FROM active_dataset WHERE singleton = 1" --json > remote-publication-state.json
+
       - name: Preflight remote publication budget
         if: steps.params.outputs.manifest_present == 'true'
         run: |
@@ -312,11 +318,13 @@ jobs:
           MAX_D1_MUTATIONS_PER_RUN=50000
           MAX_D1_ROWS_WRITTEN_24H=90000
           MAX_D1_DATABASE_BYTES=400000000
-          MAX_R2_CLASS_A_PER_MONTH=500000
+          MAX_R2_CLASS_A_PER_MONTH=800000
           MAX_R2_CLASS_B_PER_MONTH=5000000
           WEEKDAY_RUNS_PER_MONTH=22
           if ! uv run python -m market_pipeline.publication.preflight --plan active-publication-plan.json \
             --d1-info d1-publication-info.json \
+            --remote-publication-state remote-publication-state.json \
+            --resolved-plan resolved-publication-plan.json \
             --max-d1-mutations-per-run "${MAX_D1_MUTATIONS_PER_RUN}" \
             --max-d1-rows-written-24h "${MAX_D1_ROWS_WRITTEN_24H}" \
             --max-d1-database-bytes "${MAX_D1_DATABASE_BYTES}" \
@@ -331,39 +339,54 @@ jobs:
         if: steps.params.outputs.manifest_present == 'true'
         run: |
           set -euo pipefail
-          while IFS= read -r object_key; do
+          while IFS=$'\t' read -r object_mode object_key; do
             history_file="history/${object_key}"
             remote_object="stonks-private-history/${object_key}"
             verified_file="$(mktemp)"
             trap 'rm -f "${verified_file}"' EXIT
-            pnpm --dir apps/api exec wrangler r2 object put "${remote_object}" --file "${history_file}" --remote --env production
+            if [ "${object_mode}" = "mutable" ] || [ "${object_mode}" = "bootstrap" ]; then
+              pnpm --dir apps/api exec wrangler r2 object put "${remote_object}" --file "${history_file}" --remote --env production
+            fi
             pnpm --dir apps/api exec wrangler r2 object get "${remote_object}" --file "${verified_file}" --remote --env production
             cmp --silent "${history_file}" "${verified_file}"
             rm -f "${verified_file}"
             trap - EXIT
-          done < <(python3 - active-history-objects.json <<'PY'
+          done < <(python3 - active-history-objects.json resolved-publication-plan.json <<'PY'
           import json
           import sys
           from pathlib import Path, PurePosixPath
 
           manifest_path = Path(sys.argv[1])
+          resolved_path = Path(sys.argv[2])
           root = Path("history").resolve()
           try:
-              keys = json.loads(manifest_path.read_text(encoding="utf-8"))
+              manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+              resolved = json.loads(resolved_path.read_text(encoding="utf-8"))
           except (OSError, json.JSONDecodeError) as exc:
               raise SystemExit(f"invalid active history manifest: {exc}")
-          if not isinstance(keys, list) or not keys:
+          if not isinstance(manifest, dict) or set(manifest) != {"mutable", "immutable"} or not isinstance(resolved, dict):
               raise SystemExit("active history manifest must contain at least one object")
-          for key in keys:
-              if not isinstance(key, str) or not key or "\x00" in key or "\n" in key or "\r" in key:
-                  raise SystemExit("active history manifest has an invalid object key")
-              relative = PurePosixPath(key)
-              if relative.is_absolute() or ".." in relative.parts or relative.parts[0] not in {"history", "charts"}:
-                  raise SystemExit("active history manifest object escapes the history root")
-              local = (root / relative).resolve()
-              if not local.is_relative_to(root) or not local.is_file():
-                  raise SystemExit(f"active history manifest object is missing: {key}")
-              print(key)
+          bootstrap = resolved.get("remote_active_dataset_id") is None
+          new_ids = resolved.get("new_snapshot_ids")
+          if not isinstance(new_ids, list) or any(not isinstance(item, str) for item in new_ids):
+              raise SystemExit("resolved publication state is invalid")
+          new_ids = set(new_ids)
+          for mode in ("mutable", "immutable"):
+              keys = manifest.get(mode)
+              if not isinstance(keys, list):
+                  raise SystemExit("active history manifest has an invalid object group")
+              for key in keys:
+                  if not isinstance(key, str) or not key or "\x00" in key or "\n" in key or "\r" in key:
+                      raise SystemExit("active history manifest has an invalid object key")
+                  relative = PurePosixPath(key)
+                  if relative.is_absolute() or ".." in relative.parts or relative.parts[0] not in {"history", "charts"}:
+                      raise SystemExit("active history manifest object escapes the history root")
+                  local = (root / relative).resolve()
+                  if not local.is_relative_to(root) or not local.is_file():
+                      raise SystemExit(f"active history manifest object is missing: {key}")
+                  instrument_id = relative.parts[2] if mode == "immutable" else ""
+                  bootstrap_key = mode == "immutable" and (bootstrap or instrument_id in new_ids)
+                  print(("bootstrap" if bootstrap_key else mode) + "\t" + key)
           PY
           )
 
