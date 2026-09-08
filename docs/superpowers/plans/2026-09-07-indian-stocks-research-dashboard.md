@@ -603,6 +603,43 @@ git add .github apps docs/operations
 git commit -m "ops: secure and verify production deployment"
 ```
 
+### Task 15: Cloudflare Publication Bridge and Free-Tier Safety
+
+**Why this task was added:** Final whole-branch review found that the scheduled
+pipeline promoted only its local SQLite database while the deployed Worker
+would read Cloudflare D1. It also found that history/chart objects could be
+published after the active pointer changed. This remediation closes that
+deployment data path without enabling automated NSE collection.
+
+**Files:** Add focused publication/export modules and tests under `pipeline/`;
+modify `.github/workflows/daily-data.yml`, the Worker D1 serving projection,
+and operations documentation as required.
+
+**Interfaces:** Produces a deterministic active-dataset export, an R2 object
+manifest, a conservative free-tier publication plan, and a scheduled sequence
+of `local reconciliation -> R2 upload/verification -> D1 import -> remote
+active-pointer verification`.
+
+- [x] **Step 1: Add the atomic history gate and remote publication bridge**
+
+  Required history/chart writes complete before local D1 promotion. Export the
+  reconciled active dataset without overwriting global saved screens, upload
+  and verify its private R2 objects first, import it into production D1, then
+  verify the remote active dataset ID.
+
+- [ ] **Step 2: Bound publication for Cloudflare's free tier**
+
+  Use a compact remote serving projection, conservatively account for D1 index
+  write amplification and monthly R2 operations, prevent unbounded snapshot
+  retention, reject oversized SQL statements, and fail before any remote
+  mutation when the plan exceeds its safety envelope.
+
+- [ ] **Step 3: Complete independent review and full verification**
+
+  Re-run Python, TypeScript, lint, typecheck, browser E2E, workflow static
+  assertions, `git diff --check`, and Wrangler preview/production dry-runs.
+  Make no real Cloudflare call; stop for owner setup before deployment.
+
 ## Final Verification Gate
 
 - [ ] Map every specification acceptance criterion to an automated test or recorded manual result in `docs/operations/launch-checklist.md`.
