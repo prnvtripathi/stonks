@@ -120,16 +120,13 @@ def _checkpointed_artifacts(
     artifacts: list[_Artifact] = []
     for source_id, effective, artifact_id, checksum, object_key in rows:
         if not object_key:
-            warnings.append(f"{source_id}/{effective}: checkpoint has no object key; artifact was not retained")
-            continue
+            raise PublicationInputError(f"{source_id}/{effective}: checkpoint has no object key; artifact was not retained")
         try:
             body = raw_store.get(str(object_key))
-        except Exception as exc:  # noqa: BLE001 - any store failure is a skipped artifact, never a crash
-            warnings.append(f"{source_id}/{effective}: raw artifact is unreadable ({exc})")
-            continue
+        except Exception as exc:  # noqa: BLE001 - raw-store errors make the candidate unusable
+            raise PublicationInputError(f"{source_id}/{effective}: raw artifact is unreadable ({exc})") from exc
         if sha256(body).hexdigest() != str(checksum).lower():
-            warnings.append(f"{source_id}/{effective}: stored artifact checksum does not match its checkpoint")
-            continue
+            raise PublicationInputError(f"{source_id}/{effective}: stored artifact checksum does not match its checkpoint")
         artifacts.append(_Artifact(str(source_id), date.fromisoformat(str(effective)), str(artifact_id), str(checksum), body))
     return artifacts, warnings
 
@@ -146,8 +143,7 @@ def _normalize_amfi(
         try:
             rows = parse_amfi_nav(artifact.body, expected_date=artifact.effective_date)
         except AmfiNavError as exc:
-            warnings.append(f"amfi-nav/{artifact.effective_date.isoformat()}: {exc}")
-            continue
+            raise PublicationInputError(f"amfi-nav/{artifact.effective_date.isoformat()}: {exc}") from exc
         batch = normalize_amfi_schemes(rows, effective_date=artifact.effective_date)
         artifact_by_date[artifact.effective_date] = artifact.artifact_id
         for scheme in batch.active():
@@ -438,6 +434,7 @@ def publish_checkpointed_dataset(
     safe_to_promote: bool,
     blocking_reasons: Iterable[str] = (),
     history_store: HistoryStore | None = None,
+    build: DatasetBuild | None = None,
 ) -> PublicationResult:
     """Build and atomically promote a dataset, or explain why it was not promoted.
 
@@ -449,10 +446,11 @@ def publish_checkpointed_dataset(
     if not safe_to_promote:
         reasons = ", ".join(blocking_reasons) or "pre-promotion checks failed"
         return PublicationResult(promoted=False, reason=f"promotion blocked: {reasons}")
-    try:
-        build = build_candidate(connection, raw_store, source_ids, effective_date=effective_date)
-    except PublicationInputError as exc:
-        return PublicationResult(promoted=False, reason=str(exc))
+    if build is None:
+        try:
+            build = build_candidate(connection, raw_store, source_ids, effective_date=effective_date)
+        except PublicationInputError as exc:
+            return PublicationResult(promoted=False, reason=str(exc))
     candidate, scores, artifact_ids, warnings = (
         build.candidate, build.momentum, build.source_artifact_ids, list(build.warnings)
     )

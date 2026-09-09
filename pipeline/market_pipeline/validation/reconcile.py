@@ -43,6 +43,7 @@ holiday-adjacent settlement without invalidating the rest of the dataset).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from typing import Any, Iterable, Mapping, Sequence
 
 DEFAULT_MIN_COVERAGE_RATIO = 0.90
@@ -79,6 +80,28 @@ class SourceFreshness:
         return self.status == "failed"
 
 
+@dataclass(frozen=True)
+class CandidateCoverage:
+    """Observed source coverage in the candidate that is about to publish."""
+
+    source_id: str
+    expected_date: date | None
+    loaded_date: date | None
+    instrument_count: int
+    missing_ratios: Mapping[str, float]
+    blocking_reasons: tuple[str, ...] = ()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "source_id": self.source_id,
+            "expected_date": self.expected_date.isoformat() if self.expected_date else None,
+            "loaded_date": self.loaded_date.isoformat() if self.loaded_date else None,
+            "instrument_count": self.instrument_count,
+            "missing_ratios": dict(self.missing_ratios),
+            "blocking_reasons": list(self.blocking_reasons),
+        }
+
+
 def _evaluate_source(source_id: str, observation: SourceObservation) -> SourceFreshness:
     if not observation.expected:
         return SourceFreshness(source_id, "not_expected", observation.detail)
@@ -105,10 +128,13 @@ class ReconciliationReport:
     min_coverage_ratio: float
     checks: tuple[CheckResult, ...] = ()
     source_freshness: tuple[SourceFreshness, ...] = ()
+    candidate_coverage: tuple[CandidateCoverage, ...] = ()
 
     @property
     def publishable(self) -> bool:
         if any(not check.passed for check in self.checks):
+            return False
+        if any(coverage.blocking_reasons for coverage in self.candidate_coverage):
             return False
         return not any(source.blocking for source in self.source_freshness)
 
@@ -120,6 +146,7 @@ class ReconciliationReport:
             for source in self.source_freshness
             if source.blocking
         )
+        reasons.extend(reason for coverage in self.candidate_coverage for reason in coverage.blocking_reasons)
         return tuple(reasons)
 
     def as_dict(self) -> dict[str, Any]:
@@ -135,6 +162,7 @@ class ReconciliationReport:
                 {"source_id": s.source_id, "status": s.status, "detail": s.detail}
                 for s in self.source_freshness
             ],
+            "candidate_coverage": [coverage.as_dict() for coverage in self.candidate_coverage],
         }
 
 
@@ -156,6 +184,7 @@ def reconcile(
     rs_scores: Sequence[float] | None = None,
     rs_score_bounds: tuple[float, float] = (0.0, 100.0),
     sources: Mapping[str, SourceObservation] | None = None,
+    candidate_coverage: Sequence[CandidateCoverage] = (),
 ) -> ReconciliationReport:
     """Compare a candidate dataset against the previous published dataset.
 
@@ -239,6 +268,7 @@ def reconcile(
         min_coverage_ratio=min_coverage_ratio,
         checks=tuple(checks),
         source_freshness=freshness,
+        candidate_coverage=tuple(candidate_coverage),
     )
 
 
@@ -264,6 +294,7 @@ def evaluate_pre_promotion(
 
 
 __all__ = [
+    "CandidateCoverage",
     "CheckResult",
     "ReconciliationReport",
     "SourceFreshness",

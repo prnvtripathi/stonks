@@ -16,13 +16,14 @@ from typing import Any, Sequence
 from market_pipeline.domain.models import FetchedArtifact, SourceArtifact
 from market_pipeline.jobs.backfill import BackfillJob, CoverageError
 from market_pipeline.jobs.daily import run_daily
-from market_pipeline.jobs.publish import publish_checkpointed_dataset
+from market_pipeline.jobs.publish import PublicationInputError, build_candidate, publish_checkpointed_dataset
 from market_pipeline.monitoring.budgets import budget_report
 from market_pipeline.sources.registry import SourcePolicyError
 from market_pipeline.storage.d1_publisher import D1Publisher
 from market_pipeline.storage.history_store import LocalHistoryStore
 from market_pipeline.storage.raw_store import LocalRawStore
 from market_pipeline.validation.reconcile import (
+    CandidateCoverage,
     SourceObservation,
     evaluate_pre_promotion,
     reconcile,
@@ -112,53 +113,90 @@ def _manifest_fetcher(path: str) -> Any:
 
 
 def _ensure_run_history_table(connection: sqlite3.Connection) -> None:
-    """Create the local run-history table used to derive a real coverage baseline.
-
-    Every `daily`/`backfill` invocation that turns out to be safe-to-promote
-    records its completed-artifact count here, scoped by (command, sorted
-    sources). The next run against the same database/scope that does not
-    receive an explicit `--previous-count` uses the most recent safe row as
-    its baseline instead of comparing a candidate against itself. This is
-    intentionally a plain local table (not a D1-published table) since it is
-    CLI bookkeeping, not published dataset content.
-    """
-
+    """Create the local baseline table for successfully published candidates."""
     connection.execute(
-        "CREATE TABLE IF NOT EXISTS pipeline_run_history ("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT, command TEXT NOT NULL, scope TEXT NOT NULL, "
-        "completed INTEGER NOT NULL, safe_to_promote INTEGER NOT NULL, created_at TEXT NOT NULL)"
+        "CREATE TABLE IF NOT EXISTS published_candidate_coverage ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL, source_id TEXT NOT NULL, "
+        "expected_date TEXT, loaded_date TEXT, instrument_count INTEGER NOT NULL, "
+        "missing_ratios_json TEXT NOT NULL, dataset_id TEXT NOT NULL, published_at TEXT NOT NULL)"
     )
     connection.commit()
 
 
-def _run_scope(command: str, sources: Sequence[str]) -> str:
-    return json.dumps({"command": command, "sources": sorted(sources)}, sort_keys=True)
+def _candidate_scope(sources: Sequence[str]) -> str:
+    return json.dumps({"sources": sorted(sources)}, sort_keys=True)
 
 
-def _last_known_good_completed(
-    connection: sqlite3.Connection, command: str, sources: Sequence[str]
-) -> int | None:
+def _last_published_candidate_count(connection: sqlite3.Connection, sources: Sequence[str]) -> int | None:
     row = connection.execute(
-        "SELECT completed FROM pipeline_run_history WHERE command = ? AND scope = ? "
-        "AND safe_to_promote = 1 ORDER BY id DESC LIMIT 1",
-        (command, _run_scope(command, sources)),
+        "SELECT SUM(instrument_count) FROM published_candidate_coverage WHERE scope = ? "
+        "AND dataset_id = (SELECT dataset_id FROM published_candidate_coverage WHERE scope = ? ORDER BY id DESC LIMIT 1)",
+        (_candidate_scope(sources), _candidate_scope(sources)),
     ).fetchone()
-    return None if row is None else int(row[0])
+    return None if row is None or row[0] is None else int(row[0])
 
 
-def _record_run_history(
-    connection: sqlite3.Connection,
-    command: str,
-    sources: Sequence[str],
-    completed: int,
-    safe_to_promote: bool,
+def _record_published_candidate_coverage(
+    connection: sqlite3.Connection, sources: Sequence[str], coverage: Sequence[CandidateCoverage], dataset_id: str
 ) -> None:
-    connection.execute(
-        "INSERT INTO pipeline_run_history(command, scope, completed, safe_to_promote, created_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (command, _run_scope(command, sources), completed, 1 if safe_to_promote else 0, datetime.now(UTC).isoformat()),
+    now = datetime.now(UTC).isoformat()
+    connection.executemany(
+        "INSERT INTO published_candidate_coverage("
+        "scope, source_id, expected_date, loaded_date, instrument_count, missing_ratios_json, dataset_id, published_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            (
+                _candidate_scope(sources), item.source_id,
+                item.expected_date.isoformat() if item.expected_date else None,
+                item.loaded_date.isoformat() if item.loaded_date else None,
+                item.instrument_count, json.dumps(item.missing_ratios, sort_keys=True), dataset_id, now,
+            )
+            for item in coverage
+        ],
     )
     connection.commit()
+
+
+def _expected_date(source_id: str, effective_date: date) -> date | None:
+    """Return the explicit publication expectation for each wired source."""
+
+    if source_id == "amfi-nav":
+        return effective_date if effective_date.weekday() < 5 else None
+    return effective_date
+
+
+def _candidate_coverage(
+    sources: Sequence[str], effective_date: date, build: Any | None, build_error: str | None
+) -> tuple[CandidateCoverage, ...]:
+    loaded_dates: dict[str, date] = {}
+    counts: dict[str, int] = {source: 0 for source in sources}
+    if build is not None:
+        for source in build.candidate["tables"]["sources"]:
+            loaded_dates[str(source["source_id"])] = date.fromisoformat(str(source["effective_date"]))
+        # The current candidate has one wired normalizer (AMFI); source-specific
+        # counting stays explicit so future sources cannot inherit file totals.
+        if "amfi-nav" in counts:
+            counts["amfi-nav"] = len(build.candidate["tables"]["instruments"])
+    coverage: list[CandidateCoverage] = []
+    for source_id in sources:
+        expected = _expected_date(source_id, effective_date)
+        loaded = loaded_dates.get(source_id)
+        reasons: list[str] = []
+        missing_ratios: dict[str, float] = {}
+        if expected is None and loaded != effective_date:
+            # A holiday is not missing source data. It still cannot reuse an
+            # older candidate as if it were a new run, however: that would
+            # incorrectly report a stale dataset as freshly published.
+            reasons.append(f"{source_id}: no candidate artifact is available for the not-applicable date")
+        elif expected is not None and build_error is not None:
+            reasons.append(f"{source_id}: candidate build failed: {build_error}")
+        elif expected is not None and loaded != expected:
+            # A delayed source is operationally visible but does not on its
+            # own invalidate a candidate; coverage/count gates decide whether
+            # its prior data can still be safely served.
+            missing_ratios["expected_date"] = 1.0
+        coverage.append(CandidateCoverage(source_id, expected, loaded, counts[source_id], missing_ratios, tuple(reasons)))
+    return tuple(coverage)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -217,10 +255,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Safety gate: before any future promotion step runs, reconcile the
     # candidate run's coverage against the last known-good baseline and check
     # storage budget.
+    try:
+        build = build_candidate(connection, raw_store, sources, effective_date=result.end)
+        build_error = None
+    except PublicationInputError as exc:
+        build = None
+        build_error = str(exc)
+    coverage = _candidate_coverage(sources, result.end, build, build_error)
     total_days = (result.end - result.start).days + 1
     source_observations = {
         source: SourceObservation(
-            expected=True,
+            expected=_expected_date(source, result.end) is not None,
             failed=len(result.missing_dates.get(source, ())) == total_days,
             delay_days=len(result.missing_dates.get(source, ())),
             max_delay_days=0,
@@ -240,13 +285,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.previous_count is not None:
         previous_count = args.previous_count
     else:
-        baseline = _last_known_good_completed(connection, args.command, sources)
-        previous_count = baseline if baseline is not None else result.completed
+        baseline = _last_published_candidate_count(connection, sources)
+        previous_count = baseline if baseline is not None else sum(item.instrument_count for item in coverage)
     reconciliation = reconcile(
         previous=previous_count,
-        candidate=result.completed,
+        candidate=sum(item.instrument_count for item in coverage),
         min_coverage_ratio=args.min_coverage_ratio,
         sources=source_observations,
+        candidate_coverage=coverage,
     )
     storage = publisher.budget_report()
     storage_report = budget_report(
@@ -259,8 +305,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Only a safe-to-promote run may become a future baseline: a blocked
     # candidate (coverage drop, failed source, exceeded budget) must never
     # poison the next run's comparison point.
-    _record_run_history(connection, args.command, sources, result.completed, safe_to_promote)
-
     # Normalization -> analytics -> stage/promote. This only runs after the
     # Task 13 gate says the candidate is safe; a blocked run leaves the last
     # known-good dataset active and untouched.
@@ -273,7 +317,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         safe_to_promote=safe_to_promote,
         blocking_reasons=blocking_reasons,
         history_store=history_store,
+        build=build,
     )
+    if publication.promoted and publication.dataset_id is not None:
+        _record_published_candidate_coverage(connection, sources, coverage, publication.dataset_id)
 
     print(json.dumps({
         "start": result.start.isoformat(),
