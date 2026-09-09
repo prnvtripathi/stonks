@@ -86,6 +86,20 @@ def test_identical_retry_reuses_the_same_successful_candidate(tmp_path: Path, ca
     assert _active_dataset_id(db) == first["publication"]["dataset_id"]
 
 
+def test_identical_retry_does_not_inflate_the_next_candidate_baseline(tmp_path: Path, capsys: Any) -> None:
+    first_date = date(2026, 9, 1)
+    first_exit, first, db = _run_daily(tmp_path, capsys, first_date, [_artifact(first_date)])
+    retry_exit, retry, _ = _run_daily(tmp_path, capsys, first_date, [_artifact(first_date)], db=db)
+    next_date = first_date + timedelta(days=1)
+    next_exit, next_run, _ = _run_daily(tmp_path, capsys, next_date, [_artifact(next_date)], db=db)
+
+    assert first_exit == 0, first
+    assert retry_exit == 0, retry
+    assert next_exit == 0, next_run
+    assert next_run["reconciliation"]["previous_count"] == 3
+    assert _active_dataset_id(db) == next_run["publication"]["dataset_id"]
+
+
 def test_instrument_truncation_blocks_and_preserves_the_active_dataset(tmp_path: Path, capsys: Any) -> None:
     first_date = date(2026, 9, 1)
     first_exit, first, db = _run_daily(tmp_path, capsys, first_date, [_artifact(first_date, scheme_count=3)])
@@ -147,3 +161,63 @@ def test_expected_amfi_holiday_is_not_reported_as_missing_data(tmp_path: Path, c
         "missing_ratios": {},
         "blocking_reasons": ["amfi-nav: no candidate artifact is available for the not-applicable date"],
     }]
+
+
+def _run_with_corrupt_checkpoint(
+    tmp_path: Path, capsys: Any, mutate: Any
+) -> tuple[int, dict[str, Any], dict[str, Any], Path]:
+    first_date = date(2026, 9, 1)
+    first_exit, first, db = _run_daily(tmp_path, capsys, first_date, [_artifact(first_date)])
+    assert first_exit == 0, first
+    mutate(db, tmp_path)
+    next_date = first_date + timedelta(days=1)
+    exit_code, payload, _ = _run_daily(tmp_path, capsys, next_date, [_artifact(next_date)], db=db)
+    return exit_code, payload, first, db
+
+
+def test_corrupt_checkpoint_checksum_blocks_and_preserves_the_active_dataset(tmp_path: Path, capsys: Any) -> None:
+    def corrupt_checksum(db: Path, _: Path) -> None:
+        connection = sqlite3.connect(db)
+        try:
+            connection.execute("UPDATE backfill_checkpoints SET checksum = '0' * 64")
+            connection.commit()
+        finally:
+            connection.close()
+
+    exit_code, payload, first, db = _run_with_corrupt_checkpoint(tmp_path, capsys, corrupt_checksum)
+
+    assert exit_code != 0, payload
+    assert payload["publication"]["promoted"] is False
+    assert _active_dataset_id(db) == first["publication"]["dataset_id"]
+
+
+def test_absent_raw_object_blocks_and_preserves_the_active_dataset(tmp_path: Path, capsys: Any) -> None:
+    def remove_raw_object(db: Path, root: Path) -> None:
+        connection = sqlite3.connect(db)
+        try:
+            object_key = connection.execute("SELECT object_key FROM backfill_checkpoints").fetchone()[0]
+        finally:
+            connection.close()
+        (root / "raw" / str(object_key)).unlink()
+
+    exit_code, payload, first, db = _run_with_corrupt_checkpoint(tmp_path, capsys, remove_raw_object)
+
+    assert exit_code != 0, payload
+    assert payload["publication"]["promoted"] is False
+    assert _active_dataset_id(db) == first["publication"]["dataset_id"]
+
+
+def test_checkpoint_without_raw_object_key_blocks_and_preserves_the_active_dataset(tmp_path: Path, capsys: Any) -> None:
+    def remove_object_key(db: Path, _: Path) -> None:
+        connection = sqlite3.connect(db)
+        try:
+            connection.execute("UPDATE backfill_checkpoints SET object_key = NULL")
+            connection.commit()
+        finally:
+            connection.close()
+
+    exit_code, payload, first, db = _run_with_corrupt_checkpoint(tmp_path, capsys, remove_object_key)
+
+    assert exit_code != 0, payload
+    assert payload["publication"]["promoted"] is False
+    assert _active_dataset_id(db) == first["publication"]["dataset_id"]

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from datetime import date
+
 import pytest
 from market_pipeline.monitoring.budgets import budget_report
 from market_pipeline.validation.reconcile import (
+    CandidateCoverage,
     SourceObservation,
     evaluate_pre_promotion,
     reconcile,
@@ -11,6 +14,27 @@ from market_pipeline.validation.reconcile import (
 
 def test_coverage_drop_blocks_publish() -> None:
     assert not reconcile(previous=2500, candidate=1800).publishable
+
+
+def test_source_candidate_coverage_cannot_be_masked_by_other_source_growth() -> None:
+    previous = (
+        CandidateCoverage("amfi-nav", date(2026, 9, 1), date(2026, 9, 1), 100, {}, ()),
+        CandidateCoverage("nse-eod", date(2026, 9, 1), date(2026, 9, 1), 100, {}, ()),
+    )
+    candidate = (
+        CandidateCoverage("amfi-nav", date(2026, 9, 2), date(2026, 9, 2), 50, {}, ()),
+        CandidateCoverage("nse-eod", date(2026, 9, 2), date(2026, 9, 2), 200, {}, ()),
+    )
+
+    report = reconcile(
+        previous=200,
+        candidate=250,
+        source_baselines=previous,
+        candidate_coverage=candidate,
+    )
+
+    assert not report.publishable
+    assert any(check.name == "source:amfi-nav:coverage" and not check.passed for check in report.checks)
 
 
 def test_healthy_coverage_is_publishable() -> None:

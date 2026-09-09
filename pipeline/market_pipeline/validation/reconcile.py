@@ -185,6 +185,7 @@ def reconcile(
     rs_score_bounds: tuple[float, float] = (0.0, 100.0),
     sources: Mapping[str, SourceObservation] | None = None,
     candidate_coverage: Sequence[CandidateCoverage] = (),
+    source_baselines: Sequence[CandidateCoverage] = (),
 ) -> ReconciliationReport:
     """Compare a candidate dataset against the previous published dataset.
 
@@ -257,6 +258,34 @@ def reconcile(
                 f"{len(out_of_bounds)} RS score(s) fall outside expected bounds [{low}, {high}]",
             )
         )
+
+    baseline_by_source = {coverage.source_id: coverage for coverage in source_baselines}
+    for coverage in candidate_coverage:
+        baseline = baseline_by_source.get(coverage.source_id)
+        if baseline is None:
+            continue
+        source_ratio = 1.0 if baseline.instrument_count == 0 else coverage.instrument_count / baseline.instrument_count
+        checks.append(
+            CheckResult(
+                f"source:{coverage.source_id}:coverage",
+                source_ratio >= min_coverage_ratio,
+                f"source {coverage.source_id} coverage ratio {source_ratio:.1%} is below minimum "
+                f"{min_coverage_ratio:.0%} ({coverage.instrument_count} of {baseline.instrument_count} previously published instruments)",
+            )
+        )
+        for name, ratio in coverage.missing_ratios.items():
+            if name == "expected_date":
+                # Source freshness reports delayed expected dates separately;
+                # this mapping is for normalized-data missingness only.
+                continue
+            checks.append(
+                CheckResult(
+                    f"source:{coverage.source_id}:missing_ratio:{name}",
+                    ratio <= max_missing_ratio,
+                    f"source {coverage.source_id} missing ratio for {name} {ratio:.1%} exceeds maximum "
+                    f"{max_missing_ratio:.0%}",
+                )
+            )
 
     freshness = tuple(
         _evaluate_source(source_id, observation) for source_id, observation in (sources or {}).items()

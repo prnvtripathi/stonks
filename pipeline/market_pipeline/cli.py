@@ -120,6 +120,16 @@ def _ensure_run_history_table(connection: sqlite3.Connection) -> None:
         "expected_date TEXT, loaded_date TEXT, instrument_count INTEGER NOT NULL, "
         "missing_ratios_json TEXT NOT NULL, dataset_id TEXT NOT NULL, published_at TEXT NOT NULL)"
     )
+    # Earlier R01 builds may have recorded repeated rows for a retry. Retain
+    # the newest snapshot before enforcing one row per candidate/source.
+    connection.execute(
+        "DELETE FROM published_candidate_coverage WHERE id NOT IN ("
+        "SELECT MAX(id) FROM published_candidate_coverage GROUP BY scope, dataset_id, source_id)"
+    )
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_published_candidate_coverage_snapshot "
+        "ON published_candidate_coverage(scope, dataset_id, source_id)"
+    )
     connection.commit()
 
 
@@ -127,13 +137,26 @@ def _candidate_scope(sources: Sequence[str]) -> str:
     return json.dumps({"sources": sorted(sources)}, sort_keys=True)
 
 
-def _last_published_candidate_count(connection: sqlite3.Connection, sources: Sequence[str]) -> int | None:
-    row = connection.execute(
-        "SELECT SUM(instrument_count) FROM published_candidate_coverage WHERE scope = ? "
-        "AND dataset_id = (SELECT dataset_id FROM published_candidate_coverage WHERE scope = ? ORDER BY id DESC LIMIT 1)",
-        (_candidate_scope(sources), _candidate_scope(sources)),
-    ).fetchone()
-    return None if row is None or row[0] is None else int(row[0])
+def _last_published_candidate_coverage(
+    connection: sqlite3.Connection, sources: Sequence[str]
+) -> tuple[CandidateCoverage, ...]:
+    scope = _candidate_scope(sources)
+    rows = connection.execute(
+        "SELECT source_id, expected_date, loaded_date, instrument_count, missing_ratios_json "
+        "FROM published_candidate_coverage WHERE scope = ? AND dataset_id = ("
+        "SELECT dataset_id FROM published_candidate_coverage WHERE scope = ? ORDER BY id DESC LIMIT 1)",
+        (scope, scope),
+    ).fetchall()
+    return tuple(
+        CandidateCoverage(
+            str(source_id),
+            date.fromisoformat(str(expected)) if expected else None,
+            date.fromisoformat(str(loaded)) if loaded else None,
+            int(instrument_count),
+            json.loads(str(missing_ratios)),
+        )
+        for source_id, expected, loaded, instrument_count, missing_ratios in rows
+    )
 
 
 def _record_published_candidate_coverage(
@@ -143,7 +166,11 @@ def _record_published_candidate_coverage(
     connection.executemany(
         "INSERT INTO published_candidate_coverage("
         "scope, source_id, expected_date, loaded_date, instrument_count, missing_ratios_json, dataset_id, published_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(scope, dataset_id, source_id) DO UPDATE SET "
+        "expected_date=excluded.expected_date, loaded_date=excluded.loaded_date, "
+        "instrument_count=excluded.instrument_count, missing_ratios_json=excluded.missing_ratios_json, "
+        "published_at=excluded.published_at",
         [
             (
                 _candidate_scope(sources), item.source_id,
@@ -285,14 +312,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.previous_count is not None:
         previous_count = args.previous_count
     else:
-        baseline = _last_published_candidate_count(connection, sources)
-        previous_count = baseline if baseline is not None else sum(item.instrument_count for item in coverage)
+        source_baselines = _last_published_candidate_coverage(connection, sources)
+        previous_count = (
+            sum(item.instrument_count for item in source_baselines)
+            if source_baselines else sum(item.instrument_count for item in coverage)
+        )
+    if args.previous_count is not None:
+        source_baselines = ()
     reconciliation = reconcile(
         previous=previous_count,
         candidate=sum(item.instrument_count for item in coverage),
         min_coverage_ratio=args.min_coverage_ratio,
         sources=source_observations,
         candidate_coverage=coverage,
+        source_baselines=source_baselines,
     )
     storage = publisher.budget_report()
     storage_report = budget_report(
