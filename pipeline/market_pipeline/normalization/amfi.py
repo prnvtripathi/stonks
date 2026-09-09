@@ -16,6 +16,9 @@ from market_pipeline.domain.models import INSTRUMENT_NAMESPACE, AssetClass
 from market_pipeline.sources.amfi_nav import AmfiNavRow
 
 
+NORMALIZATION_VERSION = "amfi-normalization-v1"
+
+
 def _scheme_id(code: str) -> UUID:
     return uuid5(INSTRUMENT_NAMESPACE, f"amfi|{code}|{AssetClass.MUTUAL_FUND.value}")
 

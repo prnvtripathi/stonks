@@ -25,10 +25,15 @@ from decimal import Decimal
 from hashlib import sha256
 from typing import Any, Iterable, Mapping, Sequence
 
+from market_pipeline.analytics import momentum as momentum_analytics
+from market_pipeline.analytics import returns as returns_analytics
+from market_pipeline.analytics import risk as risk_analytics
+from market_pipeline.analytics import rs as rs_analytics
 from market_pipeline.analytics.momentum import MomentumScore, momentum_scores
 from market_pipeline.analytics.returns import ReturnMetrics, calculate_returns
 from market_pipeline.analytics.risk import RiskMetrics, calculate_risk
 from market_pipeline.analytics.rs import benchmark_rs
+from market_pipeline.normalization import amfi as amfi_normalization
 from market_pipeline.normalization.amfi import AmfiScheme, normalize_amfi_schemes
 from market_pipeline.publication.input_manifest import InputManifestError, manifest_with_fingerprint
 from market_pipeline.sources.amfi_nav import AmfiNavError, parse_amfi_nav
@@ -46,6 +51,24 @@ RETURN_METRICS = (
     ("return_12m", "twelve_month"),
 )
 BENCHMARK_WINDOWS = (("benchmark_rs_3m", "three_month"), ("benchmark_rs_6m", "six_month"), ("benchmark_rs_12m", "twelve_month"))
+CATEGORY_RANK_FORMULA_VERSION = "category-rank-v1"
+PROJECTION_VERSION = "d1-projection-v1"
+
+
+def implementation_versions() -> dict[str, str]:
+    """Read dataset identity versions from their owning implementation modules."""
+
+    return {
+        "normalization": amfi_normalization.NORMALIZATION_VERSION,
+        "analytics": "|".join((
+            returns_analytics.FORMULA_VERSION,
+            risk_analytics.FORMULA_VERSION,
+            rs_analytics.FORMULA_VERSION,
+            CATEGORY_RANK_FORMULA_VERSION,
+            momentum_analytics.FORMULA_VERSION,
+        )),
+        "projection": PROJECTION_VERSION,
+    }
 
 
 class PublicationInputError(RuntimeError):
@@ -116,12 +139,12 @@ def _checkpointed_artifacts(
         return [], warnings
     placeholders = ",".join("?" for _ in source_ids)
     rows = connection.execute(
-        "SELECT source_id, effective_date, artifact_id, checksum, object_key FROM backfill_checkpoints "
+        "SELECT source_id, effective_date, artifact_id, checksum, object_key, adapter_version FROM backfill_checkpoints "
         f"WHERE source_id IN ({placeholders}) ORDER BY effective_date, source_id",
         tuple(source_ids),
     ).fetchall()
     artifacts: list[_Artifact] = []
-    for source_id, effective, artifact_id, checksum, object_key in rows:
+    for source_id, effective, artifact_id, checksum, object_key, adapter_version in rows:
         if not object_key:
             raise PublicationInputError(f"{source_id}/{effective}: checkpoint has no object key; artifact was not retained")
         try:
@@ -132,7 +155,7 @@ def _checkpointed_artifacts(
             raise PublicationInputError(f"{source_id}/{effective}: stored artifact checksum does not match its checkpoint")
         artifacts.append(_Artifact(
             str(source_id), date.fromisoformat(str(effective)), str(artifact_id), str(checksum),
-            "v1", str(object_key), body,
+            str(adapter_version), str(object_key), body,
         ))
     return artifacts, warnings
 
@@ -247,11 +270,7 @@ def build_candidate(
     ]
     if not usable:
         raise PublicationInputError("no normalizable artifacts are available for the requested effective date")
-    versions = {
-        "normalization": "amfi-v1",
-        "analytics": "returns-v1+risk-v1+rs-v1+category-rank-v1+momentum-v1",
-        "projection": "d1-v1",
-    }
+    versions = implementation_versions()
     try:
         manifest = manifest_with_fingerprint([
             {
@@ -343,7 +362,7 @@ def build_candidate(
         metrics.append(_metric_row(
             instrument_id, effective, "category_rank",
             Decimal(ranks[instrument_id]) if instrument_id in ranks else None,
-            formula_version="category-rank-v1", source_artifact_id=artifact_id,
+                formula_version=CATEGORY_RANK_FORMULA_VERSION, source_artifact_id=artifact_id,
             metadata={"unit": "count", "cohort": f"amfi-category:{category}"},
         ))
         for metric, field_name in BENCHMARK_WINDOWS:
@@ -354,7 +373,7 @@ def build_candidate(
                 value = benchmark_rs(asset, benchmark)
             metrics.append(_metric_row(
                 instrument_id, effective, metric, value,
-                formula_version="rs-v1", source_artifact_id=artifact_id,
+                formula_version=rs_analytics.FORMULA_VERSION, source_artifact_id=artifact_id,
                 metadata={
                     "unit": "percent",
                     "benchmark": f"amfi-category-composite:{category}",

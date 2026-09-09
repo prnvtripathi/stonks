@@ -19,17 +19,13 @@ _INPUT_FIELDS = (
     "adapter_version",
     "raw_object_key",
 )
-_TIMESTAMP_FIELDS = {"generated_at", "retrieved_at", "fetched_at", "created_at", "updated_at"}
-
-
 def _canonical_input(value: Mapping[str, str]) -> dict[str, Any]:
     missing = [field for field in _INPUT_FIELDS if not str(value.get(field, "")).strip()]
     if missing:
         raise InputManifestError(f"input is missing required lineage fields: {', '.join(missing)}")
-    # Retrieval/generation timestamps explain job execution, not the bytes or
-    # formula inputs used by a dataset. Deliberately omit them from its identity.
-    semantic = {str(key): item for key, item in value.items() if str(key) not in _TIMESTAMP_FIELDS}
-    return {key: semantic[key] for key in sorted(semantic)}
+    # The allowlist deliberately excludes execution/retrieval fields such as
+    # timestamps and retry IDs: they describe an attempt, not its input bytes.
+    return {field: str(value[field]) for field in _INPUT_FIELDS}
 
 
 def canonical_inputs(inputs: Sequence[Mapping[str, str]]) -> list[dict[str, Any]]:

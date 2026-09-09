@@ -82,7 +82,15 @@ def upgrade_checkpoint_schema(connection: sqlite3.Connection) -> None:
                 )
             connection.execute("DROP TABLE backfill_checkpoints_legacy")
             connection.commit()
-            return
+            columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(backfill_checkpoints)")}
+        if "adapter_version" not in columns:
+            # Historical checkpoints did not retain this semantic input. Keep
+            # their uncertainty explicit so a current adapter cannot silently
+            # share the same dataset fingerprint.
+            connection.execute(
+                "ALTER TABLE backfill_checkpoints ADD COLUMN adapter_version TEXT NOT NULL DEFAULT 'legacy-unknown'"
+            )
+            connection.commit()
 
 
 def _ensure_checkpoint_table(connection: sqlite3.Connection) -> None:
@@ -90,7 +98,7 @@ def _ensure_checkpoint_table(connection: sqlite3.Connection) -> None:
     connection.execute(
         "CREATE TABLE IF NOT EXISTS backfill_checkpoints ("
         "source_id TEXT NOT NULL, effective_date TEXT NOT NULL, artifact_id TEXT NOT NULL, checksum TEXT NOT NULL, "
-        "object_key TEXT, completed_at TEXT NOT NULL, PRIMARY KEY(source_id,effective_date,artifact_id))"
+        "object_key TEXT, adapter_version TEXT NOT NULL, completed_at TEXT NOT NULL, PRIMARY KEY(source_id,effective_date,artifact_id))"
     )
     connection.commit()
 
@@ -124,23 +132,23 @@ class BackfillJob:
         effective_date: date,
         artifact_id: str,
         checksum: str,
-    ) -> tuple[str, str | None] | None:
+    ) -> tuple[str, str | None, str] | None:
         row = self.database.execute(
-            "SELECT checksum, object_key FROM backfill_checkpoints WHERE source_id=? AND effective_date=? AND artifact_id=?",
+            "SELECT checksum, object_key, adapter_version FROM backfill_checkpoints WHERE source_id=? AND effective_date=? AND artifact_id=?",
             (source_id, effective_date.isoformat(), artifact_id),
         ).fetchone()
         if row is not None:
-            return str(row[0]), row[1]
+            return str(row[0]), row[1], str(row[2])
         # A pre-0002 row cannot be mapped to the canonical artifact ID because
         # old checkpoints did not retain filename/identity. Match only a single
         # legacy row by checksum; never guess when multiple legacy objects exist.
         legacy = self.database.execute(
-            "SELECT checksum, object_key FROM backfill_checkpoints WHERE source_id=? AND effective_date=? AND artifact_id LIKE 'legacy-%'",
+            "SELECT checksum, object_key, adapter_version FROM backfill_checkpoints WHERE source_id=? AND effective_date=? AND artifact_id LIKE 'legacy-%'",
             (source_id, effective_date.isoformat()),
         ).fetchall()
         matches = [item for item in legacy if str(item[0]).lower() == checksum.lower()]
         if len(matches) == 1:
-            return str(matches[0][0]), matches[0][1]
+            return str(matches[0][0]), matches[0][1], str(matches[0][2])
         if legacy:
             if len(matches) > 1:
                 raise BackfillIntegrityError(
@@ -161,11 +169,11 @@ class BackfillJob:
             return value[0], value[1]
         raise TypeError("fetcher must return FetchedArtifact, SourceArtifact, or (artifact, body)")
 
-    def _save_checkpoint(self, source: str, effective: date, artifact_id: str, checksum: str, object_key: str | None) -> None:
+    def _save_checkpoint(self, source: str, effective: date, artifact_id: str, checksum: str, object_key: str | None, adapter_version: str) -> None:
         self.database.execute(
-            "INSERT INTO backfill_checkpoints(source_id,effective_date,artifact_id,checksum,object_key,completed_at) "
-            "VALUES(?,?,?,?,?,?) ON CONFLICT(source_id,effective_date,artifact_id) DO UPDATE SET checksum=excluded.checksum,object_key=excluded.object_key,completed_at=excluded.completed_at",
-            (source, effective.isoformat(), artifact_id, checksum.lower(), object_key, datetime.now(UTC).isoformat()),
+            "INSERT INTO backfill_checkpoints(source_id,effective_date,artifact_id,checksum,object_key,adapter_version,completed_at) "
+            "VALUES(?,?,?,?,?,?,?) ON CONFLICT(source_id,effective_date,artifact_id) DO UPDATE SET checksum=excluded.checksum,object_key=excluded.object_key,adapter_version=excluded.adapter_version,completed_at=excluded.completed_at",
+            (source, effective.isoformat(), artifact_id, checksum.lower(), object_key, adapter_version, datetime.now(UTC).isoformat()),
         )
         self.database.commit()
 
@@ -213,10 +221,10 @@ class BackfillJob:
                         raise BackfillIntegrityError(f"{source}/{current.isoformat()}: checksum mismatch")
                     artifact_id = str(artifact.artifact_id)
                     prior = self._checkpoint(source, current, artifact_id, checksum)
-                    if prior is not None and prior[0].lower() == checksum:
+                    if prior is not None and prior[0].lower() == checksum and prior[2] in {artifact.adapter_version, "legacy-unknown"}:
                         skipped += 1
                         continue
-                    if prior is not None:
+                    if prior is not None and prior[0].lower() != checksum:
                         raise BackfillIntegrityError(f"{source}/{current.isoformat()}: artifact checksum changed for {artifact_id}")
                     key: str | None = None
                     if self.raw_store is not None and body is not None:
@@ -228,7 +236,7 @@ class BackfillJob:
                             raise BackfillIntegrityError(f"{source}/{current.isoformat()}: artifact persistence failed: {exc}") from exc
                     if key is None:
                         key = f"raw/{source}/{current.isoformat()}/{checksum}/{artifact.filename}"
-                    self._save_checkpoint(source, current, artifact_id, checksum, key)
+                    self._save_checkpoint(source, current, artifact_id, checksum, key, artifact.adapter_version)
                     completed += 1
             current += timedelta(days=1)
         self.database.commit()

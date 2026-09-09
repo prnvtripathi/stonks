@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from market_pipeline.cli import main
+from market_pipeline.jobs import publish as publish_job
 from market_pipeline.publication.input_manifest import dataset_fingerprint
 
 
@@ -59,6 +60,36 @@ def test_dataset_fingerprint_is_order_independent_and_tracks_raw_and_formula_inp
     assert dataset_fingerprint(inputs, versions) == dataset_fingerprint(list(reversed(inputs)), versions)
     assert dataset_fingerprint(inputs, versions) != dataset_fingerprint(inputs[:1], versions)
     assert dataset_fingerprint(inputs, versions) != dataset_fingerprint(inputs, {**versions, "analytics": "returns-v2"})
+
+
+def test_dataset_fingerprint_ignores_execution_metadata() -> None:
+    input_record = {
+        "source_id": "amfi-nav", "effective_date": "2026-09-08", "artifact_id": "b",
+        "checksum": "b" * 64, "adapter_version": "v1", "raw_object_key": "raw/b",
+    }
+    versions = {"normalization": "amfi-v1", "analytics": "returns-v1", "projection": "d1-v1"}
+
+    assert dataset_fingerprint([input_record], versions) == dataset_fingerprint([
+        {**input_record, "retrieved_at": "2026-09-08T09:00:00Z", "execution_attempt_id": "retry-2"}
+    ], versions)
+
+
+def test_changed_production_projection_version_creates_a_new_dataset(tmp_path: Path, capsys: Any, monkeypatch: Any) -> None:
+    effective = date(2026, 9, 8)
+    db = tmp_path / "market.db"
+    first_exit, first = _run(tmp_path, capsys, ["daily", "--date", effective.isoformat()], [_artifact(effective, 108.0)], db)
+
+    monkeypatch.setattr(publish_job, "PROJECTION_VERSION", "d1-projection-v2")
+    changed_exit, changed = _run(tmp_path, capsys, ["daily", "--date", effective.isoformat()], [_artifact(effective, 108.0)], db)
+
+    assert first_exit == 0, first
+    assert changed_exit == 0, changed
+    assert changed["publication"]["dataset_id"] != first["publication"]["dataset_id"]
+    connection = sqlite3.connect(db)
+    try:
+        assert connection.execute("SELECT adapter_version FROM backfill_checkpoints").fetchone()[0] == "v1"
+    finally:
+        connection.close()
 
 
 def test_historical_backfill_changes_dataset_identity_and_metric_lineage(tmp_path: Path, capsys: Any) -> None:
