@@ -30,6 +30,7 @@ from market_pipeline.analytics.returns import ReturnMetrics, calculate_returns
 from market_pipeline.analytics.risk import RiskMetrics, calculate_risk
 from market_pipeline.analytics.rs import benchmark_rs
 from market_pipeline.normalization.amfi import AmfiScheme, normalize_amfi_schemes
+from market_pipeline.publication.input_manifest import InputManifestError, manifest_with_fingerprint
 from market_pipeline.sources.amfi_nav import AmfiNavError, parse_amfi_nav
 from market_pipeline.sources.registry import get_source_policy
 from market_pipeline.storage.d1_publisher import D1Publisher, ReconciliationError, publish
@@ -92,6 +93,8 @@ class _Artifact:
     effective_date: date
     artifact_id: str
     checksum: str
+    adapter_version: str
+    raw_object_key: str
     body: bytes
 
 
@@ -127,7 +130,10 @@ def _checkpointed_artifacts(
             raise PublicationInputError(f"{source_id}/{effective}: raw artifact is unreadable ({exc})") from exc
         if sha256(body).hexdigest() != str(checksum).lower():
             raise PublicationInputError(f"{source_id}/{effective}: stored artifact checksum does not match its checkpoint")
-        artifacts.append(_Artifact(str(source_id), date.fromisoformat(str(effective)), str(artifact_id), str(checksum), body))
+        artifacts.append(_Artifact(
+            str(source_id), date.fromisoformat(str(effective)), str(artifact_id), str(checksum),
+            "v1", str(object_key), body,
+        ))
     return artifacts, warnings
 
 
@@ -241,6 +247,26 @@ def build_candidate(
     ]
     if not usable:
         raise PublicationInputError("no normalizable artifacts are available for the requested effective date")
+    versions = {
+        "normalization": "amfi-v1",
+        "analytics": "returns-v1+risk-v1+rs-v1+category-rank-v1+momentum-v1",
+        "projection": "d1-v1",
+    }
+    try:
+        manifest = manifest_with_fingerprint([
+            {
+                "source_id": artifact.source_id,
+                "effective_date": artifact.effective_date.isoformat(),
+                "artifact_id": artifact.artifact_id,
+                "checksum": artifact.checksum.lower(),
+                "adapter_version": artifact.adapter_version,
+                "raw_object_key": artifact.raw_object_key,
+            }
+            for artifact in usable
+        ], versions)
+    except InputManifestError as exc:
+        raise PublicationInputError(str(exc)) from exc
+    fingerprint = str(manifest["fingerprint"])
 
     series, artifact_by_date, parse_warnings = _normalize_amfi(usable)
     warnings.extend(parse_warnings)
@@ -353,10 +379,15 @@ def build_candidate(
             "components": {key: value for key, value in momentum_components.items() if value is not None},
         })
 
+    # Return/risk/momentum values consume a whole time series. The persisted
+    # manifest, rather than the final daily file, is their authoritative
+    # lineage; attaching only ``artifact_id`` here would be misleading.
+    for metric in metrics:
+        metric["source_artifact_id"] = None
+        metric["metadata"]["input_manifest_sha256"] = fingerprint
     scores = momentum_scores(momentum_records)
     policy = get_source_policy("amfi-nav")
     now = datetime.now(UTC).isoformat()
-    fingerprint = sha256(artifact_id.encode("utf-8")).hexdigest()
     candidate = {
         "dataset_id": f"amfi-nav-{effective.isoformat()}-{fingerprint[:12]}",
         "effective_date": effective.isoformat(),
@@ -365,6 +396,8 @@ def build_candidate(
             "generated_at": now,
             "artifact_dates": len(artifact_by_date),
             "unwired_sources": unwired,
+            "input_manifest": manifest,
+            "input_manifest_sha256": fingerprint,
         },
         "tables": {
             "sources": [{
@@ -387,7 +420,7 @@ def build_candidate(
             "latest_metrics": metrics,
         },
     }
-    artifact_ids = {str(instrument["instrument_id"]): artifact_id for instrument in instruments}
+    artifact_ids: dict[str, str] = {}
     return DatasetBuild(candidate, scores, artifact_ids, histories, tuple(warnings))
 
 
