@@ -35,7 +35,19 @@ describe("compact publication contract", () => {
     expect(instrument?.momentum).toMatchObject({ cohort: "mutual_fund:equity", coverage: 0.85, sourceDate: "2026-09-07", formulaVersion: "momentum-v2-cohort", warning: "Thin category coverage" });
   });
 
-  it("rejects malformed metric metadata without discarding valid object metadata", async () => {
+  it("decodes JSON-string metric metadata through the D1 repository", async () => {
+    const row = compactMomentumRow();
+    const metrics = JSON.parse(String(row.metric_rows_json)) as Array<Record<string, unknown>>;
+    for (const metric of metrics) metric.metadata = JSON.stringify(metric.metadata);
+    row.metric_rows_json = JSON.stringify(metrics);
+
+    const instrument = await storeFor(row).instrument("momentum-contract", "mf-1");
+
+    expect(instrument?.momentum?.components[0]).toMatchObject({ raw: 12, normalized: 0.6, weight: 0.2, contribution: 0.12, unit: "percent" });
+    expect(instrument?.momentum).toMatchObject({ cohort: "mutual_fund:equity", coverage: 0.85, sourceDate: "2026-09-07", formulaVersion: "momentum-v2-cohort", warning: "Thin category coverage" });
+  });
+
+  it("rejects malformed null and array metric metadata", async () => {
     const row = compactMomentumRow();
     const metrics = JSON.parse(String(row.metric_rows_json)) as Array<Record<string, unknown>>;
     metrics[0]!.metadata = null;
