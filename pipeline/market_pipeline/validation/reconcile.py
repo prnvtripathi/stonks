@@ -261,18 +261,6 @@ def reconcile(
 
     baseline_by_source = {coverage.source_id: coverage for coverage in source_baselines}
     for coverage in candidate_coverage:
-        baseline = baseline_by_source.get(coverage.source_id)
-        if baseline is None:
-            continue
-        source_ratio = 1.0 if baseline.instrument_count == 0 else coverage.instrument_count / baseline.instrument_count
-        checks.append(
-            CheckResult(
-                f"source:{coverage.source_id}:coverage",
-                source_ratio >= min_coverage_ratio,
-                f"source {coverage.source_id} coverage ratio {source_ratio:.1%} is below minimum "
-                f"{min_coverage_ratio:.0%} ({coverage.instrument_count} of {baseline.instrument_count} previously published instruments)",
-            )
-        )
         for name, ratio in coverage.missing_ratios.items():
             if name == "expected_date":
                 # Source freshness reports delayed expected dates separately;
@@ -286,6 +274,18 @@ def reconcile(
                     f"{max_missing_ratio:.0%}",
                 )
             )
+        baseline = baseline_by_source.get(coverage.source_id)
+        if baseline is None:
+            continue
+        source_ratio = 1.0 if baseline.instrument_count == 0 else coverage.instrument_count / baseline.instrument_count
+        checks.append(
+            CheckResult(
+                f"source:{coverage.source_id}:coverage",
+                source_ratio >= min_coverage_ratio,
+                f"source {coverage.source_id} coverage ratio {source_ratio:.1%} is below minimum "
+                f"{min_coverage_ratio:.0%} ({coverage.instrument_count} of {baseline.instrument_count} previously published instruments)",
+            )
+        )
 
     freshness = tuple(
         _evaluate_source(source_id, observation) for source_id, observation in (sources or {}).items()

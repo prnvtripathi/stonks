@@ -37,6 +37,24 @@ def test_source_candidate_coverage_cannot_be_masked_by_other_source_growth() -> 
     assert any(check.name == "source:amfi-nav:coverage" and not check.passed for check in report.checks)
 
 
+def test_source_specific_normalized_missingness_blocks_publish() -> None:
+    report = reconcile(
+        previous=200,
+        candidate=200,
+        source_baselines=(
+            CandidateCoverage("amfi-nav", date(2026, 9, 1), date(2026, 9, 1), 100, {}, ()),
+            CandidateCoverage("nse-eod", date(2026, 9, 1), date(2026, 9, 1), 100, {}, ()),
+        ),
+        candidate_coverage=(
+            CandidateCoverage("amfi-nav", date(2026, 9, 2), date(2026, 9, 2), 100, {"instrument_rows": 0.10}, ()),
+            CandidateCoverage("nse-eod", date(2026, 9, 2), date(2026, 9, 2), 100, {}, ()),
+        ),
+    )
+
+    assert not report.publishable
+    assert any(check.name == "source:amfi-nav:missing_ratio:instrument_rows" and not check.passed for check in report.checks)
+
+
 def test_healthy_coverage_is_publishable() -> None:
     report = reconcile(previous=2500, candidate=2450)
     assert report.publishable

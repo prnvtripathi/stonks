@@ -10,7 +10,10 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from market_pipeline import cli
 from market_pipeline.cli import main
+from market_pipeline.jobs.backfill import BackfillResult
+from market_pipeline.jobs.publish import DatasetBuild
 
 TERMS_URL = "https://www.amfiindia.com/terms-and-conditions"
 SOURCE_URL = "https://www.amfiindia.com/spages/NAVAll.txt"
@@ -98,6 +101,57 @@ def test_identical_retry_does_not_inflate_the_next_candidate_baseline(tmp_path: 
     assert next_exit == 0, next_run
     assert next_run["reconciliation"]["previous_count"] == 3
     assert _active_dataset_id(db) == next_run["publication"]["dataset_id"]
+
+
+def test_previous_count_cannot_mask_a_multisource_truncation(
+    tmp_path: Path, capsys: Any, monkeypatch: Any
+) -> None:
+    db = tmp_path / "market.db"
+    connection = sqlite3.connect(db)
+    try:
+        cli._ensure_run_history_table(connection)
+        connection.executemany(
+            "INSERT INTO published_candidate_coverage("
+            "scope, source_id, expected_date, loaded_date, instrument_count, missing_ratios_json, dataset_id, published_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            [
+                ('{"sources": ["amfi-nav", "nse-eod"]}', "amfi-nav", "2026-09-01", "2026-09-01", 100, "{}", "baseline", "2026-09-01T00:00:00Z"),
+                ('{"sources": ["amfi-nav", "nse-eod"]}', "nse-eod", "2026-09-01", "2026-09-01", 100, "{}", "baseline", "2026-09-01T00:00:00Z"),
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    candidate = {
+        "dataset_id": "candidate",
+        "effective_date": "2026-09-02",
+        "tables": {
+            "sources": [
+                {"source_id": "amfi-nav", "effective_date": "2026-09-02"},
+                {"source_id": "nse-eod", "effective_date": "2026-09-02"},
+            ],
+            "instruments": (
+                [{"provider": "amfi", "metadata": {"source_id": "amfi-nav"}} for _ in range(50)]
+                + [{"provider": "nse", "metadata": {"source_id": "nse-eod"}} for _ in range(200)]
+            ),
+        },
+    }
+    monkeypatch.setattr(
+        cli, "run_daily", lambda *args, **kwargs: BackfillResult(date(2026, 9, 2), date(2026, 9, 2), 0, 0)
+    )
+    monkeypatch.setattr(cli, "build_candidate", lambda *args, **kwargs: DatasetBuild(candidate, {}, {}, {}, ()))
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"artifacts": []}), encoding="utf-8")
+
+    exit_code = cli.main([
+        "--db", str(db), "daily", "--date", "2026-09-02", "--manifest", str(manifest),
+        "--source", "amfi-nav", "--source", "nse-eod", "--previous-count", "200",
+    ])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code != 0, payload
+    assert any("source amfi-nav coverage" in reason for reason in payload["blocking_reasons"])
 
 
 def test_instrument_truncation_blocks_and_preserves_the_active_dataset(tmp_path: Path, capsys: Any) -> None:

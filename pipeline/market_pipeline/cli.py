@@ -200,10 +200,13 @@ def _candidate_coverage(
     if build is not None:
         for source in build.candidate["tables"]["sources"]:
             loaded_dates[str(source["source_id"])] = date.fromisoformat(str(source["effective_date"]))
-        # The current candidate has one wired normalizer (AMFI); source-specific
-        # counting stays explicit so future sources cannot inherit file totals.
-        if "amfi-nav" in counts:
-            counts["amfi-nav"] = len(build.candidate["tables"]["instruments"])
+        for instrument in build.candidate["tables"]["instruments"]:
+            metadata = instrument.get("metadata", {})
+            source_id = instrument.get("source_id") or metadata.get("source_id")
+            if source_id is None and instrument.get("provider") == "amfi":
+                source_id = "amfi-nav"
+            if source_id in counts:
+                counts[str(source_id)] += 1
     coverage: list[CandidateCoverage] = []
     for source_id in sources:
         expected = _expected_date(source_id, effective_date)
@@ -309,16 +312,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     # for this scope (a genuine first-ever run) do we fall back to comparing
     # the candidate against itself (ratio 1.0), which still leaves source
     # failures and the budget check as protection.
+    source_baselines = _last_published_candidate_coverage(connection, sources)
     if args.previous_count is not None:
         previous_count = args.previous_count
+        # Keep the legacy aggregate override for a one-source invocation, but
+        # never let it hide a per-source drop in a multi-source candidate.
+        if len(coverage) <= 1:
+            source_baselines = ()
     else:
-        source_baselines = _last_published_candidate_coverage(connection, sources)
         previous_count = (
             sum(item.instrument_count for item in source_baselines)
             if source_baselines else sum(item.instrument_count for item in coverage)
         )
-    if args.previous_count is not None:
-        source_baselines = ()
     reconciliation = reconcile(
         previous=previous_count,
         candidate=sum(item.instrument_count for item in coverage),
