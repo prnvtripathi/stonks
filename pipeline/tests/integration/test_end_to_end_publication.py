@@ -134,6 +134,12 @@ def test_manifest_flows_from_raw_artifact_to_a_promoted_queryable_dataset(tmp_pa
     # Analytics use the Task 8 fractional convention, never percentage points.
     assert metrics[(by_symbol["119553"], "return_12m")][0] < 0
 
+    benchmark_rows = _active_rows(db, "latest_metrics", "metric, state, metadata_json")
+    benchmark_rows = [row for row in benchmark_rows if row[0].startswith("benchmark_rs_")]
+    assert len(benchmark_rows) == len(SCHEMES) * 3
+    assert all(row[1] == "missing" for row in benchmark_rows)
+    assert all(json.loads(row[2])["reason"] == "official benchmark mapping is unavailable" for row in benchmark_rows)
+
     # Momentum provenance was attached through the publication seam.
     momentum = [row for row in _active_rows(db, "latest_metrics", "instrument_id, metric, metadata_json") if row[1] == "momentum_score"]
     assert len(momentum) == len(SCHEMES)

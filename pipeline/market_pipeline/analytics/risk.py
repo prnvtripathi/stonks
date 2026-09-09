@@ -9,7 +9,8 @@ from typing import Any
 
 from market_pipeline.analytics._utils import Point, coerce_points, endpoint_index, ratio
 
-FORMULA_VERSION = "risk-v1"
+FORMULA_VERSION = "risk-v2-252-session"
+RISK_RETURN_SESSIONS = 252
 
 
 @dataclass(frozen=True)
@@ -65,18 +66,21 @@ def calculate_risk(
     points = coerce_points(observations)
     end = endpoint_index(points, effective_date)
     window = points[: end + 1] if end is not None else ()
-    daily_returns = [ratio(current.value, prior.value) for prior, current in zip(window, window[1:])]
+    risk_window = window[-(RISK_RETURN_SESSIONS + 1):]
+    daily_returns = [ratio(current.value, prior.value) for prior, current in zip(risk_window, risk_window[1:])]
     valid_returns = [value for value in daily_returns if value is not None]
+    coverage = Decimal(len(valid_returns)) / Decimal(RISK_RETURN_SESSIONS)
+    has_full_risk_window = len(risk_window) == RISK_RETURN_SESSIONS + 1 and coverage == Decimal(1)
     volatility: Decimal | None = None
-    if len(valid_returns) >= 2:
+    if has_full_risk_window:
         mean = sum(valid_returns, Decimal(0)) / Decimal(len(valid_returns))
         variance = sum((value - mean) ** 2 for value in valid_returns) / Decimal(len(valid_returns) - 1)
         volatility = variance.sqrt() * Decimal(252).sqrt()
     drawdown: Decimal | None = None
-    if window:
-        peak = window[0].value
+    if has_full_risk_window:
+        peak = risk_window[0].value
         drawdowns: list[Decimal] = []
-        for point in window:
+        for point in risk_window:
             peak = max(peak, point.value)
             if peak != 0:
                 drawdowns.append(point.value / peak - Decimal(1))
@@ -98,5 +102,5 @@ def calculate_risk(
         ),
         weekly_average_volume=_window_average(window, len(window) - 1 if window else None, 5, volume=True),
         effective_date=window[-1].effective_date if window else None,
-        coverage=Decimal(len(valid_returns)) / Decimal(max(len(window) - 1, 1)),
+        coverage=coverage,
     )

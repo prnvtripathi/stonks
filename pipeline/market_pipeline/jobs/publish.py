@@ -32,7 +32,6 @@ from market_pipeline.analytics import rs as rs_analytics
 from market_pipeline.analytics.momentum import MomentumScore, momentum_scores
 from market_pipeline.analytics.returns import ReturnMetrics, calculate_returns
 from market_pipeline.analytics.risk import RiskMetrics, calculate_risk
-from market_pipeline.analytics.rs import benchmark_rs
 from market_pipeline.normalization import amfi as amfi_normalization
 from market_pipeline.normalization.amfi import AmfiScheme, normalize_amfi_schemes
 from market_pipeline.publication.input_manifest import InputManifestError, manifest_with_fingerprint
@@ -209,26 +208,6 @@ def _metric_row(
     }
 
 
-def _category_composite(
-    returns_by_instrument: Mapping[str, ReturnMetrics],
-    categories: Mapping[str, str],
-    field_name: str,
-) -> dict[str, Decimal]:
-    """Equal-weighted composite return per AMFI category, used as the benchmark."""
-
-    grouped: dict[str, list[Decimal]] = {}
-    for instrument_id, metrics in returns_by_instrument.items():
-        value = getattr(metrics, field_name)
-        if value is None:
-            continue
-        grouped.setdefault(categories[instrument_id], []).append(value)
-    return {
-        category: sum(values, Decimal(0)) / Decimal(len(values))
-        for category, values in grouped.items()
-        if len(values) >= 2
-    }
-
-
 def _category_ranks(
     returns_by_instrument: Mapping[str, ReturnMetrics],
     categories: Mapping[str, str],
@@ -330,10 +309,6 @@ def build_candidate(
     if not instruments:
         raise PublicationInputError("no instrument reported an observation on the published effective date")
 
-    composites = {
-        metric: _category_composite(returns_by_instrument, categories, field_name)
-        for metric, field_name in BENCHMARK_WINDOWS
-    }
     ranks = _category_ranks(returns_by_instrument, categories)
 
     metrics: list[dict[str, Any]] = []
@@ -365,19 +340,13 @@ def build_candidate(
                 formula_version=CATEGORY_RANK_FORMULA_VERSION, source_artifact_id=artifact_id,
             metadata={"unit": "count", "cohort": f"amfi-category:{category}"},
         ))
-        for metric, field_name in BENCHMARK_WINDOWS:
-            asset = getattr(returns, field_name)
-            benchmark = composites[metric].get(category)
-            value: Decimal | None = None
-            if asset is not None and benchmark is not None and Decimal(1) + benchmark != 0:
-                value = benchmark_rs(asset, benchmark)
+        for metric, _ in BENCHMARK_WINDOWS:
             metrics.append(_metric_row(
-                instrument_id, effective, metric, value,
+                instrument_id, effective, metric, None,
                 formula_version=rs_analytics.FORMULA_VERSION, source_artifact_id=artifact_id,
                 metadata={
                     "unit": "percent",
-                    "benchmark": f"amfi-category-composite:{category}",
-                    "benchmark_return": str(benchmark) if benchmark is not None else None,
+                    "reason": "official benchmark mapping is unavailable",
                 },
             ))
         momentum_components: dict[str, Any] = {
