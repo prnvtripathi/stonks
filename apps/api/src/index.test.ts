@@ -306,6 +306,21 @@ describe("private research API", () => {
     expect((await store.listRuns("screen-1")).map((run) => run.id)).toEqual(["a-uuid", "z-uuid"]);
   });
 
+  it("uses the most recently completed run for default results and transitions", async () => {
+    const store = new MemoryResearchStore("dataset-1");
+    const screen = await store.createScreen({ name: "Volume", source: "Volume > 1", languageVersion: "v1", createdAt: "2026-01-01", updatedAt: "2026-01-01" });
+    store.instruments.set("old", { instrumentId: "old", symbol: "OLD", name: "Old", assetClass: "equity", active: true, metrics: { volume: 2 } });
+    await store.runScreen("dataset-1", screen, "2026-09-10", "2026-09-09T10:00:00.000Z");
+    store.instruments.set("old", { instrumentId: "old", symbol: "OLD", name: "Old", assetClass: "equity", active: false, metrics: { volume: 2 } });
+    store.instruments.set("latest", { instrumentId: "latest", symbol: "LATEST", name: "Latest", assetClass: "equity", active: true, metrics: { volume: 2 } });
+    const latest = await store.runScreen("dataset-1", screen, "2026-09-04", "2026-09-09T11:00:00.000Z");
+
+    expect((await store.listRuns(screen.id))[0]?.id).toBe(latest.id);
+
+    const next = await store.runScreen("dataset-1", screen, "2026-09-03", "2026-09-09T12:00:00.000Z");
+    expect(next.matches.find((match) => match.instrumentId === "latest")).toMatchObject({ entered: false, exited: false });
+  });
+
   it("inverts only known predicate outcomes for odd NOT parity", () => {
     const item = { instrumentId: "ONE", symbol: "ONE", name: "One", assetClass: "equity" as const, active: true, metricRows: [{ metric: "volume", value: 3, state: "present" as const }] };
     expect(buildExplanation("NOT Volume > 5", item).clauses?.[0]?.result).toBe("Matched");

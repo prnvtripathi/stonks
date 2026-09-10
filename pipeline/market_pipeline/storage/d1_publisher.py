@@ -36,6 +36,20 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def upgrade_immutable_screen_run_schema(connection: sqlite3.Connection) -> None:
+    """Apply 0007's additive columns once for repeatable local initialization."""
+
+    additions = {
+        "screen_runs": {"source": "TEXT", "language_version": "TEXT"},
+        "screen_matches": {"symbol": "TEXT", "name": "TEXT", "asset_class": "TEXT"},
+    }
+    for table, columns in additions.items():
+        existing = {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")}
+        for column, column_type in columns.items():
+            if column not in existing:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+
+
 @dataclass(frozen=True)
 class DatasetCandidate:
     dataset_id: str
@@ -119,8 +133,10 @@ class D1Publisher:
         self.connection.executescript(snapshots_migration.read_text(encoding="utf-8"))
         bounded_snapshots_migration = Path(__file__).resolve().parents[3] / "db" / "migrations" / "0006_bounded_instrument_snapshots.sql"
         self.connection.executescript(bounded_snapshots_migration.read_text(encoding="utf-8"))
-        immutable_runs_migration = Path(__file__).resolve().parents[3] / "db" / "migrations" / "0007_immutable_screen_run_snapshots.sql"
-        self.connection.executescript(immutable_runs_migration.read_text(encoding="utf-8"))
+        # Wrangler applies 0007 exactly once in D1. Local initialization is
+        # intentionally repeatable, so use the same additive schema upgrade
+        # without replaying its non-idempotent ALTER TABLE statements.
+        upgrade_immutable_screen_run_schema(self.connection)
         self.connection.commit()
 
     def active_dataset_id(self) -> str | None:

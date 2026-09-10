@@ -30,6 +30,17 @@ def test_forward_migrations_upgrade_existing_and_fresh_databases() -> None:
     assert "dataset_id" not in {row[1] for row in legacy.execute("PRAGMA table_info(saved_screens)").fetchall()}
     assert {"source", "language_version"} <= {row[1] for row in legacy.execute("PRAGMA table_info(screen_runs)").fetchall()}
     assert {"symbol", "name", "asset_class"} <= {row[1] for row in legacy.execute("PRAGMA table_info(screen_matches)").fetchall()}
+    legacy.execute("INSERT INTO active_dataset(singleton, dataset_id, changed_at) VALUES (1, 'legacy', '2026-09-01T00:00:00Z')")
+    legacy.execute("INSERT INTO instrument_snapshots(instrument_id, dataset_id, symbol, name, asset_class, active) VALUES ('old', 'legacy', 'OLD', 'Old instrument', 'equity', 1)")
+    legacy.execute("INSERT INTO screen_runs(dataset_id, run_id, screen_id, effective_date, status, result_count, source, language_version, completed_at) VALUES ('legacy', 'run-1', 'screen-1', '2026-09-01', 'complete', 1, 'Volume > 100', 'v1', '2026-09-01T12:00:00Z')")
+    legacy.execute("INSERT INTO screen_matches(dataset_id, run_id, ordinal, instrument_id, score, symbol, name, asset_class, explanation_json, entered, exited) VALUES ('legacy', 'run-1', 1, 'old', 10, 'OLD', 'Old instrument', 'equity', '{\"matched\":true}', 1, 0)")
+    legacy.commit()
+
+    D1Publisher(legacy).initialize_schema()
+
+    assert legacy.execute("SELECT symbol, name FROM instrument_snapshots WHERE instrument_id='old'").fetchone() == ("OLD", "Old instrument")
+    assert legacy.execute("SELECT source, language_version FROM screen_runs WHERE run_id='run-1'").fetchone() == ("Volume > 100", "v1")
+    assert legacy.execute("SELECT symbol, explanation_json FROM screen_matches WHERE run_id='run-1'").fetchone() == ("OLD", '{"matched":true}')
 
     fresh = sqlite3.connect(":memory:")
     D1Publisher(fresh).initialize_schema()

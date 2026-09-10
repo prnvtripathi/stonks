@@ -61,7 +61,7 @@ export class MemoryResearchStore implements ResearchStore {
     return [...this.runs.entries()]
       .filter(([key]) => key.endsWith(`:${screenId}`))
       .flatMap(([, runs]) => runs)
-      .sort((left, right) => right.effectiveDate.localeCompare(left.effectiveDate) || (right.completedAt ?? "").localeCompare(left.completedAt ?? "") || right.id.localeCompare(left.id));
+      .sort(compareRunsByLatestExecution);
   }
   public async runScreen(datasetId: string, screen: SavedScreen, effectiveDate: string, completedAt = new Date().toISOString()): Promise<RunDetail> {
     const parsed = parseQuery(screen.source);
@@ -108,7 +108,7 @@ export class D1ResearchStore implements ResearchStore {
     ensureD1Success(result);
     return { ...existing, name: input.name, source: input.source, updatedAt: input.updatedAt };
   }
-  public async listRuns(screenId: string): Promise<RunDetail[]> { const result = await this.db.prepare("SELECT run_id, screen_id, dataset_id, effective_date, completed_at, result_count, status, source, language_version FROM screen_runs WHERE screen_id = ? ORDER BY effective_date DESC, completed_at DESC, run_id DESC").bind(screenId).all<Record<string, unknown>>(); return Promise.all(result.results.map(async (row) => { const matches = await this.db.prepare("SELECT instrument_id, ordinal, score, symbol, name, asset_class, explanation_json, entered, exited FROM screen_matches WHERE dataset_id = ? AND run_id = ? ORDER BY ordinal").bind(String(row.dataset_id), String(row.run_id)).all<Record<string, unknown>>(); return { id: String(row.run_id), screenId: String(row.screen_id), datasetId: String(row.dataset_id), effectiveDate: String(row.effective_date), ...(row.completed_at ? { completedAt: String(row.completed_at) } : {}), matchCount: Number(row.result_count), status: row.status === "failed" ? "failed" : "complete", source: row.source == null ? null : String(row.source), languageVersion: row.language_version == null ? null : String(row.language_version), matches: matches.results.map((match) => ({ instrumentId: String(match.instrument_id), rank: match.exited ? 0 : Number(match.ordinal), score: match.score == null ? null : Number(match.score), symbol: match.symbol == null ? null : String(match.symbol), name: match.name == null ? null : String(match.name), assetClass: match.asset_class == null ? null : String(match.asset_class) as AssetClass, explanation: parseExplanation(match.explanation_json), entered: Boolean(match.entered), exited: Boolean(match.exited) })) }; }));
+  public async listRuns(screenId: string): Promise<RunDetail[]> { const result = await this.db.prepare("SELECT run_id, screen_id, dataset_id, effective_date, completed_at, result_count, status, source, language_version FROM screen_runs WHERE screen_id = ? ORDER BY CASE WHEN completed_at IS NOT NULL AND julianday(completed_at) IS NOT NULL THEN 0 ELSE 1 END ASC, CASE WHEN completed_at IS NOT NULL AND julianday(completed_at) IS NOT NULL THEN completed_at END DESC, effective_date DESC, run_id DESC").bind(screenId).all<Record<string, unknown>>(); return Promise.all(result.results.map(async (row) => { const matches = await this.db.prepare("SELECT instrument_id, ordinal, score, symbol, name, asset_class, explanation_json, entered, exited FROM screen_matches WHERE dataset_id = ? AND run_id = ? ORDER BY ordinal").bind(String(row.dataset_id), String(row.run_id)).all<Record<string, unknown>>(); return { id: String(row.run_id), screenId: String(row.screen_id), datasetId: String(row.dataset_id), effectiveDate: String(row.effective_date), ...(row.completed_at ? { completedAt: String(row.completed_at) } : {}), matchCount: Number(row.result_count), status: row.status === "failed" ? "failed" : "complete", source: row.source == null ? null : String(row.source), languageVersion: row.language_version == null ? null : String(row.language_version), matches: matches.results.map((match) => ({ instrumentId: String(match.instrument_id), rank: match.exited ? 0 : Number(match.ordinal), score: match.score == null ? null : Number(match.score), symbol: match.symbol == null ? null : String(match.symbol), name: match.name == null ? null : String(match.name), assetClass: match.asset_class == null ? null : String(match.asset_class) as AssetClass, explanation: parseExplanation(match.explanation_json), entered: Boolean(match.entered), exited: Boolean(match.exited) })) }; }));
   }
   public async runScreen(datasetId: string, screen: SavedScreen, effectiveDate: string, completedAt = new Date().toISOString()): Promise<RunDetail> {
     const parsed = parseQuery(screen.source);
@@ -140,6 +140,23 @@ export class D1ResearchStore implements ResearchStore {
   public async listGlossary(): Promise<readonly GlossaryEntry[]> { return DEFAULT_GLOSSARY_ENTRIES; }
   public async glossary(slug: string): Promise<GlossaryEntry | null> { return DEFAULT_GLOSSARY_ENTRIES.find((entry) => entry.slug === slug) ?? null; }
   private screen(row: Record<string, unknown>): SavedScreen { return { id: String(row.screen_id), name: String(row.name), source: String(row.expression), languageVersion: "v1", createdAt: String(row.created_at), updatedAt: String(row.updated_at) }; }
+}
+
+function compareRunsByLatestExecution(left: RunDetail, right: RunDetail): number {
+  const leftExecution = validExecutionTime(left.completedAt);
+  const rightExecution = validExecutionTime(right.completedAt);
+  if (leftExecution !== null || rightExecution !== null) {
+    if (leftExecution === null) return 1;
+    if (rightExecution === null) return -1;
+    if (leftExecution !== rightExecution) return rightExecution - leftExecution;
+  }
+  return right.effectiveDate.localeCompare(left.effectiveDate) || right.id.localeCompare(left.id);
+}
+
+function validExecutionTime(value: string | undefined): number | null {
+  if (!value) return null;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : null;
 }
 
 function parseExplanation(value: unknown): Explanation { if (typeof value !== "string") return { matched: true, text: "", metrics: [] }; try { const parsed: unknown = JSON.parse(value); if (typeof parsed === "object" && parsed !== null && "matched" in parsed && "text" in parsed && "metrics" in parsed && Array.isArray(parsed.metrics)) { const record = parsed as Record<string, unknown>; const metrics = record.metrics as readonly unknown[]; return { matched: Boolean(record.matched), text: String(record.text), metrics: metrics.map(String), ...(Array.isArray(record.clauses) ? { clauses: record.clauses as ExplanationClause[] } : {}), ...(typeof record.momentum === "object" && record.momentum !== null ? { momentum: record.momentum as MomentumBreakdown } : {}) }; } } catch { /* corrupted explanation is represented, not executed */ } return { matched: true, text: "", metrics: [] }; }
