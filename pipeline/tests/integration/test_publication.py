@@ -17,7 +17,7 @@ from market_pipeline.storage.history_store import (
 )
 
 
-def test_corporate_actions_forward_migration_upgrades_existing_and_fresh_databases() -> None:
+def test_forward_migrations_upgrade_existing_and_fresh_databases() -> None:
     migration_dir = Path(__file__).resolve().parents[3] / "db" / "migrations"
     legacy = sqlite3.connect(":memory:")
     legacy.executescript((migration_dir / "0001_market_schema.sql").read_text(encoding="utf-8"))
@@ -28,11 +28,15 @@ def test_corporate_actions_forward_migration_upgrades_existing_and_fresh_databas
     assert legacy.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='corporate_actions'").fetchone() is not None
     assert legacy.execute("SELECT name, expression FROM saved_screens WHERE screen_id='screen-1'").fetchone() == ("Legacy", "Volume > 1")
     assert "dataset_id" not in {row[1] for row in legacy.execute("PRAGMA table_info(saved_screens)").fetchall()}
+    assert {"source", "language_version"} <= {row[1] for row in legacy.execute("PRAGMA table_info(screen_runs)").fetchall()}
+    assert {"symbol", "name", "asset_class"} <= {row[1] for row in legacy.execute("PRAGMA table_info(screen_matches)").fetchall()}
 
     fresh = sqlite3.connect(":memory:")
     D1Publisher(fresh).initialize_schema()
     assert fresh.execute("PRAGMA table_info(corporate_actions)").fetchall()
     assert fresh.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_corporate_actions_instrument'").fetchone() is not None
+    assert {"source", "language_version"} <= {row[1] for row in fresh.execute("PRAGMA table_info(screen_runs)").fetchall()}
+    assert {"symbol", "name", "asset_class"} <= {row[1] for row in fresh.execute("PRAGMA table_info(screen_matches)").fetchall()}
 
 
 def test_publish_attaches_equity_and_mutual_fund_momentum_provenance() -> None:

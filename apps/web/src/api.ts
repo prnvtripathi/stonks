@@ -91,7 +91,7 @@ export interface ResultMatchDto {
   readonly exited: boolean;
   readonly symbol?: string | null;
   readonly name?: string | null;
-  readonly assetClass?: AssetClass;
+  readonly assetClass?: AssetClass | null;
   readonly explanation?: ExplanationDto;
   readonly momentum?: MomentumBreakdownDto;
 }
@@ -100,7 +100,7 @@ export interface ChartPointDto { readonly date: string; readonly value: number |
 export interface ChartDto { readonly points: readonly ChartPointDto[]; readonly valueLabel?: string; readonly sourceDate?: string | null; }
 export interface ScreenResultsDto {
   readonly screen: SavedScreen;
-  readonly run: ScreenRun & { readonly matches: readonly ResultMatchDto[] };
+  readonly run: ScreenRun & { readonly isCurrentDataset: boolean; readonly isCurrentQuery: boolean; readonly matches: readonly ResultMatchDto[] };
   readonly pagination: Page<ResultMatchDto>["pagination"];
 }
 

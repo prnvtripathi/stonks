@@ -197,23 +197,21 @@ async function getResults(screenId: string, url: URL, store: ResearchStore): Pro
   const screen = await store.getScreen(screenId);
   if (!screen) return error(404, "Screen not found");
   const datasetId = await store.activeDatasetId();
-  if (!datasetId) return error(503, "No active dataset");
   const pagination = readPagination(url);
   if (!pagination) return error(400, "Invalid pagination");
   const sort = url.searchParams.get("sort") ?? "rank";
   if (!(new Set(["rank", "score", "symbol", "assetClass"])).has(sort)) return error(400, "Invalid sort");
   const direction = url.searchParams.get("direction") ?? (sort === "score" ? "desc" : "asc");
   if (direction !== "asc" && direction !== "desc") return error(400, "Invalid sort direction");
-  const runs = (await store.listRuns(screenId)).filter((candidate) => candidate.datasetId === datasetId && candidate.status === "complete");
+  const runs = (await store.listRuns(screenId)).filter((candidate) => candidate.status === "complete");
   const requestedRunId = url.searchParams.get("runId");
   const run = (requestedRunId ? runs.find((candidate) => candidate.id === requestedRunId) : runs[0]) ?? null;
   if (!run) return error(404, "Run not found");
-  const enriched = await Promise.all(run.matches.filter((match) => !match.exited).map(async (match) => {
-    const instrument = await store.instrument(datasetId, match.instrumentId);
+  const enriched = run.matches.filter((match) => !match.exited).map((match) => {
     const explanation = match.explanation;
     const momentum = match.momentum ?? explanation.momentum;
-    return { ...match, symbol: instrument?.symbol ?? null, name: instrument?.name ?? null, ...(instrument?.assetClass ? { assetClass: instrument.assetClass } : {}), explanation, ...(momentum ? { momentum } : {}) };
-  }));
+    return { ...match, explanation, ...(momentum ? { momentum } : {}) };
+  });
   const ordered = [...enriched].sort((left, right) => {
     const leftValue = sort === "symbol" ? left.symbol ?? "" : sort === "assetClass" ? left.assetClass ?? "" : left[sort as "rank" | "score"] ?? -Infinity;
     const rightValue = sort === "symbol" ? right.symbol ?? "" : sort === "assetClass" ? right.assetClass ?? "" : right[sort as "rank" | "score"] ?? -Infinity;
@@ -221,7 +219,7 @@ async function getResults(screenId: string, url: URL, store: ResearchStore): Pro
     return (direction === "asc" ? comparison : -comparison) || left.instrumentId.localeCompare(right.instrumentId);
   });
   const { limit, offset } = pagination;
-  return json({ screen, run: { ...run, matches: ordered.slice(offset, offset + limit) }, pagination: { limit, offset, total: ordered.length } });
+  return json({ screen, run: { ...run, isCurrentDataset: run.datasetId === datasetId, isCurrentQuery: run.source !== null && run.source !== undefined && run.source === screen.source && run.languageVersion === screen.languageVersion, matches: ordered.slice(offset, offset + limit) }, pagination: { limit, offset, total: ordered.length } });
 }
 async function getScreen(screenId: string, store: ResearchStore): Promise<Response> {
   const screen = await store.getScreen(screenId);
@@ -232,7 +230,10 @@ async function runScreen(screenId: string, store: ResearchStore, now: () => Date
   if (!datasetId) return error(503, "No active dataset");
   const screen = await store.getScreen(screenId);
   if (!screen) return error(404, "Screen not found");
-  return json(await store.runScreen(datasetId, screen, now().toISOString().slice(0, 10)), 201);
+  const completedAt = now().toISOString();
+  const status = await store.status(datasetId);
+  if (!status.effectiveDate) return error(503, "Dataset effective date is unavailable");
+  return json(await store.runScreen(datasetId, screen, status.effectiveDate, completedAt), 201);
 }
 async function getInstrument(instrumentId: string, store: ResearchStore): Promise<Response> {
   const datasetId = await store.activeDatasetId();

@@ -119,6 +119,8 @@ class D1Publisher:
         self.connection.executescript(snapshots_migration.read_text(encoding="utf-8"))
         bounded_snapshots_migration = Path(__file__).resolve().parents[3] / "db" / "migrations" / "0006_bounded_instrument_snapshots.sql"
         self.connection.executescript(bounded_snapshots_migration.read_text(encoding="utf-8"))
+        immutable_runs_migration = Path(__file__).resolve().parents[3] / "db" / "migrations" / "0007_immutable_screen_run_snapshots.sql"
+        self.connection.executescript(immutable_runs_migration.read_text(encoding="utf-8"))
         self.connection.commit()
 
     def active_dataset_id(self) -> str | None:

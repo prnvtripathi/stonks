@@ -21,7 +21,7 @@ function fakeApi(): DashboardApi {
     getMetrics: vi.fn(async () => metrics),
     getScreens: vi.fn(async () => ({ data: screens, pagination: { limit: 50, offset: 0, total: 1 } })),
     createScreen: vi.fn(async (input: { readonly name: string; readonly source: string }) => ({ ...screens[0]!, ...input, id: "screen-new" })),
-    runScreen: vi.fn(async () => ({ id: "run-1", screenId: "screen-1", datasetId: "dataset-a", effectiveDate: "2026-09-04", matchCount: 3, status: "complete" as const, matches: [] })),
+    runScreen: vi.fn(async () => ({ id: "run-1", screenId: "screen-1", datasetId: "dataset-a", effectiveDate: "2026-09-04", matchCount: 3, status: "complete" as const, source: "Volume > 500000", languageVersion: "v1", matches: [] })),
   };
 }
 

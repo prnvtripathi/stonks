@@ -243,6 +243,42 @@ describe("private research API", () => {
     expect(body.run.matches[0]).toMatchObject({ symbol: "INFY", explanation: { clauses: expect.any(Array), momentum: { coverage: 1 } } });
   });
 
+  it("keeps an explicit saved run immutable across a publication and screen edit", async () => {
+    const store = new MemoryResearchStore("dataset-a");
+    store.instruments.set("old", { instrumentId: "old", symbol: "OLD_SYMBOL", name: "Old company", assetClass: "equity", active: true, metrics: { volume: 200 } });
+    const api = createApi({ env, store, now: () => new Date("2026-09-09T12:00:00.000Z"), accessVerifier: createTestAccessVerifier("test-secret"), testAccessSecret: "test-secret" });
+    const bearer = await api.issueTestToken({ email: "owner@example.com" });
+    const headers = { Authorization: `Bearer ${bearer}`, "Content-Type": "application/json", Origin: env.allowedOrigin };
+    const created = await api.fetch(request("/api/v1/screens", { method: "POST", headers, body: JSON.stringify({ name: "Volume", source: "Volume > 100" }) }));
+    const screen = await created.json() as { id: string };
+    const runResponse = await api.fetch(request(`/api/v1/screens/${screen.id}/runs`, { method: "POST", headers }));
+    const oldRun = await runResponse.json() as { id: string; effectiveDate: string; completedAt: string };
+
+    store.setActiveDataset("dataset-b");
+    store.instruments.clear();
+    await api.fetch(request(`/api/v1/screens/${screen.id}`, { method: "PUT", headers, body: JSON.stringify({ name: "Volume", source: "Volume > 1000" }) }));
+
+    const response = await api.fetch(request(`/api/v1/screens/${screen.id}/results?runId=${oldRun.id}`, { headers }));
+    expect(response.status).toBe(200);
+    const body = await response.json() as { screen: { source: string }; run: { datasetId: string; effectiveDate: string; completedAt: string; source: string | null; languageVersion: string | null; isCurrentDataset: boolean; isCurrentQuery: boolean; matches: { symbol: string | null; name: string | null; assetClass: string | null }[] } };
+    expect(body.screen.source).toBe("Volume > 1000");
+    expect(body.run).toMatchObject({ datasetId: "dataset-a", effectiveDate: "2026-09-04", completedAt: "2026-09-09T12:00:00.000Z", source: "Volume > 100", languageVersion: "v1", isCurrentDataset: false, isCurrentQuery: false });
+    expect(body.run.matches[0]).toMatchObject({ symbol: "OLD_SYMBOL", name: "Old company", assetClass: "equity" });
+  });
+
+  it("uses the dataset effective date rather than the execution date for new runs", async () => {
+    const store = new MemoryResearchStore("dataset-a");
+    store.instruments.set("one", { instrumentId: "one", symbol: "ONE", name: "One", assetClass: "equity", active: true, metrics: { volume: 2 } });
+    const api = createApi({ env, store, now: () => new Date("2026-09-09T12:00:00.000Z"), accessVerifier: createTestAccessVerifier("test-secret"), testAccessSecret: "test-secret" });
+    const bearer = await api.issueTestToken({ email: "owner@example.com" });
+    const headers = { Authorization: `Bearer ${bearer}`, "Content-Type": "application/json", Origin: env.allowedOrigin };
+    const created = await api.fetch(request("/api/v1/screens", { method: "POST", headers, body: JSON.stringify({ name: "Volume", source: "Volume > 1" }) }));
+    const screen = await created.json() as { id: string };
+    const response = await api.fetch(request(`/api/v1/screens/${screen.id}/runs`, { method: "POST", headers }));
+    expect(response.status).toBe(201);
+    expect(await response.json()).toMatchObject({ effectiveDate: "2026-09-04", completedAt: "2026-09-09T12:00:00.000Z" });
+  });
+
   it("explains only saved AST predicates with boolean context and tri-state values", async () => {
     const store = new MemoryResearchStore("dataset-1");
     store.instruments.set("ONE", { instrumentId: "ONE", symbol: "ONE", name: "One", assetClass: "equity", active: true, metricRows: [
@@ -264,8 +300,8 @@ describe("private research API", () => {
   it("orders same-day runs by completion time before the stable ID", async () => {
     const store = new MemoryResearchStore("dataset-1");
     store.runs.set("dataset-1:screen-1", [
-      { id: "z-uuid", screenId: "screen-1", datasetId: "dataset-1", effectiveDate: "2026-09-07", completedAt: "2026-09-07T10:00:00.000Z", matchCount: 0, status: "complete", matches: [] },
-      { id: "a-uuid", screenId: "screen-1", datasetId: "dataset-1", effectiveDate: "2026-09-07", completedAt: "2026-09-07T11:00:00.000Z", matchCount: 0, status: "complete", matches: [] },
+      { id: "z-uuid", screenId: "screen-1", datasetId: "dataset-1", effectiveDate: "2026-09-07", completedAt: "2026-09-07T10:00:00.000Z", matchCount: 0, status: "complete", source: null, languageVersion: null, matches: [] },
+      { id: "a-uuid", screenId: "screen-1", datasetId: "dataset-1", effectiveDate: "2026-09-07", completedAt: "2026-09-07T11:00:00.000Z", matchCount: 0, status: "complete", source: null, languageVersion: null, matches: [] },
     ]);
     expect((await store.listRuns("screen-1")).map((run) => run.id)).toEqual(["a-uuid", "z-uuid"]);
   });
@@ -319,7 +355,7 @@ describe("private research API", () => {
     const state: {
       present: boolean;
       runs: { runId: string; screenId: string; datasetId: string; effectiveDate: string; resultCount: number; status: string }[];
-      matches: { datasetId: string; runId: string; ordinal: number; instrumentId: string; score: number | null; explanation: string; entered: number; exited: number }[];
+      matches: { datasetId: string; runId: string; ordinal: number; instrumentId: string; score: number | null; symbol: string | null; name: string | null; assetClass: string | null; explanation: string; entered: number; exited: number }[];
     } = { present: true, runs: [], matches: [] };
     class HistoryStatement implements D1Statement {
       private values: unknown[] = [];
@@ -329,11 +365,11 @@ describe("private research API", () => {
       async all<T extends Record<string, unknown> = Record<string, unknown>>(): Promise<{ results: readonly T[] }> {
         if (this.sql.includes("FROM instrument_snapshots AS i")) return { results: (state.present ? [{ instrument_id: "one", score: 10 }] : []) as unknown as readonly T[] };
         if (this.sql.includes("FROM screen_runs")) return { results: [...state.runs].sort((left, right) => right.effectiveDate.localeCompare(left.effectiveDate) || right.runId.localeCompare(left.runId)).map((run) => ({ run_id: run.runId, screen_id: run.screenId, dataset_id: run.datasetId, effective_date: run.effectiveDate, result_count: run.resultCount, status: run.status })) as unknown as readonly T[] };
-        if (this.sql.includes("FROM screen_matches")) return { results: state.matches.filter((match) => match.runId === String(this.values[1])).map((match) => ({ instrument_id: match.instrumentId, ordinal: match.ordinal, score: match.score, explanation_json: match.explanation, entered: match.entered, exited: match.exited })) as unknown as readonly T[] };
+        if (this.sql.includes("FROM screen_matches")) return { results: state.matches.filter((match) => match.runId === String(this.values[1])).map((match) => ({ instrument_id: match.instrumentId, ordinal: match.ordinal, score: match.score, symbol: match.symbol, name: match.name, asset_class: match.assetClass, explanation_json: match.explanation, entered: match.entered, exited: match.exited })) as unknown as readonly T[] };
         return { results: [] };
       }
       async run(): Promise<D1Result> {
-        if (this.sql.includes("INSERT INTO screen_matches")) state.matches.push({ datasetId: String(this.values[0]), runId: String(this.values[1]), ordinal: Number(this.values[2]), instrumentId: String(this.values[3]), score: this.values[4] == null ? null : Number(this.values[4]), explanation: String(this.values[5]), entered: Number(this.values[6]), exited: Number(this.values[7]) });
+        if (this.sql.includes("INSERT INTO screen_matches")) state.matches.push({ datasetId: String(this.values[0]), runId: String(this.values[1]), ordinal: Number(this.values[2]), instrumentId: String(this.values[3]), score: this.values[4] == null ? null : Number(this.values[4]), symbol: this.values[5] == null ? null : String(this.values[5]), name: this.values[6] == null ? null : String(this.values[6]), assetClass: this.values[7] == null ? null : String(this.values[7]), explanation: String(this.values[8]), entered: Number(this.values[9]), exited: Number(this.values[10]) });
         if (this.sql.includes("INSERT INTO screen_runs")) state.runs.push({ datasetId: String(this.values[0]), runId: String(this.values[1]), screenId: String(this.values[2]), effectiveDate: String(this.values[3]), resultCount: Number(this.values[4]), status: "complete" });
         return { success: true };
       }

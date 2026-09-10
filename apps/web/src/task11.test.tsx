@@ -1,8 +1,8 @@
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { ComparisonTable, InstrumentResearch, MetricValue, MomentumBreakdown, ResultsTable } from "./research";
+import { ComparisonTable, InstrumentResearch, MetricValue, MomentumBreakdown, ResultsTable, ScreenResultsView } from "./research";
 import { createApiClient } from "./api";
-import type { InstrumentDto, ResultMatchDto } from "./api";
+import type { DashboardApi, InstrumentDto, ResultMatchDto } from "./api";
 
 const equity: InstrumentDto = {
   instrumentId: "infy",
@@ -125,5 +125,44 @@ describe("Task 11 research views", () => {
     const api = createApiClient({ baseUrl: "https://dashboard.example", fetcher });
     await api.getResults!("screen-1", { sort: "score", direction: "desc", limit: 25, offset: 25 });
     expect(String(fetcher.mock.calls[0]?.[0])).toContain("/api/v1/screens/screen-1/results?limit=25&offset=25&sort=score&direction=desc");
+  });
+
+  it("labels historical results with their saved query and context", async () => {
+    const api: DashboardApi = {
+      getStatus: vi.fn(async () => ({ effectiveDate: null, datasetId: null, sources: [] })),
+      getMetrics: vi.fn(async () => []),
+      getScreens: vi.fn(async () => ({ data: [], pagination: { limit: 50, offset: 0, total: 0 } })),
+      createScreen: vi.fn(async (input) => ({ id: "unused", ...input, languageVersion: "v1", createdAt: "", updatedAt: "" })),
+      getResults: vi.fn(async () => ({
+        screen: { id: "screen-1", name: "Volume", source: "Volume > 1000", languageVersion: "v1", createdAt: "2026-09-01", updatedAt: "2026-09-09" },
+        run: { id: "run-a", screenId: "screen-1", datasetId: "dataset-a", effectiveDate: "2026-09-04", completedAt: "2026-09-09T12:00:00.000Z", matchCount: 1, status: "complete" as const, source: "Volume > 100", languageVersion: "v1", isCurrentDataset: false, isCurrentQuery: false, matches: [{ ...match, symbol: "OLD_SYMBOL", name: "Old company", assetClass: "equity" as const }] },
+        pagination: { limit: 25, offset: 0, total: 1 },
+      })),
+      runScreen: vi.fn(),
+    };
+    render(<ScreenResultsView screenId="screen-1" api={api} onBack={() => undefined} onOpenInstrument={() => undefined} />);
+    expect(await screen.findByRole("link", { name: /view first match research/i })).toHaveTextContent("OLD_SYMBOL");
+    expect(screen.getByText("Volume > 100", { selector: "code" })).toBeVisible();
+    expect(screen.getByText(/screen changed since this run/i)).toBeVisible();
+    expect(screen.getByText(/data from a previous dataset/i)).toBeVisible();
+  });
+
+  it("does not substitute the current screen expression for a legacy run", async () => {
+    const api: DashboardApi = {
+      getStatus: vi.fn(async () => ({ effectiveDate: null, datasetId: null, sources: [] })),
+      getMetrics: vi.fn(async () => []),
+      getScreens: vi.fn(async () => ({ data: [], pagination: { limit: 50, offset: 0, total: 0 } })),
+      createScreen: vi.fn(async (input) => ({ id: "unused", ...input, languageVersion: "v1", createdAt: "", updatedAt: "" })),
+      getResults: vi.fn(async () => ({
+        screen: { id: "screen-1", name: "Volume", source: "Volume > 1000", languageVersion: "v1", createdAt: "2026-09-01", updatedAt: "2026-09-09" },
+        run: { id: "legacy", screenId: "screen-1", datasetId: "dataset-a", effectiveDate: "2026-09-04", matchCount: 0, status: "complete" as const, source: null, languageVersion: null, isCurrentDataset: true, isCurrentQuery: false, matches: [] },
+        pagination: { limit: 25, offset: 0, total: 0 },
+      })),
+      runScreen: vi.fn(),
+    };
+    render(<ScreenResultsView screenId="screen-1" api={api} onBack={() => undefined} onOpenInstrument={() => undefined} />);
+    await screen.findByRole("heading", { name: /volume results/i });
+    expect(document.querySelector(".lede")).toHaveTextContent("Source unavailable");
+    expect(screen.queryByText("Volume > 1000", { selector: "code" })).not.toBeInTheDocument();
   });
 });
