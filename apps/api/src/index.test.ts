@@ -366,6 +366,62 @@ describe("private research API", () => {
     ]);
   });
 
+  it("orders D1 runs by parsed execution time for defaults and predecessors", async () => {
+    const runs = [
+      { run_id: "text", screen_id: "screen-1", dataset_id: "dataset-1", effective_date: "2026-09-10", completed_at: "2026-09-09T12:00:00Z", result_count: 1, status: "complete", source: "Volume > 1", language_version: "v1" },
+      { run_id: "fractional", screen_id: "screen-1", dataset_id: "dataset-1", effective_date: "2026-09-04", completed_at: "2026-09-09T12:00:00.500Z", result_count: 1, status: "complete", source: "Volume > 1", language_version: "v1" },
+      { run_id: "missing", screen_id: "screen-1", dataset_id: "dataset-1", effective_date: "2026-09-30", completed_at: null, result_count: 0, status: "complete", source: null, language_version: null },
+      { run_id: "invalid", screen_id: "screen-1", dataset_id: "dataset-1", effective_date: "2026-09-29", completed_at: "not-a-time", result_count: 0, status: "complete", source: null, language_version: null },
+    ];
+    const matches: Record<string, readonly Record<string, unknown>[]> = {
+      text: [{ instrument_id: "old", ordinal: 1, score: 1, symbol: "OLD", name: "Old", asset_class: "equity", explanation_json: JSON.stringify({ matched: true, text: "old", metrics: [] }), entered: 1, exited: 0 }],
+      fractional: [{ instrument_id: "latest", ordinal: 1, score: 2, symbol: "LATEST", name: "Latest", asset_class: "equity", explanation_json: JSON.stringify({ matched: true, text: "latest", metrics: [] }), entered: 1, exited: 0 }],
+      missing: [],
+      invalid: [],
+    };
+    const parsedOrder = (items: typeof runs) => [...items].sort((left, right) => {
+      const leftTimestamp = left.completed_at ? Date.parse(left.completed_at) : Number.NaN;
+      const rightTimestamp = right.completed_at ? Date.parse(right.completed_at) : Number.NaN;
+      const leftValid = Number.isFinite(leftTimestamp); const rightValid = Number.isFinite(rightTimestamp);
+      if (leftValid !== rightValid) return leftValid ? -1 : 1;
+      if (leftValid && leftTimestamp !== rightTimestamp) return rightTimestamp - leftTimestamp;
+      return right.effective_date.localeCompare(left.effective_date) || right.run_id.localeCompare(left.run_id);
+    });
+    const textOrder = (items: typeof runs) => [...items].sort((left, right) => {
+      const leftValid = left.completed_at !== null && !Number.isNaN(Date.parse(left.completed_at)); const rightValid = right.completed_at !== null && !Number.isNaN(Date.parse(right.completed_at));
+      if (leftValid !== rightValid) return leftValid ? -1 : 1;
+      return String(right.completed_at ?? "").localeCompare(String(left.completed_at ?? "")) || right.effective_date.localeCompare(left.effective_date) || right.run_id.localeCompare(left.run_id);
+    });
+    class OrderedStatement implements D1Statement {
+      private values: unknown[] = [];
+      public constructor(private readonly sql: string) {}
+      bind(...values: unknown[]): D1Statement { this.values = values; return this; }
+      async first<T extends Record<string, unknown> = Record<string, unknown>>(): Promise<T | null> {
+        if (this.sql.includes("FROM active_dataset")) return { dataset_id: "dataset-1" } as unknown as T;
+        if (this.sql.includes("FROM saved_screens")) return { screen_id: "screen-1", name: "Volume", expression: "Volume > 1", created_at: "2026-01-01", updated_at: "2026-01-01" } as unknown as T;
+        if (this.sql.includes("FROM instrument_snapshots")) return { instrument_id: "latest", symbol: "LATEST", name: "Latest", asset_class: "equity", active: 1, metadata_json: "{}", metric_rows_json: JSON.stringify([{ metric: "volume", value: 2, state: "present" }]), fundamental_periods_json: "[]", corporate_actions_json: "[]" } as unknown as T;
+        return null;
+      }
+      async all<T extends Record<string, unknown> = Record<string, unknown>>(): Promise<{ results: readonly T[] }> {
+        if (this.sql.includes("FROM screen_runs")) return { results: (this.sql.includes("julianday(completed_at) DESC") ? parsedOrder(runs) : textOrder(runs)) as unknown as readonly T[] };
+        if (this.sql.includes("FROM screen_matches")) return { results: (matches[String(this.values[1])] ?? []) as unknown as readonly T[] };
+        if (this.sql.includes("FROM instrument_snapshots AS i")) return { results: [{ instrument_id: "latest", score: 2 }] as unknown as readonly T[] };
+        return { results: [] };
+      }
+      async run(): Promise<D1Result> { return { success: true }; }
+    }
+    const store = new D1ResearchStore({ prepare: (sql) => new OrderedStatement(sql) });
+    const api = createApi({ env, store, accessVerifier: createTestAccessVerifier("test-secret"), testAccessSecret: "test-secret" });
+    const bearer = await api.issueTestToken({ email: "owner@example.com" });
+    const response = await api.fetch(request("/api/v1/screens/screen-1/results", { headers: { Authorization: `Bearer ${bearer}` } }));
+    expect(response.status).toBe(200);
+    expect((await response.json() as { run: { id: string } }).run.id).toBe("fractional");
+
+    const screen = { id: "screen-1", name: "Volume", source: "Volume > 1", languageVersion: "v1", createdAt: "2026-01-01", updatedAt: "2026-01-01" } as const;
+    const next = await store.runScreen("dataset-1", screen, "2026-09-03", "2026-09-09T12:00:01.000Z");
+    expect(next.matches.find((match) => match.instrumentId === "latest")).toMatchObject({ entered: false, exited: false });
+  });
+
   it("does not repeat a persisted exit after an instrument remains absent", async () => {
     const state: {
       present: boolean;
