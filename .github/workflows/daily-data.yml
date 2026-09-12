@@ -198,6 +198,40 @@ jobs:
           restore-keys: |
             market-db-
 
+      # F12: `actions/cache` above is the fast path between runs, but
+      # GitHub documents cache eviction -- a miss here previously meant
+      # three years of raw/checkpoint state were gone with no recovery
+      # path. This step is the durable fallback: on a genuine cache miss
+      # (no `market.db` present), it restores the last verified checkpoint
+      # archive from private R2 storage instead of silently starting
+      # blank. On a cache hit, it does the cheap thing instead -- it only
+      # validates the restored `market.db`'s active dataset identity
+      # against the authoritative remote manifest, so a stale or
+      # previously-corrupted cache entry cannot masquerade as a good one
+      # undetected. A missing archive (no prior successful publication has
+      # ever run) is a legitimate first-ever-run bootstrap, not treated as
+      # a failure; any other problem (a corrupt or partially-uploaded
+      # archive) fails this step outright rather than silently continuing
+      # with blank/stale state.
+      - name: Restore checkpoint archive on cache miss
+        if: steps.params.outputs.manifest_present == 'true'
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          mkdir -p .cache
+          if [ -f market.db ]; then
+            uv run python -m market_pipeline.publication.checkpoint_archive restore \
+              --db market.db --raw-root raw --check-identity-only --result identity-check.json
+            if ! python3 -c "import json,sys; d=json.load(open('identity-check.json')); sys.exit(0 if d.get('matches') is not False else 1)"; then
+              echo "::warning::Cached market.db's active dataset identity does not match the last verified checkpoint archive; continuing with the cached state, but investigate a possibly stale/corrupted actions/cache entry."
+            fi
+          else
+            echo "::notice::No cached market.db present (cache miss); restoring the last verified checkpoint archive from private R2 storage."
+            uv run python -m market_pipeline.publication.checkpoint_archive restore \
+              --db market.db --raw-root raw --reservation-ledger .cache/publication-ledger.json --result checkpoint-restore.json
+            cat checkpoint-restore.json
+          fi
+
       - name: Run market-pipeline refresh
         id: run
         if: steps.params.outputs.manifest_present == 'true'
@@ -540,6 +574,27 @@ jobs:
             echo "::error::Remote active dataset does not match the locally published dataset."
             exit 1
           fi
+
+      # F12: only now -- after production D1's active dataset has been
+      # independently read back and confirmed to equal the locally
+      # published dataset -- is this dataset's checkpoint archive promoted
+      # to state/latest-success.json. Building/uploading the archive is
+      # itself durable evidence of local checkpoint progress; advancing
+      # the success pointer must never happen on that basis alone; see
+      # market_pipeline.publication.checkpoint_archive's module docstring.
+      - name: Back up checkpoint archive for recovery
+        if: steps.params.outputs.manifest_present == 'true'
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          mkdir -p .cache
+          expected_dataset_id="$(tr -d '\r\n' < active-dataset-id.txt)"
+          uv run python -m market_pipeline.publication.checkpoint_archive backup \
+            --db market.db --raw-root raw \
+            --promote --remote-active-dataset-id "${expected_dataset_id}" \
+            --reservation-ledger .cache/publication-ledger.json \
+            --result checkpoint-backup.json
+          cat checkpoint-backup.json
 
       - name: Record this run's reservation-ledger entry
         # Fix round 1, Important #3: this must run even if a LATER step

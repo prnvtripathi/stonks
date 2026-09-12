@@ -55,6 +55,24 @@ from typing import Any, Mapping, Protocol, Sequence, cast
 from market_pipeline.publication.bundle import BundleError, BundleObject, PublicationBundle
 from market_pipeline.storage.history_store import HistoryStoreError, chart_key, history_key
 
+__all__ = [
+    "BUCKET",
+    "DEFAULT_DEADLINE_SECONDS",
+    "DEFAULT_MAX_WORKERS",
+    "MAX_ATTEMPTS_PER_OBJECT",
+    "MAX_DEADLINE_SECONDS",
+    "MAX_WORKERS",
+    "ObjectTransferResult",
+    "R2SyncError",
+    "R2SyncResult",
+    "S3ObjectClient",
+    "build_s3_client",
+    "get_and_verify_object",
+    "main",
+    "put_and_verify_object",
+    "synchronize_history",
+]
+
 BUCKET = "stonks-private-history"
 
 #: Concurrency is configurable up to this many in-flight requests.
@@ -317,6 +335,75 @@ def synchronize_history(
         raise
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
+
+
+@dataclass(frozen=True)
+class ObjectTransferResult:
+    """Attempt counts for one object moved through :func:`put_and_verify_object`."""
+
+    put_attempts: int
+    get_attempts: int
+
+
+def put_and_verify_object(
+    client: S3ObjectClient,
+    *,
+    key: str,
+    local_path: Path,
+    sha256_hex: str,
+    size: int,
+    deadline_at: float,
+    max_attempts: int = MAX_ATTEMPTS_PER_OBJECT,
+) -> ObjectTransferResult:
+    """Bounded PUT-then-verify for exactly one object, reusable outside a bundle sync.
+
+    This is the same retry/verify primitive :func:`synchronize_history` uses
+    per object (:func:`_sync_one`), exposed directly so other publication
+    transports (e.g. the checkpoint archive in
+    :mod:`market_pipeline.publication.checkpoint_archive`) share this one
+    PUT/GET-verify/retry implementation instead of a second one.
+    """
+
+    item = _Object(key=key, local=local_path, sha256_hex=sha256_hex.lower(), size=size, kind="generic")
+    counts = _sync_one(client, item, deadline_at, max_attempts)
+    return ObjectTransferResult(put_attempts=counts.puts, get_attempts=counts.gets)
+
+
+def get_and_verify_object(client: S3ObjectClient, *, key: str, sha256_hex: str, size: int) -> bytes:
+    """GET exactly one object and verify its bytes match the recorded checksum/size.
+
+    Shares :func:`_verify_remote`'s body-reading logic so there is one place
+    that knows how to safely drain and byte-verify an S3-compatible response.
+    """
+
+    response = client.get_object(Bucket=BUCKET, Key=key)
+    body = response.get("Body")
+    read = getattr(body, "read", None)
+    if not callable(read):
+        raise R2SyncError(f"R2 object response has no readable body: {key}")
+    try:
+        data = read()
+    finally:
+        close = getattr(body, "close", None)
+        if callable(close):
+            close()
+    if not isinstance(data, (bytes, bytearray)):
+        raise R2SyncError(f"R2 object response body is not bytes: {key}")
+    if len(data) != size or sha256(data).hexdigest() != sha256_hex.lower():
+        raise R2SyncError(f"R2 object verification failed: {key}")
+    return bytes(data)
+
+
+def build_s3_client(account_id: str, access_key: str, secret_key: str, max_workers: int) -> S3ObjectClient:
+    """Public constructor for the one S3-compatible client this publisher uses.
+
+    Exposed so other publication transports (e.g. the checkpoint archive in
+    :mod:`market_pipeline.publication.checkpoint_archive`) build their client
+    the same way ``r2_sync``'s own CLI does, instead of adding a second
+    boto3 client construction path.
+    """
+
+    return _client(account_id, access_key, secret_key, max_workers)
 
 
 def _client(account_id: str, access_key: str, secret_key: str, max_workers: int) -> S3ObjectClient:

@@ -32,6 +32,17 @@ manifest, gated by the reconciliation and storage-budget checks in
    ephemeral -- without this step every run would start from an empty
    database and look like a first-ever run to the CLI. See "Coverage
    baseline persistence" below for why this matters.
+3a. **Restore the checkpoint archive on a cache miss** (F12; see "Durable
+   checkpoint-archive recovery" below). `actions/cache` is documented as
+   evictable, and a miss previously meant the three years of `raw/`
+   artifact bodies and `market.db`'s checkpoint/publication history were
+   simply gone, with no way back. This step checks whether the cache
+   restore above actually produced a `market.db`: if not, it restores the
+   last verified checkpoint archive from private R2 storage instead; if it
+   did, it only validates that cached database's active dataset identity
+   against the authoritative remote manifest (cheap: one small object, no
+   bulk download) and warns -- without failing the run -- if a stale or
+   previously-corrupted cache entry is detected.
 4. **Skip cleanly if no manifest is present.** The scheduled trigger looks for
    `manifests/daily.json`. No automated NSE/AMFI fetch is wired (see
    `docs/operations/source-policy.md`), so producing that file is an operator
@@ -122,6 +133,13 @@ manifest, gated by the reconciliation and storage-budget checks in
     wrapper: a failed Cloudflare D1 file import restores the database to its
     original state, and the generated SQL performs the status/pointer switch
     as its final statements.
+12a. **Only now** -- after that independent remote read-back confirms
+    production D1's active dataset really is the one this run built --
+    back up and promote this run's checkpoint archive (F12; see "Durable
+    checkpoint-archive recovery" below). Building the archive earlier would
+    let local checkpoint progress be mistaken for confirmed remote success;
+    this ordering is the same distinction R09's reservation ledger already
+    draws between "attempted" and "observed" usage.
 
 Before any R2 or D1 **mutation**, the workflow captures production D1's
 read-only `wrangler d1 info --json` response. The local preflight accepts only
@@ -180,6 +198,60 @@ mutable active-manifest object, so the growing newest R2 object is verified
 before D1's active pointer can change. Closed partitions are byte-verified on
 every run and re-uploaded only for bootstrap/new-instrument initialization.
 
+## Durable checkpoint-archive recovery
+
+`market_pipeline.publication.checkpoint_archive` (finding F12) closes a gap
+`actions/cache` alone cannot: GitHub documents cache eviction, and a miss on
+this ephemeral runner previously meant the three years of `raw/` artifact
+bodies and `market.db`'s checkpoint/publication history were gone with no
+recovery path. This module adds a private, versioned archive in the same R2
+account R08 already publishes history to (a distinct `checkpoints/`/`state/`
+key prefix -- never the public `history/`/`charts/` serving keys), plus a
+`state/latest-success.json` pointer.
+
+What is archived, and what is not:
+
+- **SQLite backup.** `market.db` is copied with SQLite's own backup API (a
+  transactionally consistent snapshot, not a raw file copy) and the copy's
+  checksum is recorded.
+- **Immutable raw triples.** Every artifact body/metadata/commit-marker
+  triple `storage/raw_store.py` already validates is uploaded and
+  byte-verified under its existing key.
+- **`history/` is deliberately not archived.** `jobs/publish.py` already
+  rebuilds it deterministically from `raw/` on every run, so durably
+  archiving it too would duplicate storage without adding recoverability.
+- **The reservation ledger is deliberately not archived.** It is a same-day
+  accounting margin (24-hour relevance window; see
+  `market_pipeline.publication.remote_usage`) -- losing it affects only that
+  margin, not correctness.
+
+Checkpoint progress vs. remote success: uploading an archive only proves
+"this local state was durably archived", never "this was published".
+`state/latest-success.json` is written only by `promote_latest_success`,
+and only after the caller supplies the same independently, remotely
+verified active dataset ID step 12 above reads back from production D1. A
+failed or not-yet-attempted remote publish leaves that pointer exactly
+where it was -- it is never advanced speculatively, and reloading it after
+such a failure still returns the previously verified success.
+
+Restore behavior on the next run (workflow step 3a above): every archived
+object is downloaded and byte-verified in memory before anything is written
+to disk, and the SQLite backup is restored (and sanity-opened) before any
+raw triple is written, so a corrupted or interrupted archive fails the
+restore step outright rather than leaving a half-restored `market.db` or
+`raw/` behind. The one case treated as non-fatal is `NoCheckpointArchiveError`
+-- no archive has ever been promoted -- which is a legitimate first-run
+bootstrap, not a sign of corruption. A cache *hit* still runs a cheap
+identity check against the authoritative manifest (matching dataset ID and
+input-manifest hash), so a stale or previously-corrupted cache entry cannot
+silently masquerade as a good one; a mismatch is logged as a workflow
+warning without failing the run.
+
+Archive operations (every PUT/GET attempt, including reuse-verification
+GETs for an exact retry) are folded into R09's reservation ledger the same
+way `r2_sync`'s attempted counts already are, so they are visible to
+`preflight.assert_plan_within_remote_budget` on the next run.
+
 ## Coverage baseline persistence
 
 The scheduled (cron) trigger has no `workflow_dispatch` `inputs` context, so
@@ -234,7 +306,8 @@ local active dataset untouched. The workflow's caches therefore carry three
 things between runs -- `market.db` (checkpoints and the coverage baseline),
 `raw/` (immutable artifact bodies, re-read to rebuild the three-year series a
 twelve-month return needs), and `history/` (published Parquet history and
-chart objects).
+chart objects). `market.db` and `raw/` also have a durable fallback beyond
+that cache -- see "Durable checkpoint-archive recovery" above.
 
 ## Production Cloudflare publication: one-time operator setup
 
