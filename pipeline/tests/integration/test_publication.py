@@ -2,19 +2,16 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import date
 from pathlib import Path
 from typing import Any
 
 import pytest
 from market_pipeline.analytics.momentum import NormalizedMomentumInput, momentum_score
 from market_pipeline.jobs.publish import DatasetBuild, publish_checkpointed_dataset
+from market_pipeline.publication.bundle import BundleObject, build_bundle
 from market_pipeline.storage.d1_publisher import D1Publisher, ReconciliationError, publish
-from market_pipeline.storage.history_store import (
-    HistoryStore,
-    HistoryStoreError,
-    chart_key,
-    history_key,
-)
+from market_pipeline.storage.history_store import HistoryStore, HistoryStoreError
 
 
 def test_forward_migrations_upgrade_existing_and_fresh_databases() -> None:
@@ -152,6 +149,51 @@ def test_filesystem_history_failure_leaves_previous_dataset_active(monkeypatch: 
     assert publisher.active_dataset_id() == "known-good"
 
 
+def test_failed_publication_cannot_change_the_active_bundle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed candidate must never move the active dataset's own recorded bundle."""
+
+    connection = sqlite3.connect(":memory:")
+    publisher = D1Publisher(connection)
+    publisher.initialize_schema()
+
+    known_good = _complete_candidate("known-good")
+    known_good_bundle = build_bundle(
+        dataset_id="known-good", input_manifest_hash="a" * 64, source_dates=["2026-08-31"],
+        projection_version="d1-projection-v1",
+        candidate_entries=[BundleObject(key="charts/known-good/instrument-1.json.gz", sha256="b" * 64, bytes=1, kind="chart")],
+        effective_date=date(2026, 8, 31),
+    )
+    known_good["metadata"]["publication_bundle"] = known_good_bundle.as_dict()
+    publish(known_good, publisher)
+    before_failure_bundle_id = publisher.active_dataset_id()
+    assert before_failure_bundle_id == "known-good"
+
+    candidate = _complete_candidate("candidate")
+    build = DatasetBuild(candidate, {}, {}, {"instrument-1": ("mutual_fund", ())}, ())
+    monkeypatch.setattr("market_pipeline.jobs.publish.build_candidate", lambda *args, **kwargs: build)
+
+    class FailingHistoryStore:
+        def write_history(self, *args: Any, **kwargs: Any) -> list[Any]:
+            raise HistoryStoreError("R2 write failed")
+
+        def write_chart(self, *args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("chart writing must not follow a failed history write")
+
+    result = publish_checkpointed_dataset(
+        connection, publisher, raw_store=object(), source_ids=["amfi-nav"],
+        effective_date=date(2026, 9, 1), safe_to_promote=True,
+        history_store=FailingHistoryStore(),  # type: ignore[arg-type]
+    )
+
+    assert result.promoted is False
+    active_bundle_id = publisher.active_dataset_id()
+    assert active_bundle_id == before_failure_bundle_id
+    row = connection.execute(
+        "SELECT metadata_json FROM datasets WHERE dataset_id = ?", (active_bundle_id,)
+    ).fetchone()
+    assert json.loads(row[0])["publication_bundle"]["dataset_id"] == "known-good"
+
+
 def test_active_dataset_export_imports_complete_snapshot_and_preserves_global_screens(
     tmp_path: Path,
 ) -> None:
@@ -214,17 +256,34 @@ def test_active_dataset_export_fails_closed_for_incomplete_active_data(tmp_path:
 
 
 def test_active_dataset_object_manifest_excludes_old_dataset_charts(tmp_path: Path) -> None:
+    """The bundle -- not a filesystem glob -- decides what the export requires."""
+
     from market_pipeline.publication.d1_export import export_active_dataset
 
     connection = sqlite3.connect(":memory:")
     publisher = D1Publisher(connection)
     publisher.initialize_schema()
-    publish(_complete_candidate("published"), publisher)
+
     history_root = tmp_path / "history"
     store = HistoryStore(history_root)
-    store.write_history("mutual_fund", "instrument-1", [{"effective_date": "2026-09-01", "value": "1"}])
-    store.write_chart("published", "instrument-1", {"points": []})
-    store.write_chart("old-dataset", "instrument-1", {"points": []})
+    [history_object] = store.write_history("mutual_fund", "instrument-1", [{"effective_date": "2026-09-01", "value": "1"}])
+    chart_object = store.write_chart("published", "instrument-1", {"points": []})
+    unrelated_old_chart = store.write_chart("old-dataset", "instrument-1", {"points": []})
+
+    candidate = _complete_candidate("published")
+    bundle = build_bundle(
+        dataset_id="published",
+        input_manifest_hash="f" * 64,
+        source_dates=["2026-09-01"],
+        projection_version="d1-projection-v1",
+        candidate_entries=[
+            BundleObject(key=history_object.key, sha256=history_object.sha256, bytes=history_object.bytes, kind="history"),
+            BundleObject(key=chart_object.key, sha256=chart_object.sha256, bytes=chart_object.bytes, kind="chart"),
+        ],
+        effective_date=date(2026, 9, 1),
+    )
+    candidate["metadata"]["publication_bundle"] = bundle.as_dict()
+    publish(candidate, publisher)
     manifest_path = tmp_path / "active-history-objects.json"
 
     export_active_dataset(
@@ -234,10 +293,118 @@ def test_active_dataset_object_manifest_excludes_old_dataset_charts(tmp_path: Pa
         object_manifest=manifest_path,
     )
 
-    assert json.loads(manifest_path.read_text(encoding="utf-8")) == {
-        "immutable": [],
-        "mutable": [chart_key("published", "instrument-1"), history_key("mutual_fund", "instrument-1", 2026)],
-    }
+    written = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert written["dataset_id"] == "published"
+    assert written["sql_checksum"]
+    object_keys = {item["key"] for item in written["objects"]}
+    assert object_keys == {history_object.key, chart_object.key}
+    assert unrelated_old_chart.key not in object_keys
+
+
+def test_export_bundle_serves_a_rolling_three_calendar_year_window(tmp_path: Path) -> None:
+    """History older than the rolling window is written but not part of the bundle."""
+
+    from market_pipeline.publication.d1_export import export_active_dataset
+
+    connection = sqlite3.connect(":memory:")
+    publisher = D1Publisher(connection)
+    publisher.initialize_schema()
+
+    history_root = tmp_path / "history"
+    store = HistoryStore(history_root)
+    written = store.write_history(
+        "mutual_fund",
+        "instrument-1",
+        [
+            {"effective_date": "2021-06-15", "value": "1"},  # outside the 2024-2026 window
+            {"effective_date": "2024-01-05", "value": "2"},
+            {"effective_date": "2025-01-05", "value": "3"},
+            {"effective_date": "2026-09-01", "value": "4"},
+        ],
+    )
+    chart_object = store.write_chart("published", "instrument-1", {"points": []})
+    in_window_keys = {item.key for item in written if "/2021/" not in item.key}
+    out_of_window_key = next(item.key for item in written if "/2021/" in item.key)
+
+    candidate = _complete_candidate("published")
+    bundle = build_bundle(
+        dataset_id="published",
+        input_manifest_hash="f" * 64,
+        source_dates=["2026-09-01"],
+        projection_version="d1-projection-v1",
+        candidate_entries=[
+            *(BundleObject(key=item.key, sha256=item.sha256, bytes=item.bytes, kind="history") for item in written),
+            BundleObject(key=chart_object.key, sha256=chart_object.sha256, bytes=chart_object.bytes, kind="chart"),
+        ],
+        effective_date=date(2026, 9, 1),
+    )
+    candidate["metadata"]["publication_bundle"] = bundle.as_dict()
+    publish(candidate, publisher)
+
+    manifest_path = tmp_path / "active-history-objects.json"
+    export_active_dataset(
+        connection, tmp_path / "active-dataset.sql", history_root=history_root, object_manifest=manifest_path,
+    )
+
+    object_keys = {item["key"] for item in json.loads(manifest_path.read_text(encoding="utf-8"))["objects"]}
+    assert in_window_keys <= object_keys
+    assert out_of_window_key not in object_keys
+    # The 2021 partition is still durably readable even though it is outside
+    # what this bundle serves -- retention never destroys it.
+    out_of_window_path = history_root / out_of_window_key
+    assert out_of_window_path.is_file()
+
+
+def test_publication_plan_reports_retained_objects_and_a_garbage_collection_dry_run(
+    tmp_path: Path,
+) -> None:
+    from market_pipeline.publication.d1_export import export_active_dataset
+
+    connection = sqlite3.connect(":memory:")
+    publisher = D1Publisher(connection)
+    publisher.initialize_schema()
+
+    history_root = tmp_path / "history"
+    store = HistoryStore(history_root)
+    [history_object] = store.write_history("mutual_fund", "instrument-1", [{"effective_date": "2026-09-01", "value": "1"}])
+    chart_object = store.write_chart("published", "instrument-1", {"points": []})
+    # An object nothing references any more -- a prior candidate's orphan.
+    unreferenced = store.write_chart("very-old-dataset", "instrument-1", {"points": [1]})
+
+    candidate = _complete_candidate("published")
+    bundle = build_bundle(
+        dataset_id="published", input_manifest_hash="f" * 64, source_dates=["2026-09-01"],
+        projection_version="d1-projection-v1",
+        candidate_entries=[
+            BundleObject(key=history_object.key, sha256=history_object.sha256, bytes=history_object.bytes, kind="history"),
+            BundleObject(key=chart_object.key, sha256=chart_object.sha256, bytes=chart_object.bytes, kind="chart"),
+        ],
+        effective_date=date(2026, 9, 1),
+    )
+    candidate["metadata"]["publication_bundle"] = bundle.as_dict()
+    publish(candidate, publisher)
+
+    plan_path = tmp_path / "active-publication-plan.json"
+    export_active_dataset(
+        connection,
+        tmp_path / "active-dataset.sql",
+        history_root=history_root,
+        object_manifest=tmp_path / "active-history-objects.json",
+        publication_plan=plan_path,
+    )
+
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    assert plan["retained_objects"] == 2
+    assert plan["retained_bytes"] > 0
+    gc = plan["garbage_collection"]
+    assert gc["dry_run"] is True
+    assert gc["candidates"] == [unreferenced.key]
+    assert gc["candidate_bytes"] > 0
+    # Raw artifacts are never garbage-collection candidates, regardless of
+    # what is reachable; there is nothing under raw/ in this fixture at all,
+    # which is itself the point -- this function only ever looks at
+    # history/ and charts/.
+    assert all(not key.startswith("raw/") for key in gc["candidates"])
 
 
 def test_remote_publication_preflight_rejects_a_weekday_month_over_budget() -> None:

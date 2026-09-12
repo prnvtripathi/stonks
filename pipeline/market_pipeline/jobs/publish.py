@@ -34,6 +34,7 @@ from market_pipeline.analytics.returns import ReturnMetrics, calculate_returns
 from market_pipeline.analytics.risk import RiskMetrics, calculate_risk
 from market_pipeline.normalization import amfi as amfi_normalization
 from market_pipeline.normalization.amfi import AmfiScheme, normalize_amfi_schemes
+from market_pipeline.publication.bundle import BundleError, BundleObject, build_bundle
 from market_pipeline.publication.input_manifest import InputManifestError, manifest_with_fingerprint
 from market_pipeline.sources.amfi_nav import AmfiNavError, parse_amfi_nav
 from market_pipeline.sources.registry import get_source_policy
@@ -416,16 +417,20 @@ def _write_history(
     history_store: HistoryStore,
     dataset_id: str,
     build: DatasetBuild,
-) -> tuple[int, list[str]]:
+) -> tuple[int, list[BundleObject], list[str]]:
     """Persist yearly Parquet history and the gzip chart object the API serves.
 
     History objects are immutable and content-addressed by (asset class,
-    instrument, year), so re-publishing the same observations is a no-op and a
-    changed observation surfaces as an explicit conflict rather than a silent
-    overwrite.
+    instrument, year, sha256), so re-publishing the same observations is a
+    no-op and a changed observation resolves to a different key rather than a
+    silent overwrite. The returned object entries are the candidate's own
+    record of exactly what it wrote -- the input to this run's publication
+    bundle -- rather than something a later export step has to rediscover by
+    scanning the store.
     """
 
     written = 0
+    entries: list[BundleObject] = []
     warnings: list[str] = []
     for instrument_id, (asset_class, points) in sorted(build.histories.items()):
         records = [
@@ -433,16 +438,22 @@ def _write_history(
             for point_date, value in points
         ]
         try:
-            written += len(history_store.write_history(asset_class, instrument_id, records))
-            history_store.write_chart(
+            partitions = history_store.write_history(asset_class, instrument_id, records)
+            entries.extend(
+                BundleObject(key=partition.key, sha256=partition.sha256, bytes=partition.bytes, kind="history")
+                for partition in partitions
+            )
+            written += len(partitions)
+            chart = history_store.write_chart(
                 dataset_id,
                 instrument_id,
                 {"points": [{"date": row["effective_date"], "value": float(row["value"])} for row in records]},
             )
+            entries.append(BundleObject(key=chart.key, sha256=chart.sha256, bytes=chart.bytes, kind="chart"))
             written += 1
         except (HistoryStoreError, OSError) as exc:
             warnings.append(f"{instrument_id}: history object was not written ({exc})")
-    return written, warnings
+    return written, entries, warnings
 
 
 def publish_checkpointed_dataset(
@@ -489,7 +500,7 @@ def publish_checkpointed_dataset(
         )
     history_objects = 0
     if history_store is not None:
-        history_objects, history_warnings = _write_history(history_store, dataset_id, build)
+        history_objects, object_entries, history_warnings = _write_history(history_store, dataset_id, build)
         warnings.extend(history_warnings)
         if history_warnings:
             # History/chart objects are what the Worker serves alongside the
@@ -503,6 +514,33 @@ def publish_checkpointed_dataset(
                 reason="history publication failed; active dataset was left untouched",
                 warnings=tuple(warnings),
             )
+        metadata = candidate.setdefault("metadata", {})
+        input_manifest_hash = str(metadata.get("input_manifest_sha256") or "")
+        source_dates = sorted({
+            str(item.get("effective_date"))
+            for item in (metadata.get("input_manifest") or {}).get("inputs", [])
+            if item.get("effective_date")
+        })
+        try:
+            publication_bundle = build_bundle(
+                dataset_id=dataset_id,
+                input_manifest_hash=input_manifest_hash,
+                source_dates=source_dates,
+                projection_version=implementation_versions()["projection"],
+                candidate_entries=object_entries,
+                effective_date=date.fromisoformat(str(candidate["effective_date"])),
+            )
+        except BundleError as exc:
+            return PublicationResult(
+                promoted=False,
+                dataset_id=dataset_id,
+                reason=f"publication bundle could not be built: {exc}",
+                warnings=tuple(warnings),
+            )
+        # The bundle travels with the candidate's own metadata so the exporter
+        # (publication/d1_export.py) can read it back as this candidate's
+        # authoritative object list instead of scanning the store.
+        metadata["publication_bundle"] = publication_bundle.as_dict()
     try:
         publish(candidate, publisher, momentum_scores=scores, source_artifact_ids=artifact_ids)
     except ReconciliationError as exc:

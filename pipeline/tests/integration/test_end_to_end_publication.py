@@ -151,7 +151,7 @@ def test_manifest_flows_from_raw_artifact_to_a_promoted_queryable_dataset(tmp_pa
     # Yearly history and the gzip chart object the Worker serves were written.
     history_root = tmp_path / "history"
     assert payload["publication"]["history_objects"] > 0
-    assert list(history_root.glob("history/mutual_fund/*/*.parquet"))
+    assert list(history_root.glob("history/mutual_fund/*/*/*.parquet"))
     assert len(list(history_root.glob(f"charts/{dataset_id}/*.json.gz"))) == len(SCHEMES)
 
 

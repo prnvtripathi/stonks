@@ -1,15 +1,26 @@
-"""Immutable, compact R2 history objects and private chart snapshots."""
+"""Immutable, content-addressed R2 history objects and private chart snapshots.
+
+Every historical partition key embeds a SHA-256 hash of its own deterministic
+bytes (see :func:`history_key`). A retry of an unchanged candidate therefore
+resolves to the same key (a safe no-op `put_if_absent`), while a corrected
+value for a closed year resolves to a *different* key -- the previous key and
+its bytes stay exactly as they were. No code path here can overwrite an
+existing key under a different body: there is no "replace" operation at all,
+only ``put_if_absent``. This is what closes finding F14 (a fixed
+`{asset}/{instrument}/{year}.parquet` key let a corrected or failed candidate
+silently clobber the last known-good partition).
+"""
 
 from __future__ import annotations
 
 import gzip
 import io
 import json
-import os
 import re
-import tempfile
+from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 from uuid import UUID
@@ -19,6 +30,8 @@ import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
 from market_pipeline.storage.budgets import StorageBudget
 
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
 
 class HistoryStoreError(RuntimeError):
     """Raised for malformed keys or attempts to overwrite history."""
@@ -26,8 +39,6 @@ class HistoryStoreError(RuntimeError):
 
 class HistoryObjectClient(Protocol):
     def put_if_absent(self, key: str, body: bytes) -> bool: ...
-
-    def put(self, key: str, body: bytes) -> None: ...
 
     def get(self, key: str) -> bytes | None: ...
 
@@ -37,6 +48,15 @@ class UsageReportingObjectClient(HistoryObjectClient, Protocol):
     """Optional R2 client extension for provider-reported byte usage."""
 
     def usage_bytes(self) -> int: ...
+
+
+@dataclass(frozen=True)
+class WrittenObject:
+    """A durably written, content-addressed object, ready for a bundle entry."""
+
+    key: str
+    sha256: str
+    bytes: int
 
 
 class _LocalObjectClient:
@@ -62,22 +82,6 @@ class _LocalObjectClient:
             if path.read_bytes() != body:
                 raise HistoryStoreError(f"immutable history object differs: {key}")
             return False
-
-    def put(self, key: str, body: bytes) -> None:
-        """Atomically replace a local object without exposing a partial file."""
-
-        path = self._path(key)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-        temporary_path = Path(temporary_name)
-        try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(body)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary_path, path)
-        finally:
-            temporary_path.unlink(missing_ok=True)
 
     def get(self, key: str) -> bytes | None:
         try:
@@ -112,7 +116,15 @@ def _row_date(row: Mapping[str, Any]) -> date:
     raise HistoryStoreError("history row requires effective_date or date")
 
 
-def history_key(asset_class: str, instrument_id: str | UUID, year: int) -> str:
+def history_key(asset_class: str, instrument_id: str | UUID, year: int, sha256_hex: str) -> str:
+    """Return the content-addressed key for one calendar-year history partition.
+
+    The trailing path segment is the SHA-256 of the partition's own bytes, so
+    two different candidates for the same (asset class, instrument, year)
+    never collide on a key: a corrected value produces a new key and leaves
+    the previous key's object untouched.
+    """
+
     asset = str(asset_class).lower().replace("-", "_")
     if not re.fullmatch(r"[a-z0-9_]+", asset):
         raise HistoryStoreError("asset class contains unsupported characters")
@@ -121,7 +133,10 @@ def history_key(asset_class: str, instrument_id: str | UUID, year: int) -> str:
         raise HistoryStoreError("instrument ID contains unsupported characters")
     if year < 1900 or year > 2200:
         raise HistoryStoreError("history year is outside supported range")
-    return f"history/{asset}/{instrument}/{year}.parquet"
+    digest = str(sha256_hex).lower()
+    if not _SHA256_HEX.fullmatch(digest):
+        raise HistoryStoreError("history content hash must be 64 lowercase hex characters")
+    return f"history/{asset}/{instrument}/{year}/{digest}.parquet"
 
 
 def chart_key(dataset_id: str, instrument_id: str | UUID) -> str:
@@ -134,7 +149,7 @@ def chart_key(dataset_id: str, instrument_id: str | UUID) -> str:
 
 
 class HistoryStore:
-    """Write a mutable newest-series partition and immutable earlier years/charts."""
+    """Write content-addressed, immutable historical partitions and charts."""
 
     def __init__(
         self,
@@ -172,29 +187,29 @@ class HistoryStore:
                 raise HistoryStoreError(f"immutable history object differs: {key}")
         return key
 
-    def put_mutable_partition(self, key: str, body: bytes) -> str:
-        """Replace the newest partition in a supplied series through the object client."""
-
-        replace = getattr(self.client, "put", None)
-        if not callable(replace):
-            raise HistoryStoreError("the newest history partition requires an object client with replacement support")
-        replace(key, body)
-        return key
-
     def write_history(
         self,
         asset_class: str,
         instrument_id: str | UUID,
         records: Sequence[Mapping[str, Any]],
-    ) -> list[str]:
+    ) -> list[WrittenObject]:
+        """Write one content-addressed Parquet partition per calendar year present.
+
+        Every partition -- including the still-open current year -- is written
+        with ``put_if_absent`` under a key that embeds the SHA-256 of its own
+        bytes. An exact retry of the same candidate resolves to the same key
+        (a no-op). A same-year append or a correction to a closed year always
+        changes the partition's bytes, so it always resolves to a *different*
+        key; the previous key's object is left exactly as it was.
+        """
+
         if not records:
             return []
         grouped: dict[int, list[dict[str, Any]]] = {}
         for record in records:
             row = _safe(record)
             grouped.setdefault(_row_date(record).year, []).append(row)
-        keys: list[str] = []
-        mutable_year = max(grouped)
+        written: list[WrittenObject] = []
         for year in sorted(grouped):
             rows = sorted(grouped[year], key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")))
             try:
@@ -212,16 +227,16 @@ class HistoryStore:
                 body = output.getvalue().to_pybytes()
             except (pa.ArrowException, TypeError, ValueError) as exc:
                 raise HistoryStoreError("history records cannot be encoded as Parquet") from exc
-            key = history_key(asset_class, instrument_id, year)
-            keys.append(
-                self.put_mutable_partition(key, body)
-                if year == mutable_year
-                else self.put_if_absent(key, body)
-            )
-        return keys
+            digest = sha256(body).hexdigest()
+            key = history_key(asset_class, instrument_id, year, digest)
+            self.put_if_absent(key, body)
+            written.append(WrittenObject(key=key, sha256=digest, bytes=len(body)))
+        return written
 
-    def read_history(self, asset_class: str, instrument_id: str | UUID, year: int) -> list[dict[str, Any]]:
-        key = history_key(asset_class, instrument_id, year)
+    def read_history(
+        self, asset_class: str, instrument_id: str | UUID, year: int, sha256_hex: str
+    ) -> list[dict[str, Any]]:
+        key = history_key(asset_class, instrument_id, year, sha256_hex)
         body = self.client.get(key)
         if body is None:
             raise KeyError(key)
@@ -231,12 +246,14 @@ class HistoryStore:
         except (pa.ArrowException, OSError) as exc:
             raise HistoryStoreError(f"history Parquet object is invalid: {key}") from exc
 
-    def write_chart(self, dataset_id: str, instrument_id: str | UUID, chart: Any) -> str:
+    def write_chart(self, dataset_id: str, instrument_id: str | UUID, chart: Any) -> WrittenObject:
         payload = json.dumps(_safe(chart), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         output = io.BytesIO()
         with gzip.GzipFile(fileobj=output, mode="wb", mtime=0) as handle:
             handle.write(payload)
-        return self.put_if_absent(chart_key(dataset_id, instrument_id), output.getvalue())
+        body = output.getvalue()
+        key = self.put_if_absent(chart_key(dataset_id, instrument_id), body)
+        return WrittenObject(key=key, sha256=sha256(body).hexdigest(), bytes=len(body))
 
     def read_chart(self, dataset_id: str, instrument_id: str | UUID) -> Any:
         key = chart_key(dataset_id, instrument_id)
@@ -270,6 +287,7 @@ __all__ = [
     "HistoryStoreError",
     "LocalHistoryStore",
     "R2HistoryStore",
+    "WrittenObject",
     "chart_key",
     "history_key",
 ]

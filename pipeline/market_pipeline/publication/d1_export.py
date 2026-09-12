@@ -13,10 +13,16 @@ import argparse
 import json
 import math
 import sqlite3
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from market_pipeline.storage.history_store import HistoryStoreError, chart_key, history_key
+from market_pipeline.publication.bundle import (
+    BundleError,
+    PublicationBundle,
+    plan_garbage_collection,
+    sql_checksum as bundle_sql_checksum,
+)
 
 
 class DatasetExportError(RuntimeError):
@@ -235,13 +241,16 @@ def _publication_plan(
     *,
     d1_import_bytes: int,
     snapshot_bytes: int,
+    retained_objects: int = 0,
+    retained_bytes: int = 0,
+    garbage_collection: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     mutable = list(manifest["mutable"])
     immutable = list(manifest["immutable"])
     immutable_by_instrument: dict[str, int] = {}
     for key in immutable:
         parts = key.split("/")
-        if len(parts) != 4 or parts[0] != "history":
+        if parts[0] != "history" or len(parts) not in (4, 5):
             raise DatasetExportError("immutable manifest key is invalid")
         immutable_by_instrument[parts[2]] = immutable_by_instrument.get(parts[2], 0) + 1
     return {
@@ -255,6 +264,15 @@ def _publication_plan(
         "r2_mutable_objects": len(mutable),
         "r2_immutable_objects": len(immutable),
         "immutable_objects_by_instrument": immutable_by_instrument,
+        # Objects kept reachable for rollback (the active bundle plus the
+        # previous successfully-promoted bundle) and a dry-run cleanup plan
+        # for everything else this run found unreferenced. See R07/F14 and
+        # docs/operations/retention.md.
+        "retained_objects": retained_objects,
+        "retained_bytes": retained_bytes,
+        "garbage_collection": dict(garbage_collection) if garbage_collection is not None else {
+            "dry_run": True, "candidate_count": 0, "candidate_bytes": 0, "candidates": [],
+        },
         "weekday_runs_per_month": _WEEKDAY_RUNS_PER_MONTH,
         "max_d1_mutations_per_run": _MAX_D1_MUTATIONS_PER_RUN,
         "max_r2_class_a_per_month": _MAX_R2_CLASS_A_PER_MONTH,
@@ -262,48 +280,127 @@ def _publication_plan(
     }
 
 
-def _manifest_keys(connection: sqlite3.Connection, dataset_id: str, history_root: Path) -> dict[str, list[str]]:
-    """Return exactly the active dataset's chart and active instruments' history keys."""
+def _load_bundle(connection: sqlite3.Connection, dataset_id: str) -> PublicationBundle:
+    """Read this dataset's own recorded publication bundle.
+
+    The bundle is the authoritative record of exactly what this candidate
+    wrote (see ``jobs/publish.py``); the exporter never re-derives it by
+    scanning the object store.
+    """
+
+    row = connection.execute("SELECT metadata_json FROM datasets WHERE dataset_id = ?", (dataset_id,)).fetchone()
+    if row is None:
+        raise DatasetExportError("active dataset row is missing")
+    try:
+        metadata = json.loads(str(row[0]))
+    except json.JSONDecodeError as exc:
+        raise DatasetExportError("active dataset metadata is invalid") from exc
+    data = metadata.get("publication_bundle") if isinstance(metadata, dict) else None
+    if not data:
+        raise DatasetExportError("active dataset has no recorded publication bundle")
+    try:
+        bundle = PublicationBundle.from_dict(data)
+    except BundleError as exc:
+        raise DatasetExportError(f"active dataset publication bundle is invalid: {exc}") from exc
+    if bundle.dataset_id != dataset_id:
+        raise DatasetExportError("publication bundle dataset_id does not match the active dataset")
+    return bundle
+
+
+def _verify_bundle_objects(bundle: PublicationBundle, history_root: Path) -> None:
+    """Byte-verify exactly the bundle's own objects; never glob for extras."""
 
     root = history_root.resolve()
     if not root.is_dir():
         raise DatasetExportError("history root is missing")
+    for entry in bundle.objects:
+        path = (root / entry.key).resolve()
+        if not path.is_relative_to(root):
+            raise DatasetExportError(f"bundle object escapes configured root: {entry.key}")
+        try:
+            body = path.read_bytes()
+        except OSError as exc:
+            raise DatasetExportError(f"bundle object is missing: {entry.key}") from exc
+        if len(body) != entry.bytes or sha256(body).hexdigest() != entry.sha256:
+            raise DatasetExportError(f"bundle object does not match its recorded checksum: {entry.key}")
+
+
+def _bundle_object_groups(bundle: PublicationBundle) -> dict[str, list[str]]:
+    """Classify a bundle's objects into write-cadence groups for the R09 budget.
+
+    Chart objects and each instrument's newest (currently open) history year
+    are written on every run; a closed year's object already exists from an
+    earlier run and is only ever read back. This grouping is a cost estimate
+    for ``_publication_plan``, not a claim about mutability: every object
+    here is written exactly once, under a content-addressed key.
+    """
+
+    newest_year_by_instrument: dict[str, int] = {}
+    for entry in bundle.objects:
+        if entry.kind != "history":
+            continue
+        parts = entry.key.split("/")
+        if len(parts) != 5 or parts[0] != "history":
+            raise DatasetExportError(f"bundle history object key has an unexpected shape: {entry.key}")
+        instrument_id, year = parts[2], int(parts[3])
+        newest_year_by_instrument[instrument_id] = max(year, newest_year_by_instrument.get(instrument_id, year))
     mutable: list[str] = []
     immutable: list[str] = []
-    instruments = connection.execute(
-        "SELECT instrument_id, asset_class FROM instruments WHERE dataset_id = ? "
-        "ORDER BY asset_class, instrument_id",
-        (dataset_id,),
-    )
-    try:
-        for instrument_id, asset_class in instruments:
-            chart = chart_key(dataset_id, str(instrument_id))
-            chart_path = (root / chart).resolve()
-            if not chart_path.is_file() or not chart_path.is_relative_to(root):
-                raise DatasetExportError(f"active dataset chart is missing: {chart}")
-            mutable.append(chart)
-            history_dir = (root / Path(history_key(str(asset_class), str(instrument_id), 2000)).parent).resolve()
-            if not history_dir.is_relative_to(root):
-                raise DatasetExportError(f"history directory escapes configured root: {instrument_id}")
-            try:
-                history_files = sorted(history_dir.glob("*.parquet"))
-            except OSError as exc:
-                raise DatasetExportError(f"active instrument history is unreadable: {instrument_id}") from exc
-            if not history_files:
-                raise DatasetExportError(f"active instrument has no history: {instrument_id}")
-            newest = max(int(item.stem) for item in history_files)
-            for item in history_files:
-                try:
-                    key = history_key(str(asset_class), str(instrument_id), int(item.stem))
-                except (HistoryStoreError, ValueError) as exc:
-                    raise DatasetExportError(f"active instrument history key is invalid: {item}") from exc
-                expected = (root / key).resolve()
-                if not expected.is_file() or expected != item.resolve() or not expected.is_relative_to(root):
-                    raise DatasetExportError(f"history object escapes configured root: {item}")
-                (mutable if int(item.stem) == newest else immutable).append(key)
-    except HistoryStoreError as exc:
-        raise DatasetExportError("active dataset contains an unsafe history key") from exc
+    for entry in bundle.objects:
+        if entry.kind == "chart":
+            mutable.append(entry.key)
+            continue
+        instrument_id, year = entry.key.split("/")[2], int(entry.key.split("/")[3])
+        (mutable if year == newest_year_by_instrument[instrument_id] else immutable).append(entry.key)
     return {"mutable": sorted(mutable), "immutable": sorted(immutable)}
+
+
+def _existing_object_sizes(history_root: Path) -> dict[str, int]:
+    """Inventory derived objects already present in the store, for GC dry-run only.
+
+    This is the one place this module intentionally scans the store: garbage
+    collection is, by definition, a question about what exists that no
+    reachable bundle references, and that cannot be answered without looking.
+    It never decides what a candidate *needs* -- that always comes from a
+    bundle.
+    """
+
+    root = history_root.resolve()
+    sizes: dict[str, int] = {}
+    for prefix in ("history", "charts"):
+        base = root / prefix
+        if not base.is_dir():
+            continue
+        for path in base.rglob("*"):
+            if path.is_file():
+                sizes[path.relative_to(root).as_posix()] = path.stat().st_size
+    return sizes
+
+
+def _reachable_bundles(connection: sqlite3.Connection, dataset_id: str) -> list[PublicationBundle]:
+    """Bundles that must stay reachable: the active dataset and the previous promotion.
+
+    Keeping the previous successfully-promoted dataset's bundle reachable is
+    what makes rollback possible after a bad promotion. Rows are never
+    deleted by this module; datasets simply move from ``active`` to
+    ``superseded``.
+    """
+
+    rows = connection.execute(
+        "SELECT metadata_json FROM datasets WHERE status IN ('active','superseded') "
+        "ORDER BY CASE WHEN dataset_id = ? THEN 0 ELSE 1 END, promoted_at DESC LIMIT 2",
+        (dataset_id,),
+    ).fetchall()
+    bundles: list[PublicationBundle] = []
+    for (metadata_json,) in rows:
+        try:
+            metadata = json.loads(str(metadata_json))
+            data = metadata.get("publication_bundle") if isinstance(metadata, dict) else None
+            if data:
+                bundles.append(PublicationBundle.from_dict(data))
+        except (json.JSONDecodeError, BundleError):
+            continue
+    return bundles
 
 
 def export_active_dataset(
@@ -324,9 +421,25 @@ def export_active_dataset(
     _assert_complete(connection, dataset_id, dataset)
     if (history_root is None) != (object_manifest is None):
         raise DatasetExportError("history_root and object_manifest must be supplied together")
+    bundle: PublicationBundle | None = None
     manifest: dict[str, list[str]] | None = None
+    gc_plan_dict: dict[str, Any] | None = None
+    retained_objects = 0
+    retained_bytes = 0
     if history_root is not None:
-        manifest = _manifest_keys(connection, dataset_id, Path(history_root))
+        root = Path(history_root)
+        bundle = _load_bundle(connection, dataset_id)
+        _verify_bundle_objects(bundle, root)
+        manifest = _bundle_object_groups(bundle)
+        reachable = _reachable_bundles(connection, dataset_id)
+        if bundle.dataset_id not in {item.dataset_id for item in reachable}:
+            reachable = [bundle, *reachable]
+        existing_sizes = _existing_object_sizes(root)
+        gc_plan = plan_garbage_collection(reachable, existing_sizes)
+        gc_plan_dict = gc_plan.as_dict()
+        reachable_keys = {key for item in reachable for key in item.object_keys}
+        retained_objects = len(reachable_keys)
+        retained_bytes = sum(existing_sizes.get(key, 0) for key in reachable_keys)
     pointer = connection.execute(
         "SELECT changed_at FROM active_dataset WHERE singleton = 1"
     ).fetchone()
@@ -362,9 +475,11 @@ def export_active_dataset(
         "",
     ))
     import_bytes = _assert_sql_size(statements)
-    Path(output).write_text("\n".join(statements), encoding="utf-8")
-    if manifest is not None and object_manifest is not None:
-        Path(object_manifest).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    sql_text = "\n".join(statements)
+    Path(output).write_text(sql_text, encoding="utf-8")
+    if bundle is not None and object_manifest is not None:
+        finalized = bundle.with_sql_checksum(bundle_sql_checksum(sql_text))
+        Path(object_manifest).write_text(json.dumps(finalized.as_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if publication_plan is not None:
         source_count = sum(1 for _ in _rows(connection, "sources", dataset_id))
         source_run_count = sum(1 for _ in _rows(connection, "source_runs", dataset_id))
@@ -376,6 +491,9 @@ def export_active_dataset(
             manifest or {"mutable": [], "immutable": []},
             d1_import_bytes=import_bytes,
             snapshot_bytes=snapshot_bytes,
+            retained_objects=retained_objects,
+            retained_bytes=retained_bytes,
+            garbage_collection=gc_plan_dict,
         )
         Path(publication_plan).write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return dataset_id
