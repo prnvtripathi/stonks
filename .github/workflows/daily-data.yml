@@ -477,6 +477,7 @@ jobs:
           fi
 
       - name: Upload and verify private R2 history objects
+        id: r2_upload
         if: steps.params.outputs.manifest_present == 'true'
         # Below four hours (F14): a hair under r2_sync's own internal
         # --deadline-seconds 14400 (exactly four hours) below, so a true
@@ -497,11 +498,16 @@ jobs:
           # (including the D1 import that follows this one) unless a
           # later step explicitly opts back in with an always-run
           # condition, which none of the remaining promotion steps do.
+          # `pipefail` (set above) means this pipeline's exit code is still
+          # r2_sync's own -- `tee` never masks a failure -- while also
+          # capturing its one summary line (R09/F14) so the reservation-
+          # ledger step below can record the true attempted put/get counts
+          # instead of an estimate.
           uv run python -m market_pipeline.publication.r2_sync \
             --bundle active-history-objects.json \
             --history-root history \
             --max-workers 16 \
-            --deadline-seconds 14400
+            --deadline-seconds 14400 | tee r2-sync-summary.txt
 
       - name: Import active dataset into production D1
         if: steps.params.outputs.manifest_present == 'true'
@@ -536,7 +542,15 @@ jobs:
           fi
 
       - name: Record this run's reservation-ledger entry
-        if: steps.params.outputs.manifest_present == 'true'
+        # Fix round 1, Important #3: this must run even if a LATER step
+        # (D1 import/verify) fails, because R2 quota was already spent by
+        # the successful upload above and this ledger exists precisely to
+        # record spent-but-not-yet-observed quota -- `always()` plus an
+        # explicit check on the upload step's own outcome (not the job's
+        # overall status) means this step still runs on a post-upload
+        # failure, but is correctly skipped if the upload itself never
+        # succeeded (nothing was spent to record).
+        if: always() && steps.params.outputs.manifest_present == 'true' && steps.r2_upload.outcome == 'success'
         run: |
           set -euo pipefail
           # A live GraphQL Analytics observation lags real usage (ingestion
@@ -545,26 +559,44 @@ jobs:
           # preflight can bridge that lag rather than treat a stale
           # observation as complete -- see
           # market_pipeline.publication.remote_usage.append_reservation_ledger_entry.
-          # Recorded from the resolved plan (this run's own budget
-          # decision), which is a conservative upper bound: the true
-          # attempted R2 operation count from r2_sync's retries is not
-          # separately exposed by its CLI today.
+          # Fix round 1, Important #4: r2_sync's own summary line (captured
+          # by the upload step above) already reports the true attempted
+          # put/get counts, including every retry and reuse-verification
+          # request -- use that real count, not an estimate derived from
+          # the plan's object counts (which does not account for retries
+          # and would otherwise under-reserve, the unsafe direction for a
+          # conservative ledger).
           mkdir -p .cache
-          uv run python3 - resolved-publication-plan.json .cache/publication-ledger.json <<'PY'
+          uv run python3 - resolved-publication-plan.json r2-sync-summary.txt .cache/publication-ledger.json <<'PY'
           import json
+          import re
           import sys
           from datetime import datetime, timezone
-
-          from market_pipeline.publication.remote_usage import ReservationLedgerEntry, append_reservation_ledger_entry
           from pathlib import Path
 
+          from market_pipeline.publication.remote_usage import ReservationLedgerEntry, append_reservation_ledger_entry
+
           plan = json.load(open(sys.argv[1], encoding="utf-8"))
+          summary = Path(sys.argv[2]).read_text(encoding="utf-8")
+          match = re.search(
+              r"verified (\d+) objects \((\d+) bytes\) with \d+ attempted requests \((\d+) put, (\d+) get\)",
+              summary,
+          )
+          if match is None:
+              raise SystemExit(
+                  "could not parse r2_sync's summary line -- refusing to record an "
+                  "unverified reservation-ledger entry: " + repr(summary)
+              )
+          _verified_objects, verified_bytes, put_attempts, get_attempts = (int(group) for group in match.groups())
           entry = ReservationLedgerEntry(
               recorded_at=datetime.now(timezone.utc),
               d1_mutations=int(plan["d1_mutations"]),
-              r2_class_a_operations=int(plan["r2_mutable_objects"]) + int(plan["r2_immutable_objects"]),
-              r2_class_b_operations=int(plan["r2_mutable_objects"]) + int(plan["r2_immutable_objects"]),
-              r2_bytes=int(plan.get("d1_import_bytes", 0)),
+              # R2's own billing classes: PUT/POST/LIST/DELETE are Class A,
+              # GET/HEAD are Class B -- matching r2_sync's put/get attempt
+              # split directly onto the same classes preflight budgets.
+              r2_class_a_operations=put_attempts,
+              r2_class_b_operations=get_attempts,
+              r2_bytes=verified_bytes,
           )
-          append_reservation_ledger_entry(Path(sys.argv[2]), entry, now=entry.recorded_at)
+          append_reservation_ledger_entry(Path(sys.argv[3]), entry, now=entry.recorded_at)
           PY

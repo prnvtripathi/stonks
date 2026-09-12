@@ -382,3 +382,134 @@ def test_evaluate_publication_attempt_rejects_raw_untrusted_usage() -> None:
 
     assert outcome.mutation_calls == ()
     assert outcome.rejection_reason is not None and "validated RemoteUsage" in outcome.rejection_reason
+
+
+def test_evaluate_publication_attempt_rejects_oversized_r2_retained_bytes_before_any_mutation() -> None:
+    """Fix round 1, Important #1: R2 storage bytes must be budgeted, not just operation counts.
+
+    A plan that is otherwise well within every operation-count envelope
+    must still be rejected -- before any mutation is authorized -- when the
+    validated, observed R2 retained-bytes figure alone already exceeds the
+    storage envelope.
+    """
+
+    from market_pipeline.publication.preflight import MAX_R2_BYTES, evaluate_publication_attempt
+
+    monthly_attempt_plan = plan_monthly_attempts(NOW.date(), reserved_manual_attempts=4)
+    plan = _twelve_thousand_instrument_rolling_three_year_plan(weekday_runs_per_month=monthly_attempt_plan.monthly_attempts)
+    payload = _payload()
+    payload["data"]["viewer"]["accounts"][0]["r2"]["retainedBytes"] = MAX_R2_BYTES + 1
+    remote_usage = validate_remote_usage(payload, EXPECTED_RESOURCES, NOW)
+
+    oversized = evaluate_publication_attempt(
+        plan,
+        remote_usage=remote_usage,
+        remote_snapshot_ids=set(),
+        remote_active_dataset_id=None,
+        monthly_attempt_plan=monthly_attempt_plan,
+    )
+
+    assert not oversized.authorized
+    assert oversized.mutation_calls == ()
+    assert oversized.resolved_plan is None
+    assert oversized.rejection_reason is not None
+    assert "R2 retained storage" in oversized.rejection_reason
+
+
+def test_evaluate_publication_attempt_folds_reserved_ledger_bytes_into_the_r2_byte_budget() -> None:
+    """Not-yet-observed reservation-ledger bytes must count against the R2 byte cap too."""
+
+    from market_pipeline.publication.preflight import (
+        MAX_R2_BYTES,
+        ReservedTotals,
+        evaluate_publication_attempt,
+    )
+
+    monthly_attempt_plan = plan_monthly_attempts(NOW.date(), reserved_manual_attempts=4)
+    plan = _twelve_thousand_instrument_rolling_three_year_plan(weekday_runs_per_month=monthly_attempt_plan.monthly_attempts)
+    payload = _payload()
+    payload["data"]["viewer"]["accounts"][0]["r2"]["retainedBytes"] = int(MAX_R2_BYTES * 0.9)
+    remote_usage = validate_remote_usage(payload, EXPECTED_RESOURCES, NOW)
+    reserved = ReservedTotals(r2_bytes=int(MAX_R2_BYTES * 0.2))
+
+    oversized = evaluate_publication_attempt(
+        plan,
+        remote_usage=remote_usage,
+        remote_snapshot_ids=set(),
+        remote_active_dataset_id=None,
+        monthly_attempt_plan=monthly_attempt_plan,
+        reserved=reserved,
+    )
+
+    assert not oversized.authorized
+    assert oversized.rejection_reason is not None and "R2 retained storage" in oversized.rejection_reason
+
+
+def test_evaluate_publication_attempt_applies_account_budget_allocation_to_every_cap() -> None:
+    """Fix round 1, Important #2: DEFAULT_ACCOUNT_BUDGET_ALLOCATION must actually be enforced.
+
+    A plan that fits under the raw, literal caps but not under the scaled
+    (account-wide-allocation-reduced) caps must be rejected -- proving the
+    allocation fraction is multiplied in, not merely documented.
+    """
+
+    from market_pipeline.publication.d1_export import _publication_plan
+    from market_pipeline.publication.preflight import MAX_R2_BYTES, evaluate_publication_attempt
+
+    monthly_attempt_plan = plan_monthly_attempts(NOW.date(), reserved_manual_attempts=4)
+    # A tiny, otherwise-trivial plan so only the R2 byte cap is ever at
+    # stake -- isolates the allocation-scaling effect from every other cap.
+    plan = _publication_plan(
+        snapshot_ids=["instrument-1"],
+        source_count=1,
+        source_run_count=1,
+        manifest={"mutable": [], "immutable": []},
+        d1_import_bytes=1,
+        snapshot_bytes=1,
+        weekday_runs_per_month=monthly_attempt_plan.monthly_attempts,
+    )
+    payload = _payload()
+    # Comfortably under the raw MAX_R2_BYTES cap, but over a 50% allocation.
+    payload["data"]["viewer"]["accounts"][0]["r2"]["retainedBytes"] = int(MAX_R2_BYTES * 0.6)
+    remote_usage = validate_remote_usage(payload, EXPECTED_RESOURCES, NOW)
+
+    full_allocation = evaluate_publication_attempt(
+        plan,
+        remote_usage=remote_usage,
+        remote_snapshot_ids=set(),
+        remote_active_dataset_id=None,
+        monthly_attempt_plan=monthly_attempt_plan,
+        account_budget_allocation=1.0,
+    )
+    assert full_allocation.authorized
+
+    half_allocation = evaluate_publication_attempt(
+        plan,
+        remote_usage=remote_usage,
+        remote_snapshot_ids=set(),
+        remote_active_dataset_id=None,
+        monthly_attempt_plan=monthly_attempt_plan,
+        account_budget_allocation=0.5,
+    )
+    assert not half_allocation.authorized
+    assert half_allocation.rejection_reason is not None
+    assert "R2 retained storage" in half_allocation.rejection_reason
+
+
+def test_assert_plan_within_remote_budget_rejects_an_invalid_account_budget_allocation() -> None:
+    from market_pipeline.publication.preflight import assert_plan_within_remote_budget
+
+    monthly_attempt_plan = plan_monthly_attempts(NOW.date(), reserved_manual_attempts=4)
+    plan = _twelve_thousand_instrument_rolling_three_year_plan(weekday_runs_per_month=monthly_attempt_plan.monthly_attempts)
+    remote_usage = validate_remote_usage(_payload(), EXPECTED_RESOURCES, NOW)
+
+    for bad_allocation in (0, -0.1, 1.1):
+        with pytest.raises(RemotePublicationBudgetError):
+            assert_plan_within_remote_budget(
+                plan,
+                remote_usage=remote_usage,
+                remote_snapshot_ids=set(),
+                remote_active_dataset_id=None,
+                monthly_attempt_plan=monthly_attempt_plan,
+                account_budget_allocation=bad_allocation,
+            )

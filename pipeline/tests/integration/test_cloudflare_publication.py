@@ -75,6 +75,14 @@ def test_daily_workflow_uploads_and_verifies_history_before_d1_pointer_switch() 
     assert "timeout-minutes: 330" in workflow
     assert "timeout-minutes: 235" in workflow
 
+    # Fix round 1, Important #3/#4: the reservation-ledger step survives a
+    # later step's failure (as long as the R2 upload itself succeeded), and
+    # records r2_sync's real attempted put/get counts, not an estimate.
+    assert "id: r2_upload" in workflow
+    assert "if: always() && steps.params.outputs.manifest_present == 'true' && steps.r2_upload.outcome == 'success'" in workflow
+    assert "r2-sync-summary.txt" in workflow
+    assert "tee r2-sync-summary.txt" in workflow
+
 
 def test_daily_workflow_r2_upload_step_is_one_python_process_with_no_process_substitution() -> None:
     """F09/F10: no per-object subshell, no process substitution, one exit code."""

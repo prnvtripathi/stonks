@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from market_pipeline.publication.remote_usage import (
+    DEFAULT_ACCOUNT_BUDGET_ALLOCATION,
     DEFAULT_RESERVED_MANUAL_ATTEMPTS,
     MonthlyAttemptPlan,
     RemotePublicationBudgetError,
@@ -28,6 +29,15 @@ MAX_D1_DATABASE_BYTES = 400_000_000
 _D1_IMPORT_STORAGE_MULTIPLIER = 2
 MAX_R2_CLASS_A_PER_MONTH = 800_000
 MAX_R2_CLASS_B_PER_MONTH = 5_000_000
+#: Cloudflare R2's free tier stores up to 10 GB; reserve 80% of that for this
+#: publisher's own retained (reachable) objects -- same 80%-of-stated-limit
+#: style already used for MAX_D1_DATABASE_BYTES (400MB of D1's 500MB) --
+#: leaving headroom for measurement slop and any other bucket usage. Fixing
+#: F14's "Include R2 bytes ... in this task's budget" gap: this is compared
+#: against validated, observed `RemoteUsage.r2_retained_bytes` (plus
+#: not-yet-observed reservation-ledger bytes), never against raw/untrusted
+#: telemetry.
+MAX_R2_BYTES = 8_000_000_000
 
 
 def _default_weekday_runs_per_month(reference_date: date | None = None) -> int:
@@ -158,6 +168,8 @@ def assert_plan_within_remote_budget(
     max_d1_database_bytes: int = MAX_D1_DATABASE_BYTES,
     max_r2_class_a_per_month: int = MAX_R2_CLASS_A_PER_MONTH,
     max_r2_class_b_per_month: int = MAX_R2_CLASS_B_PER_MONTH,
+    max_r2_bytes: int = MAX_R2_BYTES,
+    account_budget_allocation: float = DEFAULT_ACCOUNT_BUDGET_ALLOCATION,
 ) -> RemoteBudgetDecision:
     """Gate a plan using validated Cloudflare telemetry (F11/F14).
 
@@ -168,19 +180,32 @@ def assert_plan_within_remote_budget(
     already-validated ``RemoteUsage`` -- raw Wrangler zero-default JSON (or
     any other unchecked payload) is rejected outright, never silently
     treated as "zero usage". It keeps ``assert_plan_within_free_tier``'s
-    D1 mutation/row/byte and R2 class A/B math completely intact, sourcing
-    its numbers from the validated object instead, and adds two checks that
-    raw ``d1_info`` alone cannot make:
+    D1 mutation/row/byte and R2 class A/B math completely intact (modulo the
+    ``account_budget_allocation`` scaling described below), sourcing its
+    numbers from the validated object instead, and adds checks that raw
+    ``d1_info`` alone cannot make:
 
     * the plan's monthly attempt envelope must match this month's
       independently computed schedule (:func:`~market_pipeline.publication
       .remote_usage.plan_monthly_attempts`) plus reserved manual attempts,
       so a stale hard-coded weekday constant can never silently drift from
-      reality; and
+      reality;
     * this publisher's own reservation-ledger totals recorded since the
       telemetry's observation (bridging analytics ingestion lag) are folded
       into the same-day D1 write and month-to-date R2 operation totals, so
-      operations already in flight are never invisible to the gate.
+      operations already in flight are never invisible to the gate;
+    * validated, observed ``r2_retained_bytes`` (plus not-yet-observed
+      ledger bytes) is checked against ``max_r2_bytes`` -- the pre-R09
+      preflight never read live R2 storage usage at all; and
+    * every cap this function enforces (D1 mutations/rows/bytes, R2 class
+      A/B operations, R2 bytes) is scaled down by
+      ``account_budget_allocation`` before use. D1 and R2 free-tier limits
+      are account-wide, not per-database/per-bucket, so this publisher
+      deliberately reserves only a fraction of the account's stated limits
+      for itself -- see ``docs/operations/security-checklist.md`` section
+      7. This scaling applies only in this validated-telemetry entry point;
+      :func:`assert_plan_within_free_tier`'s own defaults are untouched so
+      its existing direct unit tests keep exercising literal thresholds.
     """
 
     if not isinstance(remote_usage, RemoteUsage):
@@ -189,8 +214,21 @@ def assert_plan_within_remote_budget(
             "market_pipeline.publication.remote_usage.validate_remote_usage); "
             "raw Wrangler or GraphQL JSON is not an accepted source"
         )
+    if not isinstance(account_budget_allocation, (int, float)) or isinstance(account_budget_allocation, bool) or not 0 < account_budget_allocation <= 1:
+        raise RemotePublicationBudgetError("account_budget_allocation must be a fraction in (0, 1]")
     reserved_totals = reserved if reserved is not None else ReservedTotals()
     weekday_runs_per_month = monthly_attempt_plan.monthly_attempts
+
+    def _scale(cap: int) -> int:
+        return int(cap * account_budget_allocation)
+
+    effective_max_d1_mutations_per_run = _scale(max_d1_mutations_per_run)
+    effective_max_d1_rows_written_24h = _scale(max_d1_rows_written_24h)
+    effective_max_d1_database_bytes = _scale(max_d1_database_bytes)
+    effective_max_r2_class_a_per_month = _scale(max_r2_class_a_per_month)
+    effective_max_r2_class_b_per_month = _scale(max_r2_class_b_per_month)
+    effective_max_r2_bytes = _scale(max_r2_bytes)
+
     d1_info = {
         "database_size": remote_usage.d1_database_bytes,
         "rows_written_24h": remote_usage.d1_rows_written_24h + reserved_totals.d1_mutations,
@@ -200,11 +238,11 @@ def assert_plan_within_remote_budget(
         d1_info=d1_info,
         remote_snapshot_ids=remote_snapshot_ids,
         remote_active_dataset_id=remote_active_dataset_id,
-        max_d1_mutations_per_run=max_d1_mutations_per_run,
-        max_d1_rows_written_24h=max_d1_rows_written_24h,
-        max_d1_database_bytes=max_d1_database_bytes,
-        max_r2_class_a_per_month=max_r2_class_a_per_month,
-        max_r2_class_b_per_month=max_r2_class_b_per_month,
+        max_d1_mutations_per_run=effective_max_d1_mutations_per_run,
+        max_d1_rows_written_24h=effective_max_d1_rows_written_24h,
+        max_d1_database_bytes=effective_max_d1_database_bytes,
+        max_r2_class_a_per_month=effective_max_r2_class_a_per_month,
+        max_r2_class_b_per_month=effective_max_r2_class_b_per_month,
         weekday_runs_per_month=weekday_runs_per_month,
     )
     # `assert_plan_within_free_tier`'s class_a/class_b figures are a
@@ -216,15 +254,25 @@ def assert_plan_within_remote_budget(
     # live R2 usage read the pre-R09 preflight never made.
     observed_class_a = remote_usage.r2_class_a_operations_month_to_date + reserved_totals.r2_class_a_operations
     observed_class_b = remote_usage.r2_class_b_operations_month_to_date + reserved_totals.r2_class_b_operations
-    if observed_class_a >= max_r2_class_a_per_month:
+    if observed_class_a >= effective_max_r2_class_a_per_month:
         raise RemotePublicationBudgetError(
             f"observed R2 Class A operations this month ({observed_class_a}) already meet or exceed "
-            f"the safety envelope ({max_r2_class_a_per_month}); refusing to add this run's operations"
+            f"the safety envelope ({effective_max_r2_class_a_per_month}); refusing to add this run's operations"
         )
-    if observed_class_b >= max_r2_class_b_per_month:
+    if observed_class_b >= effective_max_r2_class_b_per_month:
         raise RemotePublicationBudgetError(
             f"observed R2 Class B operations this month ({observed_class_b}) already meet or exceed "
-            f"the safety envelope ({max_r2_class_b_per_month}); refusing to add this run's operations"
+            f"the safety envelope ({effective_max_r2_class_b_per_month}); refusing to add this run's operations"
+        )
+    # F14: budget R2 *storage* bytes too, not just operation counts -- the
+    # observed, validated retained-bytes figure plus this publisher's own
+    # not-yet-observed reservation-ledger bytes, compared against the
+    # account-scaled R2 storage envelope.
+    observed_r2_bytes = remote_usage.r2_retained_bytes + reserved_totals.r2_bytes
+    if observed_r2_bytes > effective_max_r2_bytes:
+        raise RemotePublicationBudgetError(
+            f"observed R2 retained storage ({observed_r2_bytes} bytes) would exceed "
+            f"the safety envelope ({effective_max_r2_bytes} bytes)"
         )
     return RemoteBudgetDecision(resolved_plan=resolved, mutation_calls=("d1_import", "r2_upload"))
 
@@ -264,6 +312,8 @@ def evaluate_publication_attempt(
     max_d1_database_bytes: int = MAX_D1_DATABASE_BYTES,
     max_r2_class_a_per_month: int = MAX_R2_CLASS_A_PER_MONTH,
     max_r2_class_b_per_month: int = MAX_R2_CLASS_B_PER_MONTH,
+    max_r2_bytes: int = MAX_R2_BYTES,
+    account_budget_allocation: float = DEFAULT_ACCOUNT_BUDGET_ALLOCATION,
 ) -> PublicationAttemptOutcome:
     """Gate one publication attempt without raising -- for reporting and tests."""
 
@@ -280,6 +330,8 @@ def evaluate_publication_attempt(
             max_d1_database_bytes=max_d1_database_bytes,
             max_r2_class_a_per_month=max_r2_class_a_per_month,
             max_r2_class_b_per_month=max_r2_class_b_per_month,
+            max_r2_bytes=max_r2_bytes,
+            account_budget_allocation=account_budget_allocation,
         )
     except RemotePublicationBudgetError as exc:
         return PublicationAttemptOutcome(mutation_calls=(), rejection_reason=str(exc))
@@ -297,6 +349,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--max-d1-database-bytes", type=int, default=MAX_D1_DATABASE_BYTES)
     parser.add_argument("--max-r2-class-a-per-month", type=int, default=MAX_R2_CLASS_A_PER_MONTH)
     parser.add_argument("--max-r2-class-b-per-month", type=int, default=MAX_R2_CLASS_B_PER_MONTH)
+    parser.add_argument("--max-r2-bytes", type=int, default=MAX_R2_BYTES, help="used only with --remote-usage")
+    parser.add_argument(
+        "--account-budget-allocation",
+        type=float,
+        default=DEFAULT_ACCOUNT_BUDGET_ALLOCATION,
+        help="fraction of each account-wide cap this publisher reserves for itself; used only with --remote-usage",
+    )
     parser.add_argument("--weekday-runs-per-month", type=int, default=None, help="defaults to the actual current month's scheduled attempts (see plan_monthly_attempts)")
     parser.add_argument(
         "--remote-usage",
@@ -353,6 +412,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_d1_database_bytes=args.max_d1_database_bytes,
                 max_r2_class_a_per_month=args.max_r2_class_a_per_month,
                 max_r2_class_b_per_month=args.max_r2_class_b_per_month,
+                max_r2_bytes=args.max_r2_bytes,
+                account_budget_allocation=args.account_budget_allocation,
             )
             resolved = decision.resolved_plan
         else:
