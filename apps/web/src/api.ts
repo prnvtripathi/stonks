@@ -108,7 +108,7 @@ export interface DashboardApi {
   getStatus(): Promise<StatusDto>;
   getMetrics(): Promise<readonly MetricDefinition[]>;
   getScreens(): Promise<Page<SavedScreen>>;
-  getRuns?(screenId: string): Promise<{ readonly screen: SavedScreen; readonly runs: readonly ScreenRunSummary[] }>;
+  getRuns?(screenId: string, options?: { readonly limit?: number; readonly offset?: number }): Promise<{ readonly screen: SavedScreen; readonly runs: readonly ScreenRunSummary[]; readonly pagination?: Page<ScreenRunSummary>["pagination"] }>;
   getResults?(screenId: string, options?: { readonly runId?: string; readonly limit?: number; readonly offset?: number; readonly sort?: "rank" | "score" | "symbol" | "assetClass"; readonly direction?: "asc" | "desc" }): Promise<ScreenResultsDto>;
   getInstrument?(instrumentId: string): Promise<InstrumentDto>;
   getChart?(instrumentId: string): Promise<ChartDto>;
@@ -140,7 +140,12 @@ export function createApiClient(options: ApiClientOptions = {}): DashboardApi {
     getStatus: () => request<StatusDto>("/api/v1/status"),
     getMetrics: async () => (await request<{ metrics: readonly MetricDefinition[] }>("/api/v1/metrics")).metrics,
     getScreens: () => request<Page<SavedScreen>>("/api/v1/screens"),
-    getRuns: (screenId) => request<{ screen: SavedScreen; runs: readonly ScreenRunSummary[] }>(`/api/v1/screens/${encodeURIComponent(screenId)}/runs`),
+    getRuns: (screenId, options = {}) => {
+      const params = new URLSearchParams();
+      if (options.limit !== undefined) params.set("limit", String(options.limit));
+      if (options.offset !== undefined) params.set("offset", String(options.offset));
+      return request<{ screen: SavedScreen; runs: readonly ScreenRunSummary[]; pagination: Page<ScreenRunSummary>["pagination"] }>(`/api/v1/screens/${encodeURIComponent(screenId)}/runs${params.toString() ? `?${params}` : ""}`);
+    },
     getResults: (screenId, options = {}) => {
       const params = new URLSearchParams();
       if (options.runId) params.set("runId", options.runId);

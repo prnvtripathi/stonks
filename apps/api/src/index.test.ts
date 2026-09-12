@@ -187,7 +187,7 @@ describe("private research API", () => {
     expect(flags(third)).toEqual({ one: { entered: true, exited: false }, two: { entered: false, exited: true } });
     expect(matchesFor(second).find((match) => match.instrumentId === "one")?.exited).toBe(true);
     expect(matchesFor(third).find((match) => match.instrumentId === "two")?.exited).toBe(true);
-    expect((await store.listRuns(screen.id)).map((run) => run.effectiveDate)).toEqual(["2026-03-01", "2026-02-01", "2026-01-01"]);
+    expect((await store.listRuns(screen.id)).runs.map((run) => run.effectiveDate)).toEqual(["2026-03-01", "2026-02-01", "2026-01-01"]);
   });
 
   it("does not repeat an exit after an instrument remains absent", async () => {
@@ -309,7 +309,7 @@ describe("private research API", () => {
       { id: "z-uuid", screenId: "screen-1", datasetId: "dataset-1", effectiveDate: "2026-09-07", completedAt: "2026-09-07T10:00:00.000Z", matchCount: 0, status: "complete", source: null, languageVersion: null, matches: [] },
       { id: "a-uuid", screenId: "screen-1", datasetId: "dataset-1", effectiveDate: "2026-09-07", completedAt: "2026-09-07T11:00:00.000Z", matchCount: 0, status: "complete", source: null, languageVersion: null, matches: [] },
     ]);
-    expect((await store.listRuns("screen-1")).map((run) => run.id)).toEqual(["a-uuid", "z-uuid"]);
+    expect((await store.listRuns("screen-1")).runs.map((run) => run.id)).toEqual(["a-uuid", "z-uuid"]);
   });
 
   it("uses the most recently completed run for default results and transitions", async () => {
@@ -321,7 +321,7 @@ describe("private research API", () => {
     store.instruments.set("latest", { instrumentId: "latest", symbol: "LATEST", name: "Latest", assetClass: "equity", active: true, metrics: { volume: 2 } });
     const latest = await store.runScreen("dataset-1", screen, "2026-09-04", "2026-09-09T11:00:00.000Z");
 
-    expect((await store.listRuns(screen.id))[0]?.id).toBe(latest.id);
+    expect((await store.listRuns(screen.id)).runs[0]?.id).toBe(latest.id);
 
     const next = await store.runScreen("dataset-1", screen, "2026-09-03", "2026-09-09T12:00:00.000Z");
     const nextPage = await store.pageRunMatches(next.id, { sort: "rank", direction: "asc", limit: 10, offset: 0 });
@@ -361,7 +361,7 @@ describe("private research API", () => {
     sqlite.prepare("INSERT INTO screen_matches (dataset_id, run_id, ordinal, instrument_id, score, symbol, name, asset_class, metrics_json, entered, exited) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run("dataset-1", "run-1", 1, "one", 2, "ONE", "One", "equity", "[]", 1, 0);
     sqlite.prepare("INSERT INTO screen_matches (dataset_id, run_id, ordinal, instrument_id, score, symbol, name, asset_class, metrics_json, entered, exited) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run("dataset-1", "run-1", 2, "two", 1, "TWO", "Two", "equity", "[]", 0, 1);
     const store = new D1ResearchStore(db);
-    const [run] = await store.listRuns("screen-1");
+    const { runs: [run] } = await store.listRuns("screen-1");
     expect(run).toMatchObject({ id: "run-1", matchCount: 1 });
     const page = await store.pageRunMatches("run-1", { sort: "rank", direction: "asc", limit: 10, offset: 0 });
     expect(page.total).toBe(1);

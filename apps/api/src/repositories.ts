@@ -17,6 +17,8 @@ export type SortDirection = "asc" | "desc";
 export interface ResultPageOptions { readonly sort: ResultSortField; readonly direction: SortDirection; readonly limit: number; readonly offset: number; }
 export interface RunMatchDto extends ScreenMatch { readonly explanation: Explanation; readonly momentum?: MomentumBreakdown; readonly entered: boolean; readonly exited: boolean; }
 export interface RunMatchPage { readonly matches: readonly RunMatchDto[]; readonly total: number; }
+export interface RunListOptions { readonly limit?: number; readonly offset?: number; }
+export interface RunListPage { readonly runs: readonly ScreenRun[]; readonly total: number; }
 export type ChartBody = string | ArrayBuffer | Uint8Array | ReadableStream<Uint8Array>;
 export interface ChartObject { readonly body: ChartBody; readonly contentType?: string; readonly contentEncoding?: string; }
 
@@ -36,8 +38,8 @@ export interface ResearchStore {
   getScreen(screenId: string): Promise<SavedScreen | null>;
   createScreen(input: { name: string; source: string; languageVersion: string; createdAt: string; updatedAt: string }): Promise<SavedScreen>;
   updateScreen(input: { id: string; name: string; source: string; updatedAt: string }): Promise<SavedScreen>;
-  /** Run summaries only, most-recently-executed first. Never embeds matches. */
-  listRuns(screenId: string): Promise<ScreenRun[]>;
+  /** One bounded page of run summaries, most-recently-executed first, plus the total run count. Never embeds matches. */
+  listRuns(screenId: string, options?: RunListOptions): Promise<RunListPage>;
   /** One run summary: the run named by `runId`, or the latest complete run when omitted. */
   getRun(screenId: string, runId?: string): Promise<ScreenRun | null>;
   /** One bounded, sorted page of a run's live matches, plus the total live-match count. */
@@ -53,6 +55,17 @@ interface StoredMatch { readonly instrumentId: string; readonly ordinal: number;
 interface StoredRun extends ScreenRun { readonly matches: readonly StoredMatch[]; }
 
 const SORT_TIEBREAK = (left: StoredMatch, right: StoredMatch): number => left.instrumentId.localeCompare(right.instrumentId);
+const RESULT_SORT_FIELDS: ReadonlySet<string> = new Set<ResultSortField>(["rank", "score", "symbol", "assetClass"]);
+
+/**
+ * Both stores must reject the same malformed input rather than one
+ * silently falling back to a default: a caller that skips its own
+ * validation should see the same error from either store.
+ */
+function validateResultPageOptions(options: ResultPageOptions): void {
+  if (!RESULT_SORT_FIELDS.has(options.sort)) throw new Error("Invalid sort field");
+  if (options.direction !== "asc" && options.direction !== "desc") throw new Error("Invalid sort direction");
+}
 
 function sortStoredMatches(matches: readonly StoredMatch[], options: ResultPageOptions): StoredMatch[] {
   const factor = options.direction === "asc" ? 1 : -1;
@@ -68,6 +81,15 @@ function sortStoredMatches(matches: readonly StoredMatch[], options: ResultPageO
     const comparison = typeof leftValue === "string" ? leftValue.localeCompare(String(rightValue)) : Number(leftValue) - Number(rightValue);
     return comparison * factor || SORT_TIEBREAK(left, right);
   });
+}
+
+const DEFAULT_RUN_LIST_LIMIT = 50;
+const MAX_RUN_LIST_LIMIT = 100;
+/** `screen_runs` is append-only and grows one row per execution forever; a caller that skips its own bounds still gets a bounded page. */
+function normalizeRunListOptions(options?: RunListOptions): { readonly limit: number; readonly offset: number } {
+  const limit = Math.min(Math.max(Math.trunc(options?.limit ?? DEFAULT_RUN_LIST_LIMIT), 1), MAX_RUN_LIST_LIMIT);
+  const offset = Math.max(Math.trunc(options?.offset ?? 0), 0);
+  return { limit, offset };
 }
 
 export class MemoryResearchStore implements ResearchStore {
@@ -105,13 +127,18 @@ export class MemoryResearchStore implements ResearchStore {
     for (const runs of this.runs.values()) { const found = runs.find((run) => run.id === runId); if (found) return found; }
     return undefined;
   }
-  public async listRuns(screenId: string): Promise<ScreenRun[]> { return this.sortedInternalRuns(screenId).map(stripMatches); }
+  public async listRuns(screenId: string, options?: RunListOptions): Promise<RunListPage> {
+    const { limit, offset } = normalizeRunListOptions(options);
+    const all = this.sortedInternalRuns(screenId).map(stripMatches);
+    return { runs: all.slice(offset, offset + limit), total: all.length };
+  }
   public async getRun(screenId: string, runId?: string): Promise<ScreenRun | null> {
     const runs = this.sortedInternalRuns(screenId);
     const run = runId ? runs.find((candidate) => candidate.id === runId) : runs.find((candidate) => candidate.status === "complete");
     return run ? stripMatches(run) : null;
   }
   public async pageRunMatches(runId: string, options: ResultPageOptions): Promise<RunMatchPage> {
+    validateResultPageOptions(options);
     const run = this.findRunById(runId);
     if (!run) return { matches: [], total: 0 };
     const parsed = run.source ? parseQuery(run.source).value ?? undefined : undefined;
@@ -181,9 +208,11 @@ export class D1ResearchStore implements ResearchStore {
   private runSummary(row: Record<string, unknown>): ScreenRun {
     return { id: String(row.run_id), screenId: String(row.screen_id), datasetId: String(row.dataset_id), effectiveDate: String(row.effective_date), ...(row.completed_at ? { completedAt: String(row.completed_at) } : {}), matchCount: Number(row.result_count), status: row.status === "failed" ? "failed" : "complete", source: row.source == null ? null : String(row.source), languageVersion: row.language_version == null ? null : String(row.language_version) };
   }
-  public async listRuns(screenId: string): Promise<ScreenRun[]> {
-    const result = await this.db.prepare(`SELECT run_id, screen_id, dataset_id, effective_date, completed_at, result_count, status, source, language_version FROM screen_runs WHERE screen_id = ? ORDER BY ${RUN_ORDER_SQL}`).bind(screenId).all<Record<string, unknown>>();
-    return result.results.map((row) => this.runSummary(row));
+  public async listRuns(screenId: string, options?: RunListOptions): Promise<RunListPage> {
+    const { limit, offset } = normalizeRunListOptions(options);
+    const totalRow = await this.db.prepare("SELECT COUNT(*) AS total FROM screen_runs WHERE screen_id = ?").bind(screenId).first<{ total: number }>();
+    const result = await this.db.prepare(`SELECT run_id, screen_id, dataset_id, effective_date, completed_at, result_count, status, source, language_version FROM screen_runs WHERE screen_id = ? ORDER BY ${RUN_ORDER_SQL} LIMIT ? OFFSET ?`).bind(screenId, limit, offset).all<Record<string, unknown>>();
+    return { runs: result.results.map((row) => this.runSummary(row)), total: Number(totalRow?.total ?? 0) };
   }
   public async getRun(screenId: string, runId?: string): Promise<ScreenRun | null> {
     const row = runId
@@ -192,13 +221,17 @@ export class D1ResearchStore implements ResearchStore {
     return row ? this.runSummary(row) : null;
   }
   public async pageRunMatches(runId: string, options: ResultPageOptions): Promise<RunMatchPage> {
+    validateResultPageOptions(options);
     const column = SORT_COLUMNS[options.sort];
-    if (!column) throw new Error("Invalid sort field");
-    if (options.direction !== "asc" && options.direction !== "desc") throw new Error("Invalid sort direction");
     const totalRow = await this.db.prepare("SELECT COUNT(*) AS total FROM screen_matches WHERE run_id = ? AND exited = 0").bind(runId).first<{ total: number }>();
     const total = Number(totalRow?.total ?? 0);
     const direction = options.direction.toUpperCase();
-    const pageResult = await this.db.prepare(`SELECT instrument_id, ordinal, score, symbol, name, asset_class, metrics_json, entered FROM screen_matches WHERE run_id = ? AND exited = 0 ORDER BY ${column} ${direction}, instrument_id ASC LIMIT ? OFFSET ?`).bind(runId, options.limit, options.offset).all<Record<string, unknown>>();
+    // `explanation_json` is read only as a fallback: rows written before the
+    // 0008 migration have no `metrics_json` (it defaults to '[]') and would
+    // otherwise silently lose their explanation on upgrade -- identity,
+    // score, and rank are unaffected, but the derived explanation is not
+    // "immutable" if it quietly degrades to "every predicate unavailable".
+    const pageResult = await this.db.prepare(`SELECT instrument_id, ordinal, score, symbol, name, asset_class, metrics_json, explanation_json, entered FROM screen_matches WHERE run_id = ? AND exited = 0 ORDER BY ${column} ${direction}, instrument_id ASC LIMIT ? OFFSET ?`).bind(runId, options.limit, options.offset).all<Record<string, unknown>>();
     const runRow = await this.db.prepare("SELECT source, language_version FROM screen_runs WHERE run_id = ?").bind(runId).first<{ source: string | null }>();
     const source = runRow?.source ?? null;
     const ast = source ? parseQuery(source).value ?? undefined : undefined;
@@ -211,7 +244,8 @@ export class D1ResearchStore implements ResearchStore {
     const name = row.name == null ? null : String(row.name);
     const assetClass = row.asset_class == null ? null : (String(row.asset_class) as AssetClass);
     const instrumentLike: InstrumentRow = { instrumentId: String(row.instrument_id), symbol, name, assetClass: (assetClass ?? "equity") as AssetClass, active: true, metricRows };
-    const explanation = source ? buildExplanation(source, instrumentLike, ast) : { matched: true, text: "", metrics: [] };
+    const legacyExplanation = metricRows.length === 0 ? tryParseExplanation(row.explanation_json) : null;
+    const explanation = legacyExplanation ?? (source ? buildExplanation(source, instrumentLike, ast) : { matched: true, text: "", metrics: [] });
     return { instrumentId: String(row.instrument_id), rank: Number(row.ordinal), score: row.score == null ? null : Number(row.score), symbol, name, assetClass, explanation, ...(explanation.momentum ? { momentum: explanation.momentum } : {}), entered: Boolean(row.entered), exited: false };
   }
   /**
@@ -346,6 +380,25 @@ function buildMomentum(item: InstrumentRow): MomentumBreakdown {
   const components = rows.map((row) => { const id = row.metric.slice("momentum_".length); const metadata = parseMetadata((row as MetricRow & { metadata?: unknown }).metadata); const normalized = typeof metadata.normalized === "number" ? metadata.normalized : row.normalizedValue ?? null; const weight = typeof metadata.weight === "number" ? metadata.weight : 0; const contribution = typeof metadata.contribution === "number" ? metadata.contribution : normalized === null ? null : normalized * weight; const unit: MomentumComponent["unit"] = metadata.unit === "percent" || metadata.unit === "count" ? metadata.unit : "ratio"; return { componentId: id, label: labels[id] ?? id, unit, raw: row.value, normalized, weight, contribution }; });
   const scoreMetadata = parseMetadata((score as MetricRow & { metadata?: unknown } | undefined)?.metadata); const cohort = typeof scoreMetadata.cohort === "string" ? scoreMetadata.cohort : item.assetClass === "mutual_fund" ? "mutual_fund:unknown" : item.assetClass; const sourceDate = typeof scoreMetadata.source_date === "string" ? scoreMetadata.source_date : score?.effectiveDate ?? null; const coverage = typeof scoreMetadata.coverage === "number" ? scoreMetadata.coverage : components.length ? components.filter((component) => component.normalized !== null).length / components.length : score?.state === "present" ? 1 : 0; const formulaVersion = score?.formulaVersion ?? "momentum-v2-cohort"; const warning = typeof scoreMetadata.warning === "string" ? scoreMetadata.warning : score?.state === "missing" ? "Momentum score is unavailable for this instrument." : undefined;
   return { components, cohort, formulaVersion, coverage, sourceDate, ...(warning ? { warning } : {}) };
+}
+/**
+ * Reads a pre-0008 row's `explanation_json` as a fallback when `metrics_json`
+ * is empty (the migration's default for rows that predate it). Returns
+ * `null` -- rather than a placeholder explanation -- when the value isn't a
+ * genuine legacy explanation, so the caller can tell "no legacy data" apart
+ * from "has legacy data" and fall back to rebuilding from `metrics_json`.
+ */
+function tryParseExplanation(value: unknown): Explanation | null {
+  if (typeof value !== "string") return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (typeof parsed === "object" && parsed !== null && "matched" in parsed && "text" in parsed && "metrics" in parsed && Array.isArray((parsed as Record<string, unknown>).metrics)) {
+      const record = parsed as Record<string, unknown>;
+      const metrics = record.metrics as readonly unknown[];
+      return { matched: Boolean(record.matched), text: String(record.text), metrics: metrics.map(String), ...(Array.isArray(record.clauses) ? { clauses: record.clauses as ExplanationClause[] } : {}), ...(typeof record.momentum === "object" && record.momentum !== null ? { momentum: record.momentum as MomentumBreakdown } : {}) };
+    }
+  } catch { /* corrupted legacy explanation falls through to rebuild */ }
+  return null;
 }
 function parseMetadata(value: unknown): Record<string, unknown> { if (typeof value === "object" && value !== null && !Array.isArray(value)) return value as Record<string, unknown>; if (typeof value !== "string") return {}; try { const parsed: unknown = JSON.parse(value); return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {}; } catch { return {}; } }
 function parseArray(value: unknown): readonly Record<string, unknown>[] { if (typeof value !== "string") return []; try { const parsed: unknown = JSON.parse(value); return Array.isArray(parsed) ? parsed.filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null) : []; } catch { return []; } }

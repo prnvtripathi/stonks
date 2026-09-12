@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { D1ResearchStore } from "./repositories";
-import { createSqliteD1, seedDataset, seedScreen } from "./test-support/sqlite-d1";
+import { createSqliteD1, explainQueryPlan, seedDataset, seedScreen } from "./test-support/sqlite-d1";
 
 /**
  * R06: bound saved-screen execution and result retrieval to set-based D1
@@ -158,7 +158,7 @@ describe("pageRunMatches bounds result retrieval", () => {
 });
 
 describe("listRuns and getRun return bounded summaries", () => {
-  it("lists 100 historical run summaries with a single statement and no embedded matches", async () => {
+  it("lists a full page of historical run summaries with a small statement budget and no embedded matches", async () => {
     const { db, sqlite, probe } = createSqliteD1();
     seedDataset(sqlite, "dataset-1");
     seedScreen(sqlite, "screen-1", "Momentum", "Volume > 0");
@@ -169,12 +169,34 @@ describe("listRuns and getRun return bounded summaries", () => {
     probe.reset();
     const store = new D1ResearchStore(db);
 
-    const runs = await store.listRuns("screen-1");
+    const page = await store.listRuns("screen-1", { limit: 100, offset: 0 });
 
-    expect(runs).toHaveLength(100);
-    expect(runs.every((run) => !("matches" in run))).toBe(true);
-    expect(probe.statementCount).toBe(1);
+    expect(page.runs).toHaveLength(100);
+    expect(page.total).toBe(100);
+    expect(page.runs.every((run) => !("matches" in run))).toBe(true);
+    expect(probe.statementCount).toBeLessThanOrEqual(2);
     expect(probe.materializedRows).toBe(100);
+  });
+
+  it("bounds listRuns to a default page size even when a caller passes no options, and reports the full total", async () => {
+    const { db, sqlite, probe } = createSqliteD1();
+    seedDataset(sqlite, "dataset-1");
+    seedScreen(sqlite, "screen-1", "Momentum", "Volume > 0");
+    const insertRun = sqlite.prepare("INSERT INTO screen_runs (dataset_id, run_id, screen_id, effective_date, status, result_count, source, language_version, completed_at) VALUES (?,?,?,?,?,?,?,?,?)");
+    for (let index = 0; index < 100; index += 1) {
+      insertRun.run("dataset-1", `run-${index}`, "screen-1", `2026-08-${String((index % 28) + 1).padStart(2, "0")}`, "complete", 5, "Volume > 0", "v1", `2026-08-${String((index % 28) + 1).padStart(2, "0")}T00:00:00.000Z`);
+    }
+    const store = new D1ResearchStore(db);
+
+    const defaultPage = await store.listRuns("screen-1");
+    expect(defaultPage.runs.length).toBeLessThanOrEqual(50);
+    expect(defaultPage.total).toBe(100);
+
+    // `screen_runs` is append-only and grows one row per execution forever;
+    // a caller-supplied limit above the maximum is clamped, not honored.
+    const oversized = await store.listRuns("screen-1", { limit: 10_000, offset: 0 });
+    expect(oversized.runs.length).toBeLessThanOrEqual(100);
+    expect(oversized.total).toBe(100);
   });
 
   it("getRun fetches one summary without touching screen_matches", async () => {
@@ -303,5 +325,112 @@ describe("runScreen creation is bounded", () => {
     const thirdPage = await store.pageRunMatches(third.id, { sort: "rank", direction: "asc", limit: 10, offset: 0 });
     expect(thirdPage.matches.map((match) => match.instrumentId)).toEqual(["two"]);
     expect(third.matchCount).toBe(1);
+  });
+
+  /**
+   * Warmed local baseline for the brief's "Record a warmed local
+   * 12,000-instrument representative-query timing and SQL query plan"
+   * requirement. This is a regression baseline, not the live personal-use
+   * timing check the spec's two-second target still needs separately: the
+   * assertions below are deliberately generous (an order of magnitude above
+   * the measured ~40-65ms) so this stays a signal for a real regression
+   * (e.g. an index dropped, or a per-row correlated subquery reintroduced)
+   * rather than a source of local/CI flakiness.
+   */
+  it("records a warmed 12,000-instrument representative-query timing and query plan baseline", async () => {
+    const { db, sqlite, probe } = createSqliteD1();
+    seedDataset(sqlite, "dataset-1");
+    seedScreen(sqlite, "screen-1", "Everything", "Volume > 0");
+    const insertInstrument = sqlite.prepare(
+      "INSERT INTO instrument_snapshots (instrument_id, dataset_id, symbol, name, asset_class, active, metric_values_json, metric_rows_json) VALUES (?,?,?,?,?,1,?,?)",
+    );
+    sqlite.exec("BEGIN");
+    for (let index = 0; index < 12_000; index += 1) {
+      const instrumentId = `inst-${String(index).padStart(6, "0")}`;
+      insertInstrument.run(
+        instrumentId,
+        "dataset-1",
+        instrumentId.toUpperCase(),
+        `Instrument ${index}`,
+        index % 2 === 0 ? "equity" : "etf",
+        JSON.stringify({ volume: index + 1, momentum_score: index }),
+        JSON.stringify([{ metric: "volume", value: index + 1, state: "present" }, { metric: "momentum_score", value: index, state: "present" }]),
+      );
+    }
+    sqlite.exec("COMMIT");
+
+    const store = new D1ResearchStore(db);
+    const screen = { id: "screen-1", name: "Everything", source: "Volume > 0", languageVersion: "v1", createdAt: "2026-01-01", updatedAt: "2026-01-01" } as const;
+    probe.reset();
+    const started = performance.now();
+    const run = await store.runScreen("dataset-1", screen, "2026-09-07");
+    const runElapsedMs = performance.now() - started;
+
+    expect(run.matchCount).toBe(12_000);
+    // Warmed local baseline: measured ~40-65ms locally. Ten seconds is a
+    // smoke-test ceiling to catch a gross regression, not a target.
+    expect(runElapsedMs).toBeLessThan(10_000);
+    console.info(`[R06 baseline] runScreen over 12,000 instruments: ${runElapsedMs.toFixed(2)}ms, ${probe.statementCount} statements`);
+
+    // The representative query is the current-match `INSERT ... SELECT`
+    // (identified by its ROW_NUMBER() window function). Its query plan must
+    // not show a per-candidate-row scan of `screen_runs` -- the previous-run
+    // lookup is resolved once, up front, and bound as a literal -- or of
+    // `instrument_snapshots` outside its covering index.
+    const representative = probe.executed.find((statement) => statement.sql.includes("ROW_NUMBER()") && statement.sql.includes("INSERT INTO screen_matches"));
+    expect(representative).toBeDefined();
+    const plan = explainQueryPlan(sqlite, representative!);
+    const planText = plan.map((row) => row.detail).join("\n");
+    console.info(`[R06 baseline] EXPLAIN QUERY PLAN:\n${planText}`);
+    expect(planText).toContain("USING INDEX idx_instrument_snapshots_active");
+    expect(planText).not.toContain("SCAN screen_runs");
+    expect(planText).not.toMatch(/SCAN i\b/); // full scan of instrument_snapshots, as opposed to a SEARCH via the index
+
+    const pageStarted = performance.now();
+    const page = await store.pageRunMatches(run.id, { sort: "rank", direction: "asc", limit: 25, offset: 0 });
+    const pageElapsedMs = performance.now() - pageStarted;
+    expect(page.matches).toHaveLength(25);
+    expect(pageElapsedMs).toBeLessThan(1_000);
+    console.info(`[R06 baseline] pageRunMatches over 12,000 matches: ${pageElapsedMs.toFixed(2)}ms`);
+  });
+});
+
+describe("historical explanations survive the 0008 upgrade", () => {
+  it("falls back to a pre-migration row's explanation_json when metrics_json is empty", async () => {
+    const { db, sqlite } = createSqliteD1();
+    seedDataset(sqlite, "dataset-1");
+    seedScreen(sqlite, "screen-1", "Volume", "Volume > 100");
+    sqlite.prepare("INSERT INTO screen_runs (dataset_id, run_id, screen_id, effective_date, status, result_count, source, language_version, completed_at) VALUES ('dataset-1','run-1','screen-1','2026-09-07','complete',1,'Volume > 100','v1','2026-09-07T00:00:00.000Z')").run();
+    // Simulates a row written before the 0008 migration: `metrics_json`
+    // takes its column default ('[]') because the column didn't exist yet
+    // when this row was written, but `explanation_json` (populated by the
+    // pre-R06 write path) still holds the real explanation.
+    const legacyExplanation = { matched: true, text: "Matched Volume > 100", metrics: ["volume"], clauses: [{ clause: "Volume > 100", metric: "volume", result: "Matched" }] };
+    sqlite.prepare("INSERT INTO screen_matches (dataset_id, run_id, ordinal, instrument_id, score, symbol, name, asset_class, explanation_json, entered, exited) VALUES ('dataset-1','run-1',1,'old',200,'OLD','Old Co','equity',?,1,0)")
+      .run(JSON.stringify(legacyExplanation));
+    const store = new D1ResearchStore(db);
+
+    const page = await store.pageRunMatches("run-1", { sort: "rank", direction: "asc", limit: 10, offset: 0 });
+
+    expect(page.matches).toHaveLength(1);
+    expect(page.matches[0]).toMatchObject({
+      instrumentId: "old",
+      explanation: { matched: true, text: "Matched Volume > 100", clauses: [{ clause: "Volume > 100", metric: "volume", result: "Matched" }] },
+    });
+  });
+
+  it("still rebuilds the explanation from metrics_json when a post-migration row legitimately has no legacy explanation_json", async () => {
+    const { db, sqlite } = createSqliteD1();
+    seedDataset(sqlite, "dataset-1");
+    seedScreen(sqlite, "screen-1", "Volume", "Volume > 5");
+    sqlite.prepare("INSERT INTO screen_runs (dataset_id, run_id, screen_id, effective_date, status, result_count, source, language_version, completed_at) VALUES ('dataset-1','run-1','screen-1','2026-09-07','complete',1,'Volume > 5','v1','2026-09-07T00:00:00.000Z')").run();
+    const metricsJson = JSON.stringify([{ metric: "volume", value: 10, state: "present" }]);
+    sqlite.prepare("INSERT INTO screen_matches (dataset_id, run_id, ordinal, instrument_id, score, symbol, name, asset_class, metrics_json, entered, exited) VALUES ('dataset-1','run-1',1,'new',10,'NEW','New Co','equity',?,1,0)")
+      .run(metricsJson);
+    const store = new D1ResearchStore(db);
+
+    const page = await store.pageRunMatches("run-1", { sort: "rank", direction: "asc", limit: 10, offset: 0 });
+
+    expect(page.matches[0]?.explanation.clauses?.[0]).toMatchObject({ metric: "volume", result: "Matched" });
   });
 });

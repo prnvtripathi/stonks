@@ -102,7 +102,7 @@ async function handle(request: Request, env: ApiEnv, store: ResearchStore, now: 
     if (screenDetail && request.method === "GET") return getScreen(decodeURIComponent(screenDetail[1]!), store);
     if (screenDetail && request.method === "PUT") return updateScreen(decodeURIComponent(screenDetail[1]!), request, env, store, now);
     const screenRuns = path.match(/^\/api\/v1\/screens\/([^/]+)\/runs$/);
-    if (screenRuns && request.method === "GET") return getRuns(decodeURIComponent(screenRuns[1]!), store);
+    if (screenRuns && request.method === "GET") return getRuns(decodeURIComponent(screenRuns[1]!), url, store);
     if (screenRuns && request.method === "POST") return runScreen(decodeURIComponent(screenRuns[1]!), url, store, now);
     const screenResults = path.match(/^\/api\/v1\/screens\/([^/]+)\/results$/);
     if (screenResults && request.method === "GET") return getResults(decodeURIComponent(screenResults[1]!), url, store);
@@ -197,10 +197,13 @@ function readResultSort(url: URL): { readonly sort: "rank" | "score" | "symbol" 
   return { sort: sort as "rank" | "score" | "symbol" | "assetClass", direction };
 }
 
-async function getRuns(screenId: string, store: ResearchStore): Promise<Response> {
+async function getRuns(screenId: string, url: URL, store: ResearchStore): Promise<Response> {
   const screen = await store.getScreen(screenId);
   if (!screen) return error(404, "Screen not found");
-  return json({ screen, runs: await store.listRuns(screenId) });
+  const pagination = readPagination(url);
+  if (!pagination) return error(400, "Invalid pagination");
+  const page = await store.listRuns(screenId, pagination);
+  return json({ screen, runs: page.runs, pagination: { limit: pagination.limit, offset: pagination.offset, total: page.total } });
 }
 async function getResults(screenId: string, url: URL, store: ResearchStore): Promise<Response> {
   const screen = await store.getScreen(screenId);

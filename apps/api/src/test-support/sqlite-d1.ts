@@ -21,11 +21,18 @@ const MIGRATION_FILES = [
   "0008_bounded_run_result_pagination.sql",
 ];
 
+export interface ExecutedStatement {
+  readonly sql: string;
+  readonly values: readonly unknown[];
+}
+
 export interface SqliteD1Probe {
   /** Number of distinct `db.prepare(...)` calls the repository made. */
   statementCount: number;
   /** Total rows returned across every `.all()` call (never `.first()`, which is always one scalar/row). */
   materializedRows: number;
+  /** Every statement actually executed (`.first()`/`.all()`/`.run()`), in order, with its bound values -- lets a test run `EXPLAIN QUERY PLAN` against the exact SQL the repository sent, instead of a hand-copied duplicate that can drift from it. */
+  executed: ExecutedStatement[];
   reset(): void;
 }
 
@@ -47,7 +54,8 @@ export function createSqliteD1(): SqliteD1Harness {
   const probe: SqliteD1Probe = {
     statementCount: 0,
     materializedRows: 0,
-    reset() { this.statementCount = 0; this.materializedRows = 0; },
+    executed: [],
+    reset() { this.statementCount = 0; this.materializedRows = 0; this.executed = []; },
   };
 
   const db: D1Database = {
@@ -57,15 +65,18 @@ export function createSqliteD1(): SqliteD1Harness {
       const statement: D1Statement = {
         bind(...values: unknown[]): D1Statement { bound = values; return statement; },
         async first<T extends Record<string, unknown>>(): Promise<T | null> {
+          probe.executed.push({ sql, values: bound });
           const row = sqlite.prepare(sql).get(...(bound as never[])) as T | undefined;
           return row ?? null;
         },
         async all<T extends Record<string, unknown>>(): Promise<{ results: readonly T[] }> {
+          probe.executed.push({ sql, values: bound });
           const rows = sqlite.prepare(sql).all(...(bound as never[])) as T[];
           probe.materializedRows += rows.length;
           return { results: rows };
         },
         async run(): Promise<D1Result> {
+          probe.executed.push({ sql, values: bound });
           sqlite.prepare(sql).run(...(bound as never[]));
           return { success: true };
         },
@@ -96,4 +107,10 @@ export function seedDataset(sqlite: DatabaseSync, datasetId: string, effectiveDa
 
 export function seedScreen(sqlite: DatabaseSync, screenId: string, name: string, expression: string, timestamp = "2026-09-01T00:00:00.000Z"): void {
   sqlite.prepare("INSERT INTO saved_screens (screen_id, name, expression, created_at, updated_at) VALUES (?, ?, ?, ?, ?)").run(screenId, name, expression, timestamp, timestamp);
+}
+
+/** Runs `EXPLAIN QUERY PLAN` for an already-executed statement (from `probe.executed`), against the same connection and bound values, so the plan reflects exactly what the repository sent. */
+export function explainQueryPlan(sqlite: DatabaseSync, statement: ExecutedStatement): readonly { readonly detail: string }[] {
+  const rows = sqlite.prepare(`EXPLAIN QUERY PLAN ${statement.sql}`).all(...(statement.values as never[])) as { detail: string }[];
+  return rows;
 }
