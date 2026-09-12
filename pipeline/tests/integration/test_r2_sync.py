@@ -253,13 +253,22 @@ def test_sync_rejects_out_of_range_worker_and_deadline_bounds(tmp_path: Path) ->
 
 
 def test_sync_at_scale_bounds_concurrency_for_many_instruments_and_partitions(tmp_path: Path) -> None:
-    """12,000 instruments across 4 calendar partitions, scheduled with no per-object subprocess."""
+    """12,000 instruments across 4 calendar partitions (the plan's actual target
+    scale), scheduled with no per-object subprocess.
+
+    This exercises the sliding-window scheduler itself -- the `pending`
+    deque, thread-pool churn, and bookkeeping across 48,000 objects -- not
+    real network latency (the fake client's delay is deliberately near
+    zero). Any degradation in the scheduling/bookkeeping path at this scale
+    would show up as this test becoming slow or hanging, independent of
+    whatever a real R2 endpoint's round-trip time would add on top.
+    """
 
     from market_pipeline.publication.r2_sync import synchronize_history
 
     root = tmp_path / "history"
     entries = []
-    instrument_count = 60  # kept small for test runtime; exercises the same scheduling path
+    instrument_count = 12_000
     years = (2021, 2022, 2023, 2024)
     for index in range(instrument_count):
         for year in years:
@@ -268,16 +277,17 @@ def test_sync_at_scale_bounds_concurrency_for_many_instruments_and_partitions(tm
             _write(root, entry.key, body)
             entries.append(entry)
 
-    client = _FakeS3Client(delay=0.001)
+    client = _FakeS3Client(delay=0.0)
     started = time.monotonic()
-    result = synchronize_history(_bundle(tuple(entries)), root, client, max_workers=16, deadline_seconds=60)
+    result = synchronize_history(_bundle(tuple(entries)), root, client, max_workers=16, deadline_seconds=120)
     elapsed = time.monotonic() - started
 
     assert result.verified_objects == len(entries) == instrument_count * len(years)
     assert client.max_active <= 16
-    # Predicted throughput from this fake client's injected latency is not
-    # production network evidence -- recorded separately, never asserted as
-    # a real-world SLA.
+    # Predicted throughput from this fake client's near-zero injected
+    # latency is not production network evidence -- recorded separately,
+    # never asserted as a real-world SLA. It only proves the scheduler
+    # itself does not degrade at 48,000 objects.
     predicted_fake_client_objects_per_second = len(entries) / elapsed if elapsed > 0 else float("inf")
     assert predicted_fake_client_objects_per_second > 0
 
