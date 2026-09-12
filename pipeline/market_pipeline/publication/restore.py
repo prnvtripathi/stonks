@@ -195,11 +195,15 @@ def restore_dataset(
        through R08's own bounded, checksum-verified transport
        (:func:`~market_pipeline.publication.r2_sync.synchronize_history`) --
        the same R2 verification gate a normal publish uses, reusing the one
-       S3-compatible client this publisher has, never a second one. This
-       step is a no-op for objects already correct in R2 (content-addressed
-       keys let ``r2_sync`` verify-and-skip), but it still surfaces a
-       genuinely missing or corrupted remote object *before* any D1 SQL is
-       produced.
+       S3-compatible client this publisher has, never a second one. This is
+       *not* a cheap no-op even when every object is already correct in R2:
+       ``r2_sync`` has no skip-if-present fast path today, so this step
+       always spends one PUT attempt per object before its first
+       verification GET (see ``r2_sync._sync_one``), the same cost a normal
+       publish's own upload step pays. Budget this step's full PUT+GET
+       operation cost against R09's monthly R2 allowance accordingly. It
+       still reliably surfaces a genuinely missing or corrupted remote
+       object *before* any D1 SQL is produced.
     4. Only once every requested check has passed does
        :func:`~market_pipeline.publication.d1_export.export_dataset`
        generate the D1 import SQL -- the same statement shape, and the same
