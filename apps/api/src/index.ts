@@ -103,7 +103,7 @@ async function handle(request: Request, env: ApiEnv, store: ResearchStore, now: 
     if (screenDetail && request.method === "PUT") return updateScreen(decodeURIComponent(screenDetail[1]!), request, env, store, now);
     const screenRuns = path.match(/^\/api\/v1\/screens\/([^/]+)\/runs$/);
     if (screenRuns && request.method === "GET") return getRuns(decodeURIComponent(screenRuns[1]!), store);
-    if (screenRuns && request.method === "POST") return runScreen(decodeURIComponent(screenRuns[1]!), store, now);
+    if (screenRuns && request.method === "POST") return runScreen(decodeURIComponent(screenRuns[1]!), url, store, now);
     const screenResults = path.match(/^\/api\/v1\/screens\/([^/]+)\/results$/);
     if (screenResults && request.method === "GET") return getResults(decodeURIComponent(screenResults[1]!), url, store);
     const chart = path.match(/^\/api\/v1\/instruments\/([^/]+)\/chart$/);
@@ -188,6 +188,15 @@ async function updateScreen(screenId: string, request: Request, env: ApiEnv, sto
   return json(await store.updateScreen({ id: screenId, name: payload.name, source: payload.source, updatedAt }));
 }
 
+const RESULT_SORT_FIELDS = new Set(["rank", "score", "symbol", "assetClass"]);
+function readResultSort(url: URL): { readonly sort: "rank" | "score" | "symbol" | "assetClass"; readonly direction: "asc" | "desc" } | null {
+  const sort = url.searchParams.get("sort") ?? "rank";
+  if (!RESULT_SORT_FIELDS.has(sort)) return null;
+  const direction = url.searchParams.get("direction") ?? (sort === "score" ? "desc" : "asc");
+  if (direction !== "asc" && direction !== "desc") return null;
+  return { sort: sort as "rank" | "score" | "symbol" | "assetClass", direction };
+}
+
 async function getRuns(screenId: string, store: ResearchStore): Promise<Response> {
   const screen = await store.getScreen(screenId);
   if (!screen) return error(404, "Screen not found");
@@ -199,33 +208,20 @@ async function getResults(screenId: string, url: URL, store: ResearchStore): Pro
   const datasetId = await store.activeDatasetId();
   const pagination = readPagination(url);
   if (!pagination) return error(400, "Invalid pagination");
-  const sort = url.searchParams.get("sort") ?? "rank";
-  if (!(new Set(["rank", "score", "symbol", "assetClass"])).has(sort)) return error(400, "Invalid sort");
-  const direction = url.searchParams.get("direction") ?? (sort === "score" ? "desc" : "asc");
-  if (direction !== "asc" && direction !== "desc") return error(400, "Invalid sort direction");
-  const runs = (await store.listRuns(screenId)).filter((candidate) => candidate.status === "complete");
-  const requestedRunId = url.searchParams.get("runId");
-  const run = (requestedRunId ? runs.find((candidate) => candidate.id === requestedRunId) : runs[0]) ?? null;
-  if (!run) return error(404, "Run not found");
-  const enriched = run.matches.filter((match) => !match.exited).map((match) => {
-    const explanation = match.explanation;
-    const momentum = match.momentum ?? explanation.momentum;
-    return { ...match, explanation, ...(momentum ? { momentum } : {}) };
-  });
-  const ordered = [...enriched].sort((left, right) => {
-    const leftValue = sort === "symbol" ? left.symbol ?? "" : sort === "assetClass" ? left.assetClass ?? "" : left[sort as "rank" | "score"] ?? -Infinity;
-    const rightValue = sort === "symbol" ? right.symbol ?? "" : sort === "assetClass" ? right.assetClass ?? "" : right[sort as "rank" | "score"] ?? -Infinity;
-    const comparison = typeof leftValue === "string" ? leftValue.localeCompare(String(rightValue)) : Number(leftValue) - Number(rightValue);
-    return (direction === "asc" ? comparison : -comparison) || left.instrumentId.localeCompare(right.instrumentId);
-  });
+  const sortOptions = readResultSort(url);
+  if (!sortOptions) return error(400, "Invalid sort");
+  const requestedRunId = url.searchParams.get("runId") ?? undefined;
+  const run = await store.getRun(screenId, requestedRunId);
+  if (!run || run.status !== "complete") return error(404, "Run not found");
   const { limit, offset } = pagination;
-  return json({ screen, run: { ...run, isCurrentDataset: run.datasetId === datasetId, isCurrentQuery: run.source !== null && run.source !== undefined && run.source === screen.source && run.languageVersion === screen.languageVersion, matches: ordered.slice(offset, offset + limit) }, pagination: { limit, offset, total: ordered.length } });
+  const page = await store.pageRunMatches(run.id, { ...sortOptions, limit, offset });
+  return json({ screen, run: { ...run, isCurrentDataset: run.datasetId === datasetId, isCurrentQuery: run.source !== null && run.source !== undefined && run.source === screen.source && run.languageVersion === screen.languageVersion, matches: page.matches }, pagination: { limit, offset, total: page.total } });
 }
 async function getScreen(screenId: string, store: ResearchStore): Promise<Response> {
   const screen = await store.getScreen(screenId);
   return screen ? json(screen) : error(404, "Screen not found");
 }
-async function runScreen(screenId: string, store: ResearchStore, now: () => Date): Promise<Response> {
+async function runScreen(screenId: string, url: URL, store: ResearchStore, now: () => Date): Promise<Response> {
   const datasetId = await store.activeDatasetId();
   if (!datasetId) return error(503, "No active dataset");
   const screen = await store.getScreen(screenId);
@@ -233,7 +229,10 @@ async function runScreen(screenId: string, store: ResearchStore, now: () => Date
   const completedAt = now().toISOString();
   const status = await store.status(datasetId);
   if (!status.effectiveDate) return error(503, "Dataset effective date is unavailable");
-  return json(await store.runScreen(datasetId, screen, status.effectiveDate, completedAt), 201);
+  const run = await store.runScreen(datasetId, screen, status.effectiveDate, completedAt);
+  const pagination = readPagination(url) ?? { limit: 25, offset: 0 };
+  const page = await store.pageRunMatches(run.id, { sort: "rank", direction: "asc", limit: pagination.limit, offset: pagination.offset });
+  return json({ ...run, matches: page.matches, pagination: { limit: pagination.limit, offset: pagination.offset, total: page.total } }, 201);
 }
 async function getInstrument(instrumentId: string, store: ResearchStore): Promise<Response> {
   const datasetId = await store.activeDatasetId();

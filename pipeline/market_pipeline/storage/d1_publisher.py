@@ -50,6 +50,17 @@ def upgrade_immutable_screen_run_schema(connection: sqlite3.Connection) -> None:
                 connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
 
 
+def upgrade_bounded_run_result_pagination_schema(connection: sqlite3.Connection) -> None:
+    """Apply 0008's additive column/index once for repeatable local initialization."""
+
+    existing = {str(row[1]) for row in connection.execute("PRAGMA table_info(screen_matches)")}
+    if "metrics_json" not in existing:
+        connection.execute("ALTER TABLE screen_matches ADD COLUMN metrics_json TEXT NOT NULL DEFAULT '[]'")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_screen_matches_by_run ON screen_matches(run_id, exited, ordinal)"
+    )
+
+
 @dataclass(frozen=True)
 class DatasetCandidate:
     dataset_id: str
@@ -137,6 +148,9 @@ class D1Publisher:
         # intentionally repeatable, so use the same additive schema upgrade
         # without replaying its non-idempotent ALTER TABLE statements.
         upgrade_immutable_screen_run_schema(self.connection)
+        # 0008 adds a compact per-match metric snapshot and a retrieval index;
+        # apply it the same repeatable way as 0007.
+        upgrade_bounded_run_result_pagination_schema(self.connection)
         self.connection.commit()
 
     def active_dataset_id(self) -> str | None:

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import worker from "./index";
 import { createApi, createTestAccessVerifier, D1ResearchStore, MemoryResearchStore, verifyAccessRequest, type ApiEnv, type D1Database, type D1Result, type D1Statement } from "./index";
 import { buildExplanation } from "./repositories";
+import { createSqliteD1, seedDataset, seedScreen } from "./test-support/sqlite-d1";
 
 const env: ApiEnv = {
   accessTeamDomain: "https://access.example.com",
@@ -178,13 +179,14 @@ describe("private research API", () => {
     instrument("one", true);
     instrument("two", false);
     const third = await store.runScreen("dataset-new", screen, "2026-03-01");
-    const flags = (run: typeof first) => Object.fromEntries(run.matches.map((match) => [match.instrumentId, { entered: match.entered, exited: match.exited }]));
+    const matchesFor = (run: { readonly id: string; readonly datasetId: string }) => store.runs.get(`${run.datasetId}:${screen.id}`)!.find((candidate) => candidate.id === run.id)!.matches;
+    const flags = (run: { readonly id: string; readonly datasetId: string }) => Object.fromEntries(matchesFor(run).map((match) => [match.instrumentId, { entered: match.entered, exited: match.exited }]));
 
     expect(flags(first)).toEqual({ one: { entered: true, exited: false } });
     expect(flags(second)).toEqual({ two: { entered: true, exited: false }, one: { entered: false, exited: true } });
     expect(flags(third)).toEqual({ one: { entered: true, exited: false }, two: { entered: false, exited: true } });
-    expect(second.matches.find((match) => match.instrumentId === "one")?.rank).toBe(0);
-    expect(third.matches.find((match) => match.instrumentId === "two")?.rank).toBe(0);
+    expect(matchesFor(second).find((match) => match.instrumentId === "one")?.exited).toBe(true);
+    expect(matchesFor(third).find((match) => match.instrumentId === "two")?.exited).toBe(true);
     expect((await store.listRuns(screen.id)).map((run) => run.effectiveDate)).toEqual(["2026-03-01", "2026-02-01", "2026-01-01"]);
   });
 
@@ -196,9 +198,12 @@ describe("private research API", () => {
     store.instruments.set("one", { instrumentId: "one", symbol: "ONE", name: "One", assetClass: "equity", active: false, metrics: { volume: 10 } });
     const second = await store.runScreen("dataset-1", screen, "2026-01-02");
     const third = await store.runScreen("dataset-1", screen, "2026-01-03");
+    const matchesFor = (run: { readonly id: string; readonly datasetId: string }) => store.runs.get(`${run.datasetId}:${screen.id}`)!.find((candidate) => candidate.id === run.id)!.matches;
 
-    expect(second.matches.map((match) => ({ instrumentId: match.instrumentId, exited: match.exited, rank: match.rank }))).toEqual([{ instrumentId: "one", exited: true, rank: 0 }]);
-    expect(third.matches).toEqual([]);
+    expect(matchesFor(second).map((match) => ({ instrumentId: match.instrumentId, exited: match.exited }))).toEqual([{ instrumentId: "one", exited: true }]);
+    expect(matchesFor(third).filter((match) => !match.exited)).toEqual([]);
+    expect(second.matchCount).toBe(0);
+    expect(third.matchCount).toBe(0);
   });
 
   it("rejects missing mutation origin, unknown fields, invalid pagination, and oversized bytes", async () => {
@@ -289,7 +294,8 @@ describe("private research API", () => {
     ] });
     const screen = await store.createScreen({ name: "Compound", source: "Volume > 5 OR Return over 3months > 10%", languageVersion: "v1", createdAt: "2026-01-01", updatedAt: "2026-01-01" });
     const run = await store.runScreen("dataset-1", screen, "2026-01-01");
-    const clauses = run.matches[0]?.explanation.clauses ?? [];
+    const page = await store.pageRunMatches(run.id, { sort: "rank", direction: "asc", limit: 10, offset: 0 });
+    const clauses = page.matches[0]?.explanation.clauses ?? [];
     expect(clauses).toHaveLength(2);
     expect(clauses.map((clause) => clause.metric)).toEqual(["volume", "return_3m"]);
     expect(clauses.map((clause) => clause.result)).toEqual(["Matched", "Unavailable"]);
@@ -318,7 +324,8 @@ describe("private research API", () => {
     expect((await store.listRuns(screen.id))[0]?.id).toBe(latest.id);
 
     const next = await store.runScreen("dataset-1", screen, "2026-09-03", "2026-09-09T12:00:00.000Z");
-    expect(next.matches.find((match) => match.instrumentId === "latest")).toMatchObject({ entered: false, exited: false });
+    const nextPage = await store.pageRunMatches(next.id, { sort: "rank", direction: "asc", limit: 10, offset: 0 });
+    expect(nextPage.matches.find((match) => match.instrumentId === "latest")).toMatchObject({ entered: false, exited: false });
   });
 
   it("inverts only known predicate outcomes for odd NOT parity", () => {
@@ -346,115 +353,71 @@ describe("private research API", () => {
     await expect(new D1ResearchStore(failingDb).createScreen({ name: "x", source: "Volume > 1", languageVersion: "v1", createdAt: "2026-09-07T00:00:00.000Z", updatedAt: "2026-09-07T00:00:00.000Z" })).rejects.toThrow("D1 mutation failed");
   });
 
-  it("maps persisted exit ordinals to API rank zero", async () => {
-    class RunHistoryStatement implements D1Statement {
-      public constructor(private readonly sql: string) {}
-      bind(..._values: unknown[]): D1Statement { return this; }
-      async first<T extends Record<string, unknown> = Record<string, unknown>>(): Promise<T | null> { return null; }
-      async all<T extends Record<string, unknown> = Record<string, unknown>>(): Promise<{ results: readonly T[] }> {
-        if (this.sql.includes("FROM screen_runs")) return { results: [{ run_id: "run-1", screen_id: "screen-1", dataset_id: "dataset-1", effective_date: "2026-09-07", result_count: 1, status: "complete" }] as unknown as readonly T[] };
-        if (this.sql.includes("FROM screen_matches")) return { results: [{ instrument_id: "one", ordinal: 1, score: 2, explanation_json: JSON.stringify({ matched: true, text: "matched", metrics: ["volume"] }), entered: 1, exited: 0 }, { instrument_id: "two", ordinal: 2, score: 1, explanation_json: JSON.stringify({ matched: false, text: "exited", metrics: ["volume"] }), entered: 0, exited: 1 }] as unknown as readonly T[] };
-        return { results: [] };
-      }
-      async run(): Promise<D1Result> { return { success: true }; }
-    }
-    const db: D1Database = { prepare: (sql) => new RunHistoryStatement(sql) };
-    const [run] = await new D1ResearchStore(db).listRuns("screen-1");
-    expect(run?.matches.map((match) => ({ instrumentId: match.instrumentId, rank: match.rank, exited: match.exited }))).toEqual([
+  it("excludes exited rows from a page and reports the persisted ordinal as rank", async () => {
+    const { db, sqlite } = createSqliteD1();
+    seedDataset(sqlite, "dataset-1");
+    seedScreen(sqlite, "screen-1", "Volume", "Volume > 1");
+    sqlite.prepare("INSERT INTO screen_runs (dataset_id, run_id, screen_id, effective_date, status, result_count, source, language_version, completed_at) VALUES (?,?,?,?,?,?,?,?,?)").run("dataset-1", "run-1", "screen-1", "2026-09-07", "complete", 1, "Volume > 1", "v1", "2026-09-07T00:00:00.000Z");
+    sqlite.prepare("INSERT INTO screen_matches (dataset_id, run_id, ordinal, instrument_id, score, symbol, name, asset_class, metrics_json, entered, exited) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run("dataset-1", "run-1", 1, "one", 2, "ONE", "One", "equity", "[]", 1, 0);
+    sqlite.prepare("INSERT INTO screen_matches (dataset_id, run_id, ordinal, instrument_id, score, symbol, name, asset_class, metrics_json, entered, exited) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run("dataset-1", "run-1", 2, "two", 1, "TWO", "Two", "equity", "[]", 0, 1);
+    const store = new D1ResearchStore(db);
+    const [run] = await store.listRuns("screen-1");
+    expect(run).toMatchObject({ id: "run-1", matchCount: 1 });
+    const page = await store.pageRunMatches("run-1", { sort: "rank", direction: "asc", limit: 10, offset: 0 });
+    expect(page.total).toBe(1);
+    expect(page.matches.map((match) => ({ instrumentId: match.instrumentId, rank: match.rank, exited: match.exited }))).toEqual([
       { instrumentId: "one", rank: 1, exited: false },
-      { instrumentId: "two", rank: 0, exited: true },
     ]);
   });
 
   it("orders D1 runs by parsed execution time for defaults and predecessors", async () => {
-    const runs = [
-      { run_id: "text", screen_id: "screen-1", dataset_id: "dataset-1", effective_date: "2026-09-10", completed_at: "2026-09-09T12:00:00Z", result_count: 1, status: "complete", source: "Volume > 1", language_version: "v1" },
-      { run_id: "fractional", screen_id: "screen-1", dataset_id: "dataset-1", effective_date: "2026-09-04", completed_at: "2026-09-09T12:00:00.500Z", result_count: 1, status: "complete", source: "Volume > 1", language_version: "v1" },
-      { run_id: "missing", screen_id: "screen-1", dataset_id: "dataset-1", effective_date: "2026-09-30", completed_at: null, result_count: 0, status: "complete", source: null, language_version: null },
-      { run_id: "invalid", screen_id: "screen-1", dataset_id: "dataset-1", effective_date: "2026-09-29", completed_at: "not-a-time", result_count: 0, status: "complete", source: null, language_version: null },
-    ];
-    const matches: Record<string, readonly Record<string, unknown>[]> = {
-      text: [{ instrument_id: "old", ordinal: 1, score: 1, symbol: "OLD", name: "Old", asset_class: "equity", explanation_json: JSON.stringify({ matched: true, text: "old", metrics: [] }), entered: 1, exited: 0 }],
-      fractional: [{ instrument_id: "latest", ordinal: 1, score: 2, symbol: "LATEST", name: "Latest", asset_class: "equity", explanation_json: JSON.stringify({ matched: true, text: "latest", metrics: [] }), entered: 1, exited: 0 }],
-      missing: [],
-      invalid: [],
-    };
-    const parsedOrder = (items: typeof runs) => [...items].sort((left, right) => {
-      const leftTimestamp = left.completed_at ? Date.parse(left.completed_at) : Number.NaN;
-      const rightTimestamp = right.completed_at ? Date.parse(right.completed_at) : Number.NaN;
-      const leftValid = Number.isFinite(leftTimestamp); const rightValid = Number.isFinite(rightTimestamp);
-      if (leftValid !== rightValid) return leftValid ? -1 : 1;
-      if (leftValid && leftTimestamp !== rightTimestamp) return rightTimestamp - leftTimestamp;
-      return right.effective_date.localeCompare(left.effective_date) || right.run_id.localeCompare(left.run_id);
-    });
-    const textOrder = (items: typeof runs) => [...items].sort((left, right) => {
-      const leftValid = left.completed_at !== null && !Number.isNaN(Date.parse(left.completed_at)); const rightValid = right.completed_at !== null && !Number.isNaN(Date.parse(right.completed_at));
-      if (leftValid !== rightValid) return leftValid ? -1 : 1;
-      return String(right.completed_at ?? "").localeCompare(String(left.completed_at ?? "")) || right.effective_date.localeCompare(left.effective_date) || right.run_id.localeCompare(left.run_id);
-    });
-    class OrderedStatement implements D1Statement {
-      private values: unknown[] = [];
-      public constructor(private readonly sql: string) {}
-      bind(...values: unknown[]): D1Statement { this.values = values; return this; }
-      async first<T extends Record<string, unknown> = Record<string, unknown>>(): Promise<T | null> {
-        if (this.sql.includes("FROM active_dataset")) return { dataset_id: "dataset-1" } as unknown as T;
-        if (this.sql.includes("FROM saved_screens")) return { screen_id: "screen-1", name: "Volume", expression: "Volume > 1", created_at: "2026-01-01", updated_at: "2026-01-01" } as unknown as T;
-        if (this.sql.includes("FROM instrument_snapshots")) return { instrument_id: "latest", symbol: "LATEST", name: "Latest", asset_class: "equity", active: 1, metadata_json: "{}", metric_rows_json: JSON.stringify([{ metric: "volume", value: 2, state: "present" }]), fundamental_periods_json: "[]", corporate_actions_json: "[]" } as unknown as T;
-        return null;
-      }
-      async all<T extends Record<string, unknown> = Record<string, unknown>>(): Promise<{ results: readonly T[] }> {
-        if (this.sql.includes("FROM screen_runs")) return { results: (this.sql.includes("julianday(completed_at) DESC") ? parsedOrder(runs) : textOrder(runs)) as unknown as readonly T[] };
-        if (this.sql.includes("FROM screen_matches")) return { results: (matches[String(this.values[1])] ?? []) as unknown as readonly T[] };
-        if (this.sql.includes("FROM instrument_snapshots AS i")) return { results: [{ instrument_id: "latest", score: 2 }] as unknown as readonly T[] };
-        return { results: [] };
-      }
-      async run(): Promise<D1Result> { return { success: true }; }
-    }
-    const store = new D1ResearchStore({ prepare: (sql) => new OrderedStatement(sql) });
+    const { db, sqlite } = createSqliteD1();
+    seedDataset(sqlite, "dataset-1");
+    seedScreen(sqlite, "screen-1", "Volume", "Volume > 1");
+    sqlite.prepare("INSERT INTO instrument_snapshots (instrument_id, dataset_id, symbol, name, asset_class, active, metric_values_json, metric_rows_json) VALUES ('latest','dataset-1','LATEST','Latest','equity',1,?,?)").run(JSON.stringify({ volume: 2, momentum_score: 2 }), JSON.stringify([{ metric: "volume", value: 2, state: "present" }]));
+    const run = (runId: string, effectiveDate: string, completedAt: string | null) => sqlite.prepare("INSERT INTO screen_runs (dataset_id, run_id, screen_id, effective_date, status, result_count, source, language_version, completed_at) VALUES (?,?,?,?,?,?,?,?,?)").run("dataset-1", runId, "screen-1", effectiveDate, "complete", 1, "Volume > 1", "v1", completedAt);
+    run("text", "2026-09-10", "2026-09-09T12:00:00Z");
+    run("fractional", "2026-09-04", "2026-09-09T12:00:00.500Z");
+    run("missing", "2026-09-30", null);
+    run("invalid", "2026-09-29", "not-a-time");
+    sqlite.prepare("INSERT INTO screen_matches (dataset_id, run_id, ordinal, instrument_id, score, symbol, name, asset_class, metrics_json, entered, exited) VALUES ('dataset-1','text',1,'old',1,'OLD','Old','equity','[]',1,0)").run();
+    sqlite.prepare("INSERT INTO screen_matches (dataset_id, run_id, ordinal, instrument_id, score, symbol, name, asset_class, metrics_json, entered, exited) VALUES ('dataset-1','fractional',1,'latest',2,'LATEST','Latest','equity','[]',1,0)").run();
+    const store = new D1ResearchStore(db);
     const api = createApi({ env, store, accessVerifier: createTestAccessVerifier("test-secret"), testAccessSecret: "test-secret" });
     const bearer = await api.issueTestToken({ email: "owner@example.com" });
     const response = await api.fetch(request("/api/v1/screens/screen-1/results", { headers: { Authorization: `Bearer ${bearer}` } }));
     expect(response.status).toBe(200);
+    // "fractional" completed 500ms after "text" -- the fractional timestamp must win the default-run tiebreak.
     expect((await response.json() as { run: { id: string } }).run.id).toBe("fractional");
 
     const screen = { id: "screen-1", name: "Volume", source: "Volume > 1", languageVersion: "v1", createdAt: "2026-01-01", updatedAt: "2026-01-01" } as const;
     const next = await store.runScreen("dataset-1", screen, "2026-09-03", "2026-09-09T12:00:01.000Z");
-    expect(next.matches.find((match) => match.instrumentId === "latest")).toMatchObject({ entered: false, exited: false });
+    const nextPage = await store.pageRunMatches(next.id, { sort: "rank", direction: "asc", limit: 10, offset: 0 });
+    expect(nextPage.matches.find((match) => match.instrumentId === "latest")).toMatchObject({ entered: false, exited: false });
   });
 
   it("does not repeat a persisted exit after an instrument remains absent", async () => {
-    const state: {
-      present: boolean;
-      runs: { runId: string; screenId: string; datasetId: string; effectiveDate: string; resultCount: number; status: string }[];
-      matches: { datasetId: string; runId: string; ordinal: number; instrumentId: string; score: number | null; symbol: string | null; name: string | null; assetClass: string | null; explanation: string; entered: number; exited: number }[];
-    } = { present: true, runs: [], matches: [] };
-    class HistoryStatement implements D1Statement {
-      private values: unknown[] = [];
-      public constructor(private readonly sql: string) {}
-      bind(...values: unknown[]): D1Statement { this.values = values; return this; }
-      async first<T extends Record<string, unknown> = Record<string, unknown>>(): Promise<T | null> { return null; }
-      async all<T extends Record<string, unknown> = Record<string, unknown>>(): Promise<{ results: readonly T[] }> {
-        if (this.sql.includes("FROM instrument_snapshots AS i")) return { results: (state.present ? [{ instrument_id: "one", score: 10 }] : []) as unknown as readonly T[] };
-        if (this.sql.includes("FROM screen_runs")) return { results: [...state.runs].sort((left, right) => right.effectiveDate.localeCompare(left.effectiveDate) || right.runId.localeCompare(left.runId)).map((run) => ({ run_id: run.runId, screen_id: run.screenId, dataset_id: run.datasetId, effective_date: run.effectiveDate, result_count: run.resultCount, status: run.status })) as unknown as readonly T[] };
-        if (this.sql.includes("FROM screen_matches")) return { results: state.matches.filter((match) => match.runId === String(this.values[1])).map((match) => ({ instrument_id: match.instrumentId, ordinal: match.ordinal, score: match.score, symbol: match.symbol, name: match.name, asset_class: match.assetClass, explanation_json: match.explanation, entered: match.entered, exited: match.exited })) as unknown as readonly T[] };
-        return { results: [] };
-      }
-      async run(): Promise<D1Result> {
-        if (this.sql.includes("INSERT INTO screen_matches")) state.matches.push({ datasetId: String(this.values[0]), runId: String(this.values[1]), ordinal: Number(this.values[2]), instrumentId: String(this.values[3]), score: this.values[4] == null ? null : Number(this.values[4]), symbol: this.values[5] == null ? null : String(this.values[5]), name: this.values[6] == null ? null : String(this.values[6]), assetClass: this.values[7] == null ? null : String(this.values[7]), explanation: String(this.values[8]), entered: Number(this.values[9]), exited: Number(this.values[10]) });
-        if (this.sql.includes("INSERT INTO screen_runs")) state.runs.push({ datasetId: String(this.values[0]), runId: String(this.values[1]), screenId: String(this.values[2]), effectiveDate: String(this.values[3]), resultCount: Number(this.values[4]), status: "complete" });
-        return { success: true };
-      }
-    }
-    const db: D1Database = { prepare: (sql) => new HistoryStatement(sql) };
+    const { db, sqlite } = createSqliteD1();
+    seedDataset(sqlite, "dataset-1");
+    seedScreen(sqlite, "screen-1", "x", "Volume > 1");
+    const upsertInstrument = (present: boolean) => {
+      sqlite.prepare("DELETE FROM instrument_snapshots WHERE instrument_id = 'one'").run();
+      if (present) sqlite.prepare("INSERT INTO instrument_snapshots (instrument_id, dataset_id, symbol, name, asset_class, active, metric_values_json, metric_rows_json) VALUES ('one','dataset-1','ONE','One','equity',1,?,?)").run(JSON.stringify({ volume: 10, momentum_score: 10 }), JSON.stringify([{ metric: "volume", value: 10, state: "present" }]));
+    };
+    upsertInstrument(true);
     const store = new D1ResearchStore(db);
     const screen = { id: "screen-1", name: "x", source: "Volume > 1", languageVersion: "v1", createdAt: "2026-01-01", updatedAt: "2026-01-01" } as const;
     await store.runScreen("dataset-1", screen, "2026-01-01");
-    state.present = false;
+    upsertInstrument(false);
     const second = await store.runScreen("dataset-1", screen, "2026-01-02");
     const third = await store.runScreen("dataset-1", screen, "2026-01-03");
 
-    expect(second.matches.map((match) => ({ instrumentId: match.instrumentId, exited: match.exited, rank: match.rank }))).toEqual([{ instrumentId: "one", exited: true, rank: 0 }]);
-    expect(third.matches).toEqual([]);
+    expect(second.matchCount).toBe(0);
+    expect(third.matchCount).toBe(0);
+    const secondRows = sqlite.prepare("SELECT instrument_id, exited FROM screen_matches WHERE run_id = ?").all(second.id) as { instrument_id: string; exited: number }[];
+    expect(secondRows.map((row) => ({ instrumentId: row.instrument_id, exited: Boolean(row.exited) }))).toEqual([{ instrumentId: "one", exited: true }]);
+    const thirdExitedRows = sqlite.prepare("SELECT instrument_id FROM screen_matches WHERE run_id = ? AND exited = 1").all(third.id) as { instrument_id: string }[];
+    expect(thirdExitedRows).toEqual([]);
   });
 
   it("rejects a match-write failure without leaving a complete run", async () => {
@@ -476,7 +439,7 @@ describe("private research API", () => {
     const store = new D1ResearchStore(db);
     const screen = { id: "screen-1", name: "x", source: "Volume > 1", languageVersion: "v1", createdAt: "2026-01-01", updatedAt: "2026-01-01" } as const;
     await expect(store.runScreen("dataset-1", screen, "2026-09-07")).rejects.toThrow("D1 mutation failed");
-    expect(statements.some((sql) => sql.includes("screen_runs"))).toBe(false);
+    expect(statements.some((sql) => sql.includes("INSERT INTO screen_runs"))).toBe(false);
   });
 
   it("verifies a production-style RS256 Access assertion and refreshes an unknown kid", async () => {
