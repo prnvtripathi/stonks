@@ -35,55 +35,118 @@ uv run market-pipeline --db market.db daily --date 2026-09-07 --manifest manifes
 
 ## 2. Roll back to the last known-good published dataset
 
-`D1Publisher` (`pipeline/market_pipeline/storage/d1_publisher.py`) tracks
-exactly one active dataset via the singleton `active_dataset` table, and
-every previously-active dataset is retained with `status='superseded'` (never
-deleted) in the `datasets` table. Rolling back means repointing
-`active_dataset` at a prior `dataset_id` and flipping the two rows' statuses
-back -- the same two statements `D1Publisher.promote` itself runs, executed
-directly rather than through a new rollback method (there isn't, and should
-not be, separate rollback machinery).
+**A pointer-only flip is no longer sufficient against production D1.**
+`db/migrations/0006_bounded_instrument_snapshots.sql` collapsed
+`instrument_snapshots` to a *bounded serving projection* -- one row per
+`instrument_id`, not one row per dataset -- and every promotion
+(`pipeline/market_pipeline/publication/d1_export.py`'s
+`DELETE FROM instrument_snapshots WHERE dataset_id <> :new_dataset_id`)
+physically deletes every other dataset's serving rows as part of going live.
+Concretely: if dataset `A` was promoted, then dataset `B` superseded it, `A`'s
+`instrument_snapshots` rows are gone by the time `B` is active -- only
+`datasets.status='superseded'` (bookkeeping) still remembers `A` existed.
+Repointing `active_dataset` back to `A` after that (the old procedure this
+section used to document) makes `active_dataset.dataset_id = 'A'` again, but
+a dataset-scoped serving query for `A` now returns **zero rows**, because
+there is nothing left in `instrument_snapshots` for it to return. Use
+`market_pipeline.publication.restore` instead -- it reimports the compact
+projection from a retained, checksum-verified publication bundle rather than
+only moving the pointer, and it never touches `saved_screens`, `screen_runs`,
+or `screen_matches` (owner/product state the Worker owns, not the pipeline's
+market-data tables).
 
-**Step 1: identify the target dataset.**
-
-```bash
-sqlite3 market.db "SELECT dataset_id, status, effective_date, promoted_at FROM datasets ORDER BY promoted_at DESC LIMIT 10;"
-```
-
-Pick the `dataset_id` of the last dataset you know was good (its `status`
-will currently be `superseded`).
-
-**Step 2: swap the active pointer inside a single transaction** (so readers
-never observe a half-updated state):
-
-```bash
-sqlite3 market.db <<'SQL'
-BEGIN IMMEDIATE;
-UPDATE datasets SET status='superseded' WHERE status='active';
-UPDATE datasets SET status='active', promoted_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE dataset_id='<GOOD_DATASET_ID>';
-INSERT INTO active_dataset(singleton, dataset_id, changed_at)
-  VALUES (1, '<GOOD_DATASET_ID>', strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-  ON CONFLICT(singleton) DO UPDATE SET dataset_id=excluded.dataset_id, changed_at=excluded.changed_at;
-COMMIT;
-SQL
-```
-
-Replace `<GOOD_DATASET_ID>` with the dataset ID chosen in Step 1. For a
-production Cloudflare D1 database, run the same two `UPDATE`/`INSERT`
-statements via `wrangler d1 execute <DB_NAME> --command "..."` (or
-`--file`), against the same schema -- the statements are database-engine
-agnostic SQL, unchanged from what `D1Publisher.promote` runs internally.
-
-**Step 3: verify.**
+**Step 1: identify the target dataset.** Only a dataset whose publication
+bundle is still *retained* can be restored -- by design, that is the current
+active dataset and the immediately-previous successful promotion (R07's
+`reachable_bundles`; anything older may already have had its derived R2
+objects garbage-collected). List what is currently restorable:
 
 ```bash
-sqlite3 market.db "SELECT dataset_id FROM active_dataset WHERE singleton=1;"
-# Should print <GOOD_DATASET_ID>
+uv run python -c "
+import sqlite3
+from market_pipeline.publication.restore import list_restorable_datasets
+connection = sqlite3.connect('market.db')
+for item in list_restorable_datasets(connection):
+    print(item.dataset_id)
+"
 ```
 
-Do **not** delete the bad dataset's rows -- keep it as `superseded` for
-audit/debugging. A subsequent good daily run will supersede it again through
-the normal `stage`/`promote` path once its root cause is fixed.
+Pick the `dataset_id` of the last dataset you know was good. If it is not
+printed above, it is not restorable this way -- there is no separate
+mechanism to reach further back, by design (see R07/F14's retention model).
+
+**Step 2: generate and verify the restore import.** This selects, checksum-
+verifies (input-manifest identity, then every object's bytes), and
+re-synchronizes the chosen dataset's objects through the same bounded,
+byte-verified R2 transport (`publication/r2_sync.py`) a normal publish uses,
+then produces a D1 import SQL file with the identical shape/scope a normal
+publish's own export produces (market-data tables only):
+
+```bash
+export CLOUDFLARE_ACCOUNT_ID=... R2_ACCESS_KEY_ID=... R2_SECRET_ACCESS_KEY=...
+uv run python -m market_pipeline.publication.restore \
+  --db market.db \
+  --dataset-id <GOOD_DATASET_ID> \
+  --output restore-dataset.sql \
+  --history-root history \
+  --object-manifest restore-history-objects.json \
+  --publication-plan restore-publication-plan.json \
+  --verify-remote > restore-dataset-id.txt
+```
+
+A dataset that is not currently retained, whose recorded bundle is missing
+required identity fields, whose local objects fail checksum verification, or
+whose remote objects cannot be verified/re-synchronized all fail this step
+closed -- **before** any SQL is generated and before `active_dataset` is
+touched, so the currently-active (possibly bad) dataset stays exactly as
+usable as it was.
+
+**Step 3: run the same preflight/budget gate a normal publish uses**, against
+the generated plan, exactly as `.github/workflows/daily-data.yml`'s
+"Preflight remote publication budget" step does for a normal publication (see
+that workflow for the full command, including `--remote-usage` telemetry).
+There is no separate, weaker gate for a restore.
+
+**Step 4: apply the verified import to production D1**, then verify:
+
+```bash
+pnpm --dir apps/api exec wrangler d1 execute stonks-research --env production --remote --file restore-dataset.sql
+
+expected_dataset_id="$(tr -d '\r\n' < restore-dataset-id.txt)"
+pnpm --dir apps/api exec wrangler d1 execute stonks-research --env production --remote \
+  --command "SELECT dataset_id FROM active_dataset WHERE singleton = 1" --json
+# The returned dataset_id must equal ${expected_dataset_id}.
+pnpm --dir apps/api exec wrangler d1 execute stonks-research --env production --remote \
+  --command "SELECT COUNT(*) AS n FROM instrument_snapshots WHERE dataset_id = '${expected_dataset_id}'" --json
+# n must be > 0 -- this is exactly the check that a pointer-only flip fails.
+```
+
+As with a normal promotion, `active-dataset.sql`-style imports never contain
+a transaction wrapper: Cloudflare D1 rolls a failed
+`wrangler d1 execute --remote --file` import back to its original state on
+the *remote* side. This runbook (and `restore.py`'s own tests) verify the
+generated SQL's *local* behavior via `sqlite3.executescript` against a
+schema-equivalent database, but that is not proof of D1's own remote
+transactional rollback -- confirming a rejected remote import truly leaves
+the previous dataset active/serving is a live-account acceptance drill, not
+something this pipeline's local tests can establish on their own.
+
+Do **not** delete the previously-active (bad) dataset's rows -- keep it as
+`superseded` for audit/debugging; restore never deletes any `datasets` row,
+only reads them. A subsequent good daily run will supersede the restored
+dataset again through the normal `stage`/`promote` path once the original
+run's root cause is fixed.
+
+**Local-only exception.** The local SQLite `market.db` this pipeline builds
+locally never itself serves reads from `instrument_snapshots` -- that table
+is populated only by *applying* a generated D1 import SQL file (locally, in
+a test, or for real against production D1), never by
+`D1Publisher.stage`/`promote`. Flipping `active_dataset`/`datasets.status`
+directly in `market.db` with `sqlite3` (the old Step 2 above) is therefore
+still harmless there and remains a valid **local-only** bookkeeping fixup --
+it just does nothing to any production-serving data, and must never be
+treated as a substitute for the restore procedure above against production
+D1.
 
 ## 3. Restore or re-run a specific historical date range
 

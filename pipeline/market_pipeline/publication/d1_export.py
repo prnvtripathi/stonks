@@ -16,7 +16,7 @@ import sqlite3
 from datetime import date
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence, cast
 
 from market_pipeline.publication.bundle import (
     BundleError,
@@ -86,19 +86,21 @@ def _columns(connection: sqlite3.Connection, table: str) -> tuple[str, ...]:
     return columns
 
 
-def _active_dataset(connection: sqlite3.Connection) -> tuple[str, sqlite3.Row]:
-    pointer = connection.execute(
-        "SELECT dataset_id, changed_at FROM active_dataset WHERE singleton = 1"
-    ).fetchone()
-    if pointer is None:
-        raise DatasetExportError("active_dataset pointer is missing")
+def _dataset_row(connection: sqlite3.Connection, dataset_id: str) -> sqlite3.Row:
+    """Fetch one dataset row by ID, regardless of its current status.
+
+    Shared by the active-pointer export path and R11's selective restore
+    path (``export_dataset``): both need the same reconciliation/effective-
+    date sanity checks, differing only in *which* dataset_id is selected.
+    """
+
     dataset = connection.execute(
         "SELECT dataset_id,status,created_at,promoted_at,effective_date,metadata_json "
         "FROM datasets WHERE dataset_id = ?",
-        (pointer[0],),
+        (dataset_id,),
     ).fetchone()
-    if dataset is None or str(dataset[1]) != "active":
-        raise DatasetExportError("active_dataset pointer does not reference an active dataset")
+    if dataset is None:
+        raise DatasetExportError(f"dataset not found: {dataset_id}")
     if not dataset[4]:
         raise DatasetExportError("active dataset has no effective date")
     try:
@@ -107,6 +109,18 @@ def _active_dataset(connection: sqlite3.Connection) -> tuple[str, sqlite3.Row]:
         raise DatasetExportError("active dataset metadata is invalid") from exc
     if not isinstance(metadata, dict) or not metadata.get("valid", True) or not metadata.get("reconciliation_ok", True):
         raise DatasetExportError("active dataset did not pass reconciliation")
+    return cast(sqlite3.Row, dataset)
+
+
+def _active_dataset(connection: sqlite3.Connection) -> tuple[str, sqlite3.Row]:
+    pointer = connection.execute(
+        "SELECT dataset_id, changed_at FROM active_dataset WHERE singleton = 1"
+    ).fetchone()
+    if pointer is None:
+        raise DatasetExportError("active_dataset pointer is missing")
+    dataset = _dataset_row(connection, str(pointer[0]))
+    if str(dataset[1]) != "active":
+        raise DatasetExportError("active_dataset pointer does not reference an active dataset")
     return str(pointer[0]), dataset
 
 
@@ -288,7 +302,7 @@ def _publication_plan(
     }
 
 
-def _load_bundle(connection: sqlite3.Connection, dataset_id: str) -> PublicationBundle:
+def load_recorded_bundle(connection: sqlite3.Connection, dataset_id: str) -> PublicationBundle:
     """Read this dataset's own recorded publication bundle.
 
     The bundle is the authoritative record of exactly what this candidate
@@ -315,7 +329,7 @@ def _load_bundle(connection: sqlite3.Connection, dataset_id: str) -> Publication
     return bundle
 
 
-def _verify_bundle_objects(bundle: PublicationBundle, history_root: Path) -> None:
+def verify_bundle_objects(bundle: PublicationBundle, history_root: Path) -> None:
     """Byte-verify exactly the bundle's own objects; never glob for extras."""
 
     root = history_root.resolve()
@@ -385,7 +399,7 @@ def _existing_object_sizes(history_root: Path) -> dict[str, int]:
     return sizes
 
 
-def _reachable_bundles(connection: sqlite3.Connection, dataset_id: str) -> list[PublicationBundle]:
+def reachable_bundles(connection: sqlite3.Connection, dataset_id: str) -> list[PublicationBundle]:
     """Bundles that must stay reachable: the active dataset and the previous promotion.
 
     Keeping the previous successfully-promoted dataset's bundle reachable is
@@ -427,6 +441,72 @@ def export_active_dataset(
     """
 
     dataset_id, dataset = _active_dataset(connection)
+    return _export_dataset_sql(
+        connection,
+        dataset_id,
+        dataset,
+        output,
+        history_root=history_root,
+        object_manifest=object_manifest,
+        publication_plan=publication_plan,
+        weekday_runs_per_month=weekday_runs_per_month,
+    )
+
+
+def export_dataset(
+    connection: sqlite3.Connection,
+    dataset_id: str,
+    output: str | Path,
+    *,
+    history_root: str | Path | None = None,
+    object_manifest: str | Path | None = None,
+    publication_plan: str | Path | None = None,
+    weekday_runs_per_month: int | None = None,
+) -> str:
+    """Export an explicitly-selected, still-retained dataset as a D1 import (R11/F13).
+
+    This is the same import-SQL shape and re-promotion mechanics as
+    :func:`export_active_dataset` -- the dataset is simply selected by an
+    explicit ``dataset_id`` (which must currently be ``active`` or
+    ``superseded``) instead of always the current active pointer. This is
+    what :mod:`market_pipeline.publication.restore` uses to reimport a
+    retained, previously-promoted dataset's compact projection: a real
+    selective restore rather than a pointer-only flip, which
+    ``db/migrations/0006_bounded_instrument_snapshots.sql`` made unsafe (a
+    prior promotion has already physically deleted every other dataset's
+    ``instrument_snapshots`` rows).
+    """
+
+    dataset = _dataset_row(connection, dataset_id)
+    if str(dataset[1]) not in ("active", "superseded"):
+        raise DatasetExportError(
+            f"dataset is not eligible for restore (status={dataset[1]!r}): {dataset_id}"
+        )
+    return _export_dataset_sql(
+        connection,
+        dataset_id,
+        dataset,
+        output,
+        history_root=history_root,
+        object_manifest=object_manifest,
+        publication_plan=publication_plan,
+        weekday_runs_per_month=weekday_runs_per_month,
+    )
+
+
+def _export_dataset_sql(
+    connection: sqlite3.Connection,
+    dataset_id: str,
+    dataset: sqlite3.Row,
+    output: str | Path,
+    *,
+    history_root: str | Path | None = None,
+    object_manifest: str | Path | None = None,
+    publication_plan: str | Path | None = None,
+    weekday_runs_per_month: int | None = None,
+) -> str:
+    """Shared statement-building body for both export entry points above."""
+
     _assert_complete(connection, dataset_id, dataset)
     if (history_root is None) != (object_manifest is None):
         raise DatasetExportError("history_root and object_manifest must be supplied together")
@@ -437,10 +517,10 @@ def export_active_dataset(
     retained_bytes = 0
     if history_root is not None:
         root = Path(history_root)
-        bundle = _load_bundle(connection, dataset_id)
-        _verify_bundle_objects(bundle, root)
+        bundle = load_recorded_bundle(connection, dataset_id)
+        verify_bundle_objects(bundle, root)
         manifest = _bundle_object_groups(bundle)
-        reachable = _reachable_bundles(connection, dataset_id)
+        reachable = reachable_bundles(connection, dataset_id)
         if bundle.dataset_id not in {item.dataset_id for item in reachable}:
             reachable = [bundle, *reachable]
         existing_sizes = _existing_object_sizes(root)
@@ -555,4 +635,12 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["DatasetExportError", "export_active_dataset", "main"]
+__all__ = [
+    "DatasetExportError",
+    "export_active_dataset",
+    "export_dataset",
+    "load_recorded_bundle",
+    "main",
+    "reachable_bundles",
+    "verify_bundle_objects",
+]
