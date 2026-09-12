@@ -57,6 +57,7 @@ objects enforce this:
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import tempfile
 from dataclasses import dataclass
@@ -68,7 +69,6 @@ from typing import Any, Mapping, Sequence
 
 from market_pipeline.publication.r2_sync import (
     BUCKET,
-    R2SyncError,
     S3ObjectClient,
     get_and_verify_object,
     put_and_verify_object,
@@ -262,6 +262,9 @@ class IdentityCheckResult:
     remote_dataset_id: str
     local_input_manifest_hash: str | None
     remote_input_manifest_hash: str
+    raw_store_complete: bool | None
+    raw_triples_expected: int
+    raw_triples_missing: int
 
 
 def _read_local_dataset_identity(db_path: Path) -> tuple[str, str] | None:
@@ -615,12 +618,20 @@ def restore_checkpoint_archive(
     """Restore the last verified success archive onto a clean/cache-missed runner.
 
     Every object is downloaded and byte-verified in memory before anything
-    is written to disk, and the SQLite backup is restored (and re-opened
-    read-only to sanity-check it) before any raw triple is written. A
-    missing, malformed, or checksum-mismatched object anywhere aborts the
-    whole restore with :class:`CheckpointArchiveError` -- callers must never
-    fall back to initializing a blank ``market.db``/``raw/`` on that path;
-    the only case that legitimately means "start blank" is
+    is written to disk. The SQLite backup is restored into a scratch file
+    (sanity-opened with SQLite) and atomically renamed into place before any
+    raw triple is even requested. Every raw triple is then downloaded and
+    written into a *staging* directory next to ``raw_root`` -- never
+    ``raw_root`` itself -- and only after every single triple in the
+    manifest has been downloaded, verified, and staged does this function
+    atomically replace ``raw_root`` with the fully staged directory in one
+    rename. A missing, malformed, or checksum-mismatched object anywhere --
+    including a failure on the very last triple -- aborts the whole restore
+    with :class:`CheckpointArchiveError` and leaves ``raw_root`` completely
+    untouched (whatever was there before, or nothing at all); it can never
+    observe a partially populated ``raw_root``. Callers must never fall back
+    to initializing a blank ``market.db``/``raw/`` on that path; the only
+    case that legitimately means "start blank" is
     :class:`NoCheckpointArchiveError` (no archive was ever promoted).
     """
 
@@ -628,95 +639,163 @@ def restore_checkpoint_archive(
     get_attempts = 0
     verified_bytes = 0
 
+    raw_root.parent.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(tempfile.mkdtemp(dir=raw_root.parent, prefix=f".{raw_root.name}.restoring-"))
     try:
-        backup_bytes = get_and_verify_object(
-            client,
-            key=manifest.sqlite_backup.key,
-            sha256_hex=manifest.sqlite_backup.sha256,
-            size=manifest.sqlite_backup.bytes,
-        )
-        get_attempts += 1
-        verified_bytes += len(backup_bytes)
-        # Verify (in memory, in a scratch location) fully before touching
-        # db_path at all: a corrupt/interrupted archive must never leave a
-        # half-restored or invalid database at the real path. The scratch
-        # file lives next to db_path (not the system temp dir) so the final
-        # replace is an atomic same-filesystem rename, not a cross-device
-        # copy that could itself be interrupted.
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_db = db_path.parent / f"{db_path.name}.restoring-{sha256(backup_bytes[:64]).hexdigest()[:8]}"
         try:
-            tmp_db.write_bytes(backup_bytes)
-            probe = sqlite3.connect(tmp_db)
-            try:
-                probe.execute("PRAGMA schema_version").fetchone()
-            except sqlite3.DatabaseError as exc:
-                raise CheckpointArchiveError("restored SQLite backup is not a valid database") from exc
-            finally:
-                probe.close()
-            tmp_db.replace(db_path)
-        finally:
-            tmp_db.unlink(missing_ok=True)
-
-        for triple in manifest.raw_triples:
-            body = get_and_verify_object(
-                client, key=triple.object_key, sha256_hex=triple.body_sha256, size=triple.body_bytes
+            backup_bytes = get_and_verify_object(
+                client,
+                key=manifest.sqlite_backup.key,
+                sha256_hex=manifest.sqlite_backup.sha256,
+                size=manifest.sqlite_backup.bytes,
             )
             get_attempts += 1
-            verified_bytes += len(body)
-            # The manifest records only the body's checksum/size; metadata
-            # and commit-marker bytes are cross-checked below by
-            # LocalRawStore.get() itself, reusing raw_store.py's existing
-            # triple-integrity rule rather than a second checksum scheme.
-            metadata_key = triple.metadata_key
-            commit_key = triple.commit_key
-            metadata = _read_body(client.get_object(Bucket=BUCKET, Key=metadata_key))
-            commit = _read_body(client.get_object(Bucket=BUCKET, Key=commit_key))
-            get_attempts += 2
-            verified_bytes += len(metadata) + len(commit)
-
-            body_path = raw_root / triple.object_key
-            metadata_path = raw_root / metadata_key
-            commit_path = raw_root / commit_key
-            body_path.parent.mkdir(parents=True, exist_ok=True)
-            raw_root.mkdir(parents=True, exist_ok=True)
-            body_path.write_bytes(body)
-            metadata_path.write_bytes(metadata)
-            commit_path.write_bytes(commit)
+            verified_bytes += len(backup_bytes)
+            # Verify (in memory, in a scratch location) fully before
+            # touching db_path at all: a corrupt/interrupted archive must
+            # never leave a half-restored or invalid database at the real
+            # path. The scratch file lives next to db_path (not the system
+            # temp dir) so the final replace is an atomic same-filesystem
+            # rename, not a cross-device copy that could itself be
+            # interrupted.
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_db = db_path.parent / f"{db_path.name}.restoring-{sha256(backup_bytes[:64]).hexdigest()[:8]}"
             try:
-                restored = LocalRawStore(raw_root).get(triple.object_key)
-            except (KeyError, ImmutableRawStoreError) as exc:
-                raise CheckpointArchiveError(f"restored raw triple failed integrity check: {triple.object_key}") from exc
-            if restored != body:
-                raise CheckpointArchiveError(f"restored raw triple body mismatch: {triple.object_key}")
-    except (KeyError, R2SyncError) as exc:
-        raise CheckpointArchiveError(f"checkpoint archive restore failed: {exc}") from exc
+                tmp_db.write_bytes(backup_bytes)
+                probe = sqlite3.connect(tmp_db)
+                try:
+                    probe.execute("PRAGMA schema_version").fetchone()
+                except sqlite3.DatabaseError as exc:
+                    raise CheckpointArchiveError("restored SQLite backup is not a valid database") from exc
+                finally:
+                    probe.close()
+                tmp_db.replace(db_path)
+            finally:
+                tmp_db.unlink(missing_ok=True)
+
+            # Every raw triple is downloaded, verified, and written into
+            # `staging_root` -- a directory nothing else reads from -- so a
+            # failure on any triple (including the last one) never leaves a
+            # partial `raw_root` on disk for a later run to pick up (e.g.
+            # via `actions/cache/save`'s `if: always()`) and silently trust.
+            for triple in manifest.raw_triples:
+                body = get_and_verify_object(
+                    client, key=triple.object_key, sha256_hex=triple.body_sha256, size=triple.body_bytes
+                )
+                get_attempts += 1
+                verified_bytes += len(body)
+                # The manifest records only the body's checksum/size;
+                # metadata and commit-marker bytes are cross-checked below
+                # by LocalRawStore.get() itself, reusing raw_store.py's
+                # existing triple-integrity rule rather than a second
+                # checksum scheme.
+                metadata_key = triple.metadata_key
+                commit_key = triple.commit_key
+                metadata = _read_body(client.get_object(Bucket=BUCKET, Key=metadata_key))
+                commit = _read_body(client.get_object(Bucket=BUCKET, Key=commit_key))
+                get_attempts += 2
+                verified_bytes += len(metadata) + len(commit)
+
+                body_path = staging_root / triple.object_key
+                metadata_path = staging_root / metadata_key
+                commit_path = staging_root / commit_key
+                body_path.parent.mkdir(parents=True, exist_ok=True)
+                body_path.write_bytes(body)
+                metadata_path.write_bytes(metadata)
+                commit_path.write_bytes(commit)
+                try:
+                    restored = LocalRawStore(staging_root).get(triple.object_key)
+                except (KeyError, ImmutableRawStoreError) as exc:
+                    raise CheckpointArchiveError(f"restored raw triple failed integrity check: {triple.object_key}") from exc
+                if restored != body:
+                    raise CheckpointArchiveError(f"restored raw triple body mismatch: {triple.object_key}")
+        except CheckpointArchiveError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - any transport/decode failure here must fail the restore, never continue
+            raise CheckpointArchiveError(f"checkpoint archive restore failed: {exc}") from exc
+
+        # Every triple verified: atomically swap the fully staged directory
+        # into place. `os.replace`/`Path.replace` on a directory is a single
+        # rename syscall on the same filesystem (guaranteed here since
+        # `staging_root` was created as a sibling of `raw_root`), so this
+        # is the one moment `raw_root` changes, and it changes completely.
+        if raw_root.exists():
+            shutil.rmtree(raw_root)
+        staging_root.replace(raw_root)
+    finally:
+        shutil.rmtree(staging_root, ignore_errors=True)
 
     return CheckpointRestoreResult(manifest=manifest, get_attempts=get_attempts, verified_bytes=verified_bytes)
 
 
-def check_local_identity_against_manifest(client: S3ObjectClient, *, db_path: Path) -> IdentityCheckResult:
+def _raw_store_completeness(raw_root: Path, manifest: CheckpointArchiveManifest) -> tuple[bool, int]:
+    """Cheaply check that every manifest-listed raw triple's three files exist.
+
+    This is deliberately a existence check (``Path.exists()``), not a full
+    re-read/re-hash of every raw artifact: :func:`build_and_upload_checkpoint_archive`
+    already pays that cost once per archive, and re-paying it on every
+    cache-hit run would defeat the point of a cheap identity check. A
+    missing file is exactly the symptom a partial/interrupted local
+    ``raw/`` (the Critical finding this function was added to catch) would
+    leave behind, so presence alone is a strong, cheap signal; the byte-level
+    integrity of a *present* triple is still authoritatively re-checked the
+    moment it is actually read for publication (``LocalRawStore.get``).
+    """
+
+    missing = 0
+    for triple in manifest.raw_triples:
+        body_path = raw_root / triple.object_key
+        metadata_path = raw_root / triple.metadata_key
+        commit_path = raw_root / triple.commit_key
+        if not (body_path.is_file() and metadata_path.is_file() and commit_path.is_file()):
+            missing += 1
+    return missing == 0, missing
+
+
+def check_local_identity_against_manifest(
+    client: S3ObjectClient, *, db_path: Path, raw_root: Path | None = None
+) -> IdentityCheckResult:
     """Validate a cache-hit runner's local state against the authoritative manifest.
 
     A GitHub Actions cache *hit* means local files are present, but says
     nothing about whether they are the checkpoint this publisher actually
     last archived (a stale or previously-corrupted cache entry can still be
-    "hit"). This performs only the small manifest fetch -- never the bulk
-    raw/sqlite download restore does -- and reports whether local identity
-    matches; it does not repair a mismatch itself.
+    "hit"). This performs only the small manifest fetch and, when
+    ``raw_root`` is given, a cheap local existence check per raw triple --
+    never the bulk raw/sqlite download restore does -- and reports whether
+    local identity (and, if checked, raw-store completeness) matches; it
+    does not repair a mismatch itself.
+
+    ``raw_root`` should always be passed by a caller deciding whether to
+    trust a cache hit: dataset-ID/input-hash agreement alone cannot detect
+    a partially restored or partially evicted ``raw/`` directory (the F12
+    Critical finding this parameter closes) -- only checking that every
+    archived raw triple is actually present locally can.
     """
 
     manifest = load_latest_success(client)
     local = _read_local_dataset_identity(db_path)
     local_dataset_id = local[0] if local else None
     local_input_manifest_hash = local[1] if local else None
-    matches = local is not None and local_dataset_id == manifest.dataset_id and local_input_manifest_hash == manifest.input_manifest_hash
+    identity_matches = (
+        local is not None and local_dataset_id == manifest.dataset_id and local_input_manifest_hash == manifest.input_manifest_hash
+    )
+
+    raw_store_complete: bool | None = None
+    raw_triples_missing = 0
+    if raw_root is not None:
+        raw_store_complete, raw_triples_missing = _raw_store_completeness(raw_root, manifest)
+
+    matches = identity_matches and (raw_store_complete is not False)
     return IdentityCheckResult(
         matches=matches,
         local_dataset_id=local_dataset_id,
         remote_dataset_id=manifest.dataset_id,
         local_input_manifest_hash=local_input_manifest_hash,
         remote_input_manifest_hash=manifest.input_manifest_hash,
+        raw_store_complete=raw_store_complete,
+        raw_triples_expected=len(manifest.raw_triples),
+        raw_triples_missing=raw_triples_missing,
     )
 
 
@@ -811,7 +890,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
         elif args.check_identity_only:
             try:
-                identity = check_local_identity_against_manifest(client, db_path=Path(args.db))
+                identity = check_local_identity_against_manifest(
+                    client, db_path=Path(args.db), raw_root=Path(args.raw_root)
+                )
             except NoCheckpointArchiveError:
                 payload = {"matches": None, "reason": "no_prior_success"}
             else:
@@ -819,6 +900,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "matches": identity.matches,
                     "local_dataset_id": identity.local_dataset_id,
                     "remote_dataset_id": identity.remote_dataset_id,
+                    "raw_store_complete": identity.raw_store_complete,
+                    "raw_triples_expected": identity.raw_triples_expected,
+                    "raw_triples_missing": identity.raw_triples_missing,
                 }
         else:
             try:

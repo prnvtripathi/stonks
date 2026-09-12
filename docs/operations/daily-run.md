@@ -39,10 +39,12 @@ manifest, gated by the reconciliation and storage-budget checks in
    simply gone, with no way back. This step checks whether the cache
    restore above actually produced a `market.db`: if not, it restores the
    last verified checkpoint archive from private R2 storage instead; if it
-   did, it only validates that cached database's active dataset identity
-   against the authoritative remote manifest (cheap: one small object, no
-   bulk download) and warns -- without failing the run -- if a stale or
-   previously-corrupted cache entry is detected.
+   did, it validates that cached database's active dataset identity, and
+   the local `raw/` store's completeness, against the authoritative remote
+   manifest (cheap: one small object plus local existence checks, no bulk
+   download) -- and if a stale or partially-saved cache entry is detected,
+   it discards that local state and falls through to the same restore a
+   cache miss would have run, rather than merely warning and proceeding.
 4. **Skip cleanly if no manifest is present.** The scheduled trigger looks for
    `manifests/daily.json`. No automated NSE/AMFI fetch is wired (see
    `docs/operations/source-policy.md`), so producing that file is an operator
@@ -236,16 +238,34 @@ such a failure still returns the previously verified success.
 
 Restore behavior on the next run (workflow step 3a above): every archived
 object is downloaded and byte-verified in memory before anything is written
-to disk, and the SQLite backup is restored (and sanity-opened) before any
-raw triple is written, so a corrupted or interrupted archive fails the
-restore step outright rather than leaving a half-restored `market.db` or
-`raw/` behind. The one case treated as non-fatal is `NoCheckpointArchiveError`
--- no archive has ever been promoted -- which is a legitimate first-run
-bootstrap, not a sign of corruption. A cache *hit* still runs a cheap
-identity check against the authoritative manifest (matching dataset ID and
-input-manifest hash), so a stale or previously-corrupted cache entry cannot
-silently masquerade as a good one; a mismatch is logged as a workflow
-warning without failing the run.
+to disk. The SQLite backup is restored into a scratch file, sanity-opened
+with SQLite, and atomically renamed into place before any raw triple is
+even requested. Every raw triple is then downloaded, verified, and written
+into a *staging* directory next to `raw/` -- never `raw/` itself -- and
+only after every single triple in the archive's manifest has been staged
+does the restore atomically replace `raw/` with that fully staged directory
+in one rename. This means a corrupted or interrupted archive -- including a
+failure on the very last raw triple -- fails the restore step outright and
+leaves `raw/` exactly as it was before the attempt (absent, on a genuine
+cache miss); it can never observe a partially populated `raw/` on disk, and
+so it can never be picked up and silently trusted by a later
+`actions/cache/save` (`if: always()`) or restore. The one case treated as
+non-fatal is `NoCheckpointArchiveError` -- no archive has ever been
+promoted -- which is a legitimate first-run bootstrap, not a sign of
+corruption.
+
+A cache *hit* runs a cheap local check against the authoritative manifest:
+it compares `market.db`'s active dataset ID and input-manifest hash, and
+additionally confirms every raw triple the manifest lists is actually
+present on disk (a fast existence check per triple, not a full re-hash --
+the byte-level integrity of a present triple is still authoritatively
+re-checked the moment it is read, via `LocalRawStore.get`). A detected
+mismatch -- a stale cache entry from an unrelated dataset, or a `raw/`
+missing artifacts from a partial cache save -- is not merely logged: the
+workflow discards the untrusted local `market.db`/`raw/` outright and falls
+through to the same restore a genuine cache miss would have run, so the
+pipeline is never invoked against local state this check could not itself
+vouch for.
 
 Archive operations (every PUT/GET attempt, including reuse-verification
 GETs for an exact retry) are folded into R09's reservation ledger the same

@@ -30,6 +30,7 @@ from market_pipeline.publication.checkpoint_archive import (
     promote_latest_success,
     restore_checkpoint_archive,
 )
+from market_pipeline.storage.raw_store import LocalRawStore
 
 TERMS_URL = "https://www.amfiindia.com/terms-and-conditions"
 SOURCE_URL = "https://www.amfiindia.com/spages/NAVAll.txt"
@@ -53,6 +54,7 @@ class _FakeObjectStore:
         self.put_calls: list[str] = []
         self.get_calls: list[str] = []
         self.fail_keys: dict[str, int] = {}
+        self.fail_on_get_call_index: int | None = None
 
     def put_object(self, *, Bucket: str, Key: str, Body: Any) -> None:
         self.put_calls.append(Key)
@@ -63,6 +65,8 @@ class _FakeObjectStore:
 
     def get_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:
         self.get_calls.append(Key)
+        if self.fail_on_get_call_index is not None and len(self.get_calls) == self.fail_on_get_call_index:
+            raise RuntimeError(f"simulated interrupted GET for {Key}")
         if Key not in self.objects:
             raise KeyError(Key)
         return {"Body": io.BytesIO(self.objects[Key])}
@@ -234,6 +238,64 @@ def test_restore_rejects_a_corrupted_archive_and_never_writes_a_blank_database(t
     assert not restore_db.exists()
 
 
+def test_interrupted_restore_mid_raw_triple_loop_never_leaves_a_partial_raw_root(tmp_path: Path, capsys: Any) -> None:
+    """Critical fix: a restore failure partway through the raw-triple loop
+    must never leave a partial ``raw_root`` on disk for a later run (e.g.
+    via ``actions/cache/save``'s ``if: always()``) to pick up and silently
+    trust. The staged-then-atomically-swapped restore in
+    ``restore_checkpoint_archive`` must leave ``raw_root`` exactly as it was
+    before the call -- here, absent -- when any triple fails.
+    """
+
+    manifest = tmp_path / "manifest.json"
+    start, end = _write_manifest(manifest, date(2025, 9, 1), 10)
+    db = tmp_path / "work" / "market.db"
+    raw_root = tmp_path / "work" / "raw"
+    payload = _run(db, raw_root, ["backfill", "--start", start.isoformat(), "--end", end.isoformat(), "--manifest", str(manifest)], capsys)
+    dataset_id = payload["publication"]["dataset_id"]
+
+    original_store = LocalRawStore(raw_root)
+    original_keys = original_store.list()
+    assert len(original_keys) >= 4, "need enough raw triples for a genuine mid-loop failure"
+
+    store = _FakeObjectStore()
+    upload = build_and_upload_checkpoint_archive(db_path=db, raw_root=raw_root, client=store, deadline_seconds=30)
+    promote_latest_success(store, upload.manifest, remote_active_dataset_id=dataset_id)
+
+    shutil.rmtree(tmp_path / "work")
+    restore_db = tmp_path / "restored" / "market.db"
+    restore_raw = tmp_path / "restored" / "raw"
+
+    # Reset the call log so the index below counts only this restore's own
+    # GETs, not the upload phase's reuse-verification GETs against the same
+    # store instance.
+    store.get_calls = []
+    # Fail exactly on the third raw triple's body GET. Preceding GETs, in
+    # order: the state pointer (1), the manifest (1), the sqlite backup
+    # (1), then two fully-successful triples (3 GETs each: body, metadata,
+    # commit). This is a genuine mid-loop interruption, not a first-object
+    # failure.
+    store.fail_on_get_call_index = 1 + 1 + 1 + 2 * 3 + 1
+
+    with pytest.raises(CheckpointArchiveError):
+        restore_checkpoint_archive(store, db_path=restore_db, raw_root=restore_raw, deadline_seconds=30)
+
+    # The real invariant this fix protects: raw_root is exactly as it was
+    # before the failed call (absent), never partially populated -- even
+    # though the SQLite backup (restored first, and fully verified before
+    # any raw triple is even requested) legitimately did land at db_path.
+    assert not restore_raw.exists()
+    assert restore_db.exists()
+    staging_leftovers = [p for p in restore_raw.parent.iterdir() if p.name.startswith(f".{restore_raw.name}.restoring-")]
+    assert staging_leftovers == [], f"no staging directory should survive a failed restore: {staging_leftovers}"
+
+    # And the identity/completeness check must never report this
+    # non-existent, never-restored raw_root as trustworthy.
+    store.fail_on_get_call_index = None
+    result = check_local_identity_against_manifest(store, db_path=restore_db, raw_root=restore_raw)
+    assert result.matches is False
+
+
 def test_interrupted_backup_leaves_no_success_pointer_and_no_partial_manifest(tmp_path: Path, capsys: Any) -> None:
     manifest = tmp_path / "manifest.json"
     start, end = _write_manifest(manifest, date(2025, 4, 1), 20)
@@ -335,8 +397,6 @@ def test_restored_raw_artifacts_preserve_exact_source_provenance(tmp_path: Path,
     payload = _run(db, raw_root, ["backfill", "--start", start.isoformat(), "--end", end.isoformat(), "--manifest", str(manifest)], capsys)
     dataset_id = payload["publication"]["dataset_id"]
 
-    from market_pipeline.storage.raw_store import LocalRawStore
-
     original_store = LocalRawStore(raw_root)
     original_bodies = {key: original_store.get(key) for key in original_store.list()}
     assert original_bodies
@@ -367,20 +427,37 @@ def test_cache_hit_still_validates_local_identity_against_the_authoritative_mani
     upload = build_and_upload_checkpoint_archive(db_path=db, raw_root=raw_root, client=store, deadline_seconds=30)
     promote_latest_success(store, upload.manifest, remote_active_dataset_id=dataset_id)
 
-    # A "cache hit": the local database is present and matches.
-    result = check_local_identity_against_manifest(store, db_path=db)
+    # A "cache hit": the local database and raw store are present and match.
+    result = check_local_identity_against_manifest(store, db_path=db, raw_root=raw_root)
     assert result.matches is True
     assert result.local_dataset_id == dataset_id
+    assert result.raw_store_complete is True
+    assert result.raw_triples_missing == 0
 
     # A stale/corrupted cache entry from an unrelated older dataset must be
     # detected even though the local files are present ("cache hit").
     stale_db = tmp_path / "stale" / "market.db"
+    stale_raw = tmp_path / "stale" / "raw"
     stale_manifest = tmp_path / "stale-manifest.json"
     stale_start, stale_end = _write_manifest(stale_manifest, date(2020, 1, 1), 15)
-    _run(stale_db, tmp_path / "stale" / "raw", ["backfill", "--start", stale_start.isoformat(), "--end", stale_end.isoformat(), "--manifest", str(stale_manifest)], capsys)
-    stale_result = check_local_identity_against_manifest(store, db_path=stale_db)
+    _run(stale_db, stale_raw, ["backfill", "--start", stale_start.isoformat(), "--end", stale_end.isoformat(), "--manifest", str(stale_manifest)], capsys)
+    stale_result = check_local_identity_against_manifest(store, db_path=stale_db, raw_root=stale_raw)
     assert stale_result.matches is False
     assert stale_result.remote_dataset_id == dataset_id
+
+    # A cache hit whose database matches but whose raw store is missing
+    # artifacts (a partial cache save/restore) must also be rejected --
+    # dataset-ID/input-hash agreement alone is not enough (F12 Critical).
+    partial_raw = tmp_path / "partial-raw"
+    shutil.copytree(raw_root, partial_raw)
+    some_key = LocalRawStore(partial_raw).list()[0]
+    (partial_raw / some_key).unlink()
+    (partial_raw / f"{some_key}.metadata.json").unlink()
+    (partial_raw / f"{some_key}.commit.json").unlink()
+    partial_result = check_local_identity_against_manifest(store, db_path=db, raw_root=partial_raw)
+    assert partial_result.matches is False
+    assert partial_result.raw_store_complete is False
+    assert partial_result.raw_triples_missing == 1
 
 
 def test_checkpoint_archive_ledger_entry_reports_attempted_operation_counts(tmp_path: Path, capsys: Any) -> None:

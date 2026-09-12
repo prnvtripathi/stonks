@@ -68,3 +68,26 @@ def test_checkpoint_archive_restore_never_masks_a_genuine_failure_as_bootstrap()
     assert "set -euo pipefail" in restore_step
     assert "|| true" not in restore_step
     assert "continue-on-error" not in restore_step
+
+
+def test_checkpoint_archive_identity_mismatch_forces_a_real_restore_not_just_a_warning() -> None:
+    """Important #1 fix: a detected cache-hit identity mismatch must discard
+    the untrusted local state and restore for real -- logging a warning and
+    proceeding with mismatched/incomplete local state does not satisfy the
+    brief's "still validates its checkpoint identity" requirement.
+    """
+
+    workflow = _workflow_text()
+    restore_start = workflow.index("Restore checkpoint archive on cache miss")
+    run_start = workflow.index("Run market-pipeline refresh")
+    restore_step = workflow[restore_start:run_start]
+
+    assert '::warning::' in restore_step
+    mismatch_index = restore_step.index('matches')
+    # The mismatch branch must remove the untrusted local state and then
+    # fall through to the same restore invocation the cache-miss path uses
+    # -- not merely log and continue.
+    tail = restore_step[mismatch_index:]
+    assert "rm -rf market.db raw" in tail
+    assert "need_restore=1" in tail
+    assert tail.count("checkpoint_archive restore") >= 1

@@ -62,6 +62,7 @@ __all__ = [
     "MAX_ATTEMPTS_PER_OBJECT",
     "MAX_DEADLINE_SECONDS",
     "MAX_WORKERS",
+    "NoSuchKeyTranslatingClient",
     "ObjectTransferResult",
     "R2SyncError",
     "R2SyncResult",
@@ -406,6 +407,46 @@ def build_s3_client(account_id: str, access_key: str, secret_key: str, max_worke
     return _client(account_id, access_key, secret_key, max_workers)
 
 
+class NoSuchKeyTranslatingClient:
+    """Wrap a raw S3-compatible client so a missing-key GET raises ``KeyError``.
+
+    Real R2/boto3 raises ``botocore.exceptions.ClientError`` (error code
+    ``NoSuchKey``, or an HTTP 404) for a GET against an absent key --
+    never ``KeyError``. :mod:`market_pipeline.publication.checkpoint_archive`
+    depends on exactly ``KeyError`` to distinguish "no archive has ever been
+    promoted yet" (a legitimate bootstrap) from every other failure (a
+    corrupt or unreachable archive, which must hard-fail rather than be
+    mistaken for day one). Every client this module constructs is wrapped
+    with this translation so that contract holds against the real
+    Cloudflare R2 endpoint, not only against tests' fake clients.
+
+    ``put_object`` and every other error from ``get_object`` pass through
+    unchanged.
+    """
+
+    def __init__(self, client: S3ObjectClient) -> None:
+        self._client = client
+
+    def put_object(self, *, Bucket: str, Key: str, Body: Any) -> Any:
+        return self._client.put_object(Bucket=Bucket, Key=Key, Body=Body)
+
+    def get_object(self, *, Bucket: str, Key: str) -> Mapping[str, Any]:
+        from botocore.exceptions import ClientError  # type: ignore[import-untyped]
+
+        try:
+            return self._client.get_object(Bucket=Bucket, Key=Key)
+        except ClientError as exc:
+            error = exc.response.get("Error", {}) if isinstance(getattr(exc, "response", None), Mapping) else {}
+            code = str(error.get("Code", ""))
+            status = str(
+                error.get("HTTPStatusCode")
+                or (exc.response.get("ResponseMetadata", {}) if isinstance(getattr(exc, "response", None), Mapping) else {}).get("HTTPStatusCode", "")
+            )
+            if code == "NoSuchKey" or status == "404":
+                raise KeyError(Key) from exc
+            raise
+
+
 def _client(account_id: str, access_key: str, secret_key: str, max_workers: int) -> S3ObjectClient:
     import boto3  # type: ignore[import-untyped]
     from botocore.client import BaseClient  # type: ignore[import-untyped]
@@ -424,7 +465,7 @@ def _client(account_id: str, access_key: str, secret_key: str, max_workers: int)
             retries={"max_attempts": 1, "mode": "standard"},
         ),
     )
-    return cast(S3ObjectClient, client)
+    return NoSuchKeyTranslatingClient(cast(S3ObjectClient, client))
 
 
 def main(argv: Sequence[str] | None = None) -> int:

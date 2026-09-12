@@ -204,29 +204,38 @@ jobs:
       # path. This step is the durable fallback: on a genuine cache miss
       # (no `market.db` present), it restores the last verified checkpoint
       # archive from private R2 storage instead of silently starting
-      # blank. On a cache hit, it does the cheap thing instead -- it only
-      # validates the restored `market.db`'s active dataset identity
-      # against the authoritative remote manifest, so a stale or
-      # previously-corrupted cache entry cannot masquerade as a good one
-      # undetected. A missing archive (no prior successful publication has
-      # ever run) is a legitimate first-ever-run bootstrap, not treated as
-      # a failure; any other problem (a corrupt or partially-uploaded
-      # archive) fails this step outright rather than silently continuing
-      # with blank/stale state.
+      # blank. On a cache hit, it validates the cached `market.db`/`raw/`'s
+      # identity AND raw-store completeness against the authoritative
+      # remote manifest -- not just a warning: a detected mismatch (a
+      # stale cache entry, or a partial `raw/` from an interrupted save)
+      # discards the untrusted local state and forces the same real
+      # restore a cache miss would have done, so the pipeline is never run
+      # against local state this step could not itself vouch for. A
+      # missing archive (no prior successful publication has ever run) is
+      # a legitimate first-ever-run bootstrap, not treated as a failure;
+      # any other problem (a corrupt or partially-uploaded archive) fails
+      # this step outright rather than silently continuing with
+      # blank/stale/partial state.
       - name: Restore checkpoint archive on cache miss
         if: steps.params.outputs.manifest_present == 'true'
         timeout-minutes: 30
         run: |
           set -euo pipefail
           mkdir -p .cache
+          need_restore=1
           if [ -f market.db ]; then
+            need_restore=0
             uv run python -m market_pipeline.publication.checkpoint_archive restore \
               --db market.db --raw-root raw --check-identity-only --result identity-check.json
-            if ! python3 -c "import json,sys; d=json.load(open('identity-check.json')); sys.exit(0 if d.get('matches') is not False else 1)"; then
-              echo "::warning::Cached market.db's active dataset identity does not match the last verified checkpoint archive; continuing with the cached state, but investigate a possibly stale/corrupted actions/cache entry."
+            matches="$(python3 -c "import json; print(json.load(open('identity-check.json')).get('matches'))")"
+            if [ "${matches}" = "False" ]; then
+              echo "::warning::Cached market.db/raw do not match the last verified checkpoint archive (stale or partially-saved cache entry); discarding the cached state and restoring from private R2 storage instead."
+              rm -rf market.db raw
+              need_restore=1
             fi
-          else
-            echo "::notice::No cached market.db present (cache miss); restoring the last verified checkpoint archive from private R2 storage."
+          fi
+          if [ "${need_restore}" = "1" ]; then
+            echo "::notice::No trustworthy cached market.db present; restoring the last verified checkpoint archive from private R2 storage."
             uv run python -m market_pipeline.publication.checkpoint_archive restore \
               --db market.db --raw-root raw --reservation-ledger .cache/publication-ledger.json --result checkpoint-restore.json
             cat checkpoint-restore.json

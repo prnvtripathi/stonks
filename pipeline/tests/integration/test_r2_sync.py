@@ -324,3 +324,57 @@ touch {marker}
 
     assert completed.returncode != 0
     assert not marker.exists()
+
+
+def test_no_such_key_translating_client_converts_real_botocore_missing_key_error() -> None:
+    """Important #2 fix: the real boto3/R2 client raises ``botocore.exceptions
+    .ClientError`` (code ``NoSuchKey``, or an HTTP 404) for a GET against an
+    absent key -- never ``KeyError``. Any client this publisher hands to
+    :mod:`market_pipeline.publication.checkpoint_archive` must present a
+    ``KeyError`` for that case (its contract for "no archive has ever been
+    promoted yet" -- a legitimate bootstrap -- versus every other failure),
+    so ``NoSuchKeyTranslatingClient`` must translate the *real* botocore
+    exception shape, not just whatever a test's own fake client happens to
+    raise.
+    """
+
+    from botocore.exceptions import ClientError
+    from market_pipeline.publication.r2_sync import NoSuchKeyTranslatingClient
+
+    class _RawBotoLikeClient:
+        def get_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:
+            raise ClientError(
+                {"Error": {"Code": "NoSuchKey", "Message": "The specified key does not exist."}, "ResponseMetadata": {"HTTPStatusCode": 404}},
+                "GetObject",
+            )
+
+        def put_object(self, *, Bucket: str, Key: str, Body: Any) -> None:
+            raise AssertionError("not exercised by this test")
+
+    wrapped = NoSuchKeyTranslatingClient(_RawBotoLikeClient())
+    with pytest.raises(KeyError):
+        wrapped.get_object(Bucket=BUCKET, Key="state/latest-success.json")
+
+
+def test_no_such_key_translating_client_passes_through_every_other_client_error() -> None:
+    """A permissions failure, throttling, or any other real ``ClientError``
+    must never be mistaken for "key does not exist" -- it must propagate
+    unchanged so it hard-fails rather than being treated as a bootstrap.
+    """
+
+    from botocore.exceptions import ClientError
+    from market_pipeline.publication.r2_sync import NoSuchKeyTranslatingClient
+
+    class _RawBotoLikeClient:
+        def get_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:
+            raise ClientError(
+                {"Error": {"Code": "AccessDenied", "Message": "denied"}, "ResponseMetadata": {"HTTPStatusCode": 403}},
+                "GetObject",
+            )
+
+        def put_object(self, *, Bucket: str, Key: str, Body: Any) -> None:
+            raise AssertionError("not exercised by this test")
+
+    wrapped = NoSuchKeyTranslatingClient(_RawBotoLikeClient())
+    with pytest.raises(ClientError):
+        wrapped.get_object(Bucket=BUCKET, Key="state/latest-success.json")
