@@ -13,6 +13,7 @@ import argparse
 import json
 import math
 import sqlite3
+from datetime import date
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -21,6 +22,8 @@ from market_pipeline.publication.bundle import (
     BundleError,
     PublicationBundle,
     plan_garbage_collection,
+)
+from market_pipeline.publication.bundle import (
     sql_checksum as bundle_sql_checksum,
 )
 
@@ -244,6 +247,7 @@ def _publication_plan(
     retained_objects: int = 0,
     retained_bytes: int = 0,
     garbage_collection: Mapping[str, Any] | None = None,
+    weekday_runs_per_month: int | None = None,
 ) -> dict[str, Any]:
     mutable = list(manifest["mutable"])
     immutable = list(manifest["immutable"])
@@ -273,7 +277,11 @@ def _publication_plan(
         "garbage_collection": dict(garbage_collection) if garbage_collection is not None else {
             "dry_run": True, "candidate_count": 0, "candidate_bytes": 0, "candidates": [],
         },
-        "weekday_runs_per_month": _WEEKDAY_RUNS_PER_MONTH,
+        # F11/F14: the caller (the CLI's own default computes this from the
+        # actual calendar month via ``remote_usage.plan_monthly_attempts``)
+        # may override the stable module constant used by existing,
+        # deterministic unit tests below.
+        "weekday_runs_per_month": weekday_runs_per_month if weekday_runs_per_month is not None else _WEEKDAY_RUNS_PER_MONTH,
         "max_d1_mutations_per_run": _MAX_D1_MUTATIONS_PER_RUN,
         "max_r2_class_a_per_month": _MAX_R2_CLASS_A_PER_MONTH,
         "max_r2_class_b_per_month": _MAX_R2_CLASS_B_PER_MONTH,
@@ -410,6 +418,7 @@ def export_active_dataset(
     history_root: str | Path | None = None,
     object_manifest: str | Path | None = None,
     publication_plan: str | Path | None = None,
+    weekday_runs_per_month: int | None = None,
 ) -> str:
     """Write the complete active snapshot and return its dataset ID.
 
@@ -494,6 +503,7 @@ def export_active_dataset(
             retained_objects=retained_objects,
             retained_bytes=retained_bytes,
             garbage_collection=gc_plan_dict,
+            weekday_runs_per_month=weekday_runs_per_month,
         )
         Path(publication_plan).write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return dataset_id
@@ -506,7 +516,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--history-root", help="local root containing history/ and charts/ objects")
     parser.add_argument("--object-manifest", help="write the active dataset's verified R2 object keys here")
     parser.add_argument("--publication-plan", help="write the local-only remote-operation budget plan here")
+    parser.add_argument(
+        "--weekday-runs-per-month",
+        type=int,
+        default=None,
+        help="defaults to the actual current month's scheduled attempts (see remote_usage.plan_monthly_attempts)",
+    )
     args = parser.parse_args(argv)
+    weekday_runs_per_month = args.weekday_runs_per_month
+    if weekday_runs_per_month is None and args.publication_plan:
+        # F11/F14: compute the real month's schedule rather than trust a
+        # hard-coded constant. This must match whatever
+        # ``preflight``'s CLI independently computes for the same day, so
+        # both derive it from the same ``remote_usage.plan_monthly_attempts``
+        # rather than each hard-coding their own guess.
+        from market_pipeline.publication.remote_usage import plan_monthly_attempts
+
+        weekday_runs_per_month = plan_monthly_attempts(date.today()).monthly_attempts
     connection = sqlite3.connect(args.db)
     try:
         dataset_id = export_active_dataset(
@@ -515,6 +541,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             history_root=args.history_root,
             object_manifest=args.object_manifest,
             publication_plan=args.publication_plan,
+            weekday_runs_per_month=weekday_runs_per_month,
         )
     except DatasetExportError as exc:
         parser.error(str(exc))

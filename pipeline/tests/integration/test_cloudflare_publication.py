@@ -29,17 +29,18 @@ def test_daily_workflow_uploads_and_verifies_history_before_d1_pointer_switch() 
     install = workflow.index("Install pinned Wrangler dependency")
     export = workflow.index("Export locally active dataset for D1")
     d1_info = workflow.index("Read production D1 publication capacity")
+    telemetry = workflow.index("Read production capacity telemetry (GraphQL Analytics)")
     remote_state = workflow.index("Read production snapshot publication state")
     preflight = workflow.index("Preflight remote publication budget")
     r2 = workflow.index("Upload and verify private R2 history objects")
     d1 = workflow.index("Import active dataset into production D1")
     verify = workflow.index("Verify remote active dataset")
-    assert install < export < d1_info < remote_state < preflight < r2 < d1 < verify
+    ledger = workflow.index("Record this run's reservation-ledger entry")
+    assert install < export < d1_info < telemetry < remote_state < preflight < r2 < d1 < verify < ledger
     assert "pnpm install --frozen-lockfile" in workflow
     assert "--object-manifest active-history-objects.json" in workflow
     assert "active-history-objects.json" in workflow
     assert "MAX_D1_MUTATIONS_PER_RUN=50000" in workflow
-    assert "WEEKDAY_RUNS_PER_MONTH=22" in workflow
     assert "market_pipeline.publication.preflight --plan active-publication-plan.json" in workflow
     assert "--d1-info d1-publication-info.json" in workflow
     assert "wrangler d1 info stonks-research --env production --json > d1-publication-info.json" in workflow
@@ -57,6 +58,22 @@ def test_daily_workflow_uploads_and_verifies_history_before_d1_pointer_switch() 
     assert "--env preview" not in publication
     assert "stonks-research-preview" not in publication
     assert "stonks-private-history-preview" not in publication
+
+    # F11/F14: validated GraphQL Analytics telemetry feeds preflight instead
+    # of a hard-coded weekday constant.
+    assert "--remote-usage remote-usage.json" in workflow
+    assert "--expected-account-id" in workflow
+    assert "--expected-database-id" in workflow
+    assert "--expected-bucket-name stonks-private-history" in workflow
+    assert "api.cloudflare.com/client/v4/graphql" in workflow
+    assert "Account Analytics Read" in workflow
+    assert "plan_monthly_attempts" in workflow
+    assert "WEEKDAY_RUNS_PER_MONTH=22" not in workflow
+
+    # F14: an overall workflow timeout below six hours, and the publication
+    # (R2 upload) step budgeted below four hours.
+    assert "timeout-minutes: 330" in workflow
+    assert "timeout-minutes: 235" in workflow
 
 
 def test_daily_workflow_r2_upload_step_is_one_python_process_with_no_process_substitution() -> None:

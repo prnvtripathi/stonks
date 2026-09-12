@@ -69,6 +69,13 @@ permissions:
 jobs:
   refresh:
     runs-on: ubuntu-latest
+    # Below six hours overall (F14): a hosted-runner job that never
+    # terminates on a hang would otherwise queue indefinitely behind
+    # `concurrency.group: daily-data`'s `cancel-in-progress: false`, and
+    # each individual publication step below is independently bounded to
+    # well under four hours so a hang there cannot silently eat this
+    # budget either.
+    timeout-minutes: 330
     environment: daily-data-refresh
     env:
       # These values are scoped to the daily-data-refresh GitHub Environment.
@@ -186,6 +193,7 @@ jobs:
             market.db
             raw
             history
+            .cache/publication-ledger.json
           key: market-db-${{ github.run_id }}
           restore-keys: |
             market-db-
@@ -219,6 +227,7 @@ jobs:
             market.db
             raw
             history
+            .cache/publication-ledger.json
           key: market-db-${{ github.run_id }}
 
       - name: Redact and publish operator report
@@ -314,6 +323,115 @@ jobs:
           set -euo pipefail
           pnpm --dir apps/api exec wrangler d1 info stonks-research --env production --json > d1-publication-info.json
 
+      - name: Read production capacity telemetry (GraphQL Analytics)
+        if: steps.params.outputs.manifest_present == 'true'
+        timeout-minutes: 5
+        env:
+          CLOUDFLARE_D1_DATABASE_ID: ${{ vars.CLOUDFLARE_D1_DATABASE_ID }}
+        run: |
+          set -euo pipefail
+          # F11: `wrangler d1 info` (read above, kept only as a secondary,
+          # informational data point) silently defaults missing metrics to
+          # zero, so it cannot distinguish "genuinely no usage" from "the
+          # token/permission/account/database is wrong". This step instead
+          # calls Cloudflare's authenticated GraphQL Analytics API directly
+          # -- it requires the `Account Analytics Read` permission, see
+          # docs/operations/security-checklist.md section 7 -- and reshapes
+          # its response into the strict shape
+          # market_pipeline.publication.remote_usage.validate_remote_usage
+          # rejects unless every dimension, timestamp, and identity check
+          # passes. This query and reshape have been written and reasoned
+          # through against Cloudflare's documented GraphQL Analytics
+          # schema but have NOT been executed against a live account as
+          # part of this change -- see the R09 task report.
+          window_start="$(date -u +%Y-%m-01T00:00:00Z)"
+          request_body="$(python3 - "${CLOUDFLARE_ACCOUNT_ID}" "${CLOUDFLARE_D1_DATABASE_ID}" "${window_start}" <<'PY'
+          import json
+          import sys
+
+          account_tag, database_id, window_start = sys.argv[1:4]
+          query = """
+          query ($accountTag: String!, $databaseId: String!, $bucketName: String!, $since: Time!) {
+            viewer {
+              accounts(filter: {accountTag: $accountTag}) {
+                d1AnalyticsAdaptiveGroups(limit: 1, filter: {databaseId: $databaseId, datetime_geq: $since}, orderBy: [datetime_DESC]) {
+                  sum { rowsWritten }
+                  max { databaseSizeBytes }
+                }
+                r2OperationsAdaptiveGroups(limit: 1, filter: {bucketName: $bucketName, datetime_geq: $since}) {
+                  sum { classAOperations classBOperations }
+                }
+                r2StorageAdaptiveGroups(limit: 1, filter: {bucketName: $bucketName}, orderBy: [datetime_DESC]) {
+                  max { payloadSize }
+                }
+              }
+            }
+          }
+          """
+          print(json.dumps({
+              "query": query,
+              "variables": {
+                  "accountTag": account_tag,
+                  "databaseId": database_id,
+                  "bucketName": "stonks-private-history",
+                  "since": window_start,
+              },
+          }))
+          PY
+          )"
+          raw_response="$(mktemp)"
+          trap 'rm -f "${raw_response}"' EXIT
+          curl --silent --show-error --fail \
+            --header "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            --header "Content-Type: application/json" \
+            --data "${request_body}" \
+            https://api.cloudflare.com/client/v4/graphql > "${raw_response}"
+          python3 - "${raw_response}" "${CLOUDFLARE_ACCOUNT_ID}" "${CLOUDFLARE_D1_DATABASE_ID}" "${window_start}" <<'PY' > remote-usage.json
+          import json
+          import sys
+          from datetime import datetime, timezone
+
+          raw_path, account_tag, database_id, window_start = sys.argv[1:5]
+          raw = json.load(open(raw_path, encoding="utf-8"))
+          if raw.get("errors"):
+              # Pass errors straight through -- validate_remote_usage rejects
+              # them explicitly and names the Account Analytics Read
+              # permission when the message looks permission-related.
+              print(json.dumps(raw))
+              raise SystemExit(0)
+          accounts = raw.get("data", {}).get("viewer", {}).get("accounts", [])
+          account = accounts[0] if len(accounts) == 1 else {}
+          d1_groups = account.get("d1AnalyticsAdaptiveGroups") or [{}]
+          r2_ops = account.get("r2OperationsAdaptiveGroups") or [{}]
+          r2_storage = account.get("r2StorageAdaptiveGroups") or [{}]
+          reshaped = {
+              "errors": None,
+              "data": {
+                  "viewer": {
+                      "accounts": [
+                          {
+                              "accountTag": account_tag,
+                              "observedAt": datetime.now(timezone.utc).isoformat(),
+                              "d1": {
+                                  "databaseId": database_id,
+                                  "databaseSizeBytes": (d1_groups[0].get("max") or {}).get("databaseSizeBytes", 0),
+                                  "rowsWritten24h": (d1_groups[0].get("sum") or {}).get("rowsWritten", 0),
+                              },
+                              "r2": {
+                                  "bucketName": "stonks-private-history",
+                                  "retainedBytes": (r2_storage[0].get("max") or {}).get("payloadSize", 0),
+                                  "windowStart": window_start,
+                                  "classAOperationsMonthToDate": (r2_ops[0].get("sum") or {}).get("classAOperations", 0),
+                                  "classBOperationsMonthToDate": (r2_ops[0].get("sum") or {}).get("classBOperations", 0),
+                              },
+                          }
+                      ]
+                  }
+              },
+          }
+          print(json.dumps(reshaped))
+          PY
+
       - name: Read production snapshot publication state
         if: steps.params.outputs.manifest_present == 'true'
         run: |
@@ -322,6 +440,9 @@ jobs:
 
       - name: Preflight remote publication budget
         if: steps.params.outputs.manifest_present == 'true'
+        timeout-minutes: 5
+        env:
+          CLOUDFLARE_D1_DATABASE_ID: ${{ vars.CLOUDFLARE_D1_DATABASE_ID }}
         run: |
           set -euo pipefail
           MAX_D1_MUTATIONS_PER_RUN=50000
@@ -329,23 +450,41 @@ jobs:
           MAX_D1_DATABASE_BYTES=400000000
           MAX_R2_CLASS_A_PER_MONTH=800000
           MAX_R2_CLASS_B_PER_MONTH=5000000
-          WEEKDAY_RUNS_PER_MONTH=22
+          # F11/F14: the monthly attempt envelope is computed from the
+          # actual calendar month (plus reserved manual reruns) rather than
+          # a hard-coded constant -- see
+          # market_pipeline.publication.remote_usage.plan_monthly_attempts.
+          # This is informational only here; the preflight CLI recomputes
+          # the same value itself when given --remote-usage, so both derive
+          # it from the same source rather than trusting this echo.
+          echo "Monthly attempt envelope: $(uv run python -c 'from datetime import date; from market_pipeline.publication.remote_usage import plan_monthly_attempts; p = plan_monthly_attempts(date.today()); print(f"{p.monthly_attempts} ({p.scheduled_dates_in_month} scheduled + {p.reserved_manual_attempts} reserved manual)")')"
           if ! uv run python -m market_pipeline.publication.preflight --plan active-publication-plan.json \
             --d1-info d1-publication-info.json \
+            --remote-usage remote-usage.json \
+            --expected-account-id "${CLOUDFLARE_ACCOUNT_ID}" \
+            --expected-database-id "${CLOUDFLARE_D1_DATABASE_ID}" \
+            --expected-bucket-name stonks-private-history \
+            --reservation-ledger .cache/publication-ledger.json \
             --remote-publication-state remote-publication-state.json \
             --resolved-plan resolved-publication-plan.json \
             --max-d1-mutations-per-run "${MAX_D1_MUTATIONS_PER_RUN}" \
             --max-d1-rows-written-24h "${MAX_D1_ROWS_WRITTEN_24H}" \
             --max-d1-database-bytes "${MAX_D1_DATABASE_BYTES}" \
             --max-r2-class-a-per-month "${MAX_R2_CLASS_A_PER_MONTH}" \
-            --max-r2-class-b-per-month "${MAX_R2_CLASS_B_PER_MONTH}" \
-            --weekday-runs-per-month "${WEEKDAY_RUNS_PER_MONTH}"; then
+            --max-r2-class-b-per-month "${MAX_R2_CLASS_B_PER_MONTH}"; then
             echo "::error::remote publication plan exceeds the free-tier safety envelope"
             exit 1
           fi
 
       - name: Upload and verify private R2 history objects
         if: steps.params.outputs.manifest_present == 'true'
+        # Below four hours (F14): a hair under r2_sync's own internal
+        # --deadline-seconds 14400 (exactly four hours) below, so a true
+        # hang outside that internal deadline's own accounting (e.g. a
+        # network stall the retry/deadline logic never observes) is still
+        # bounded, leaving headroom in the job's own six-hour budget for
+        # the D1 import/verification steps that must still run afterward.
+        timeout-minutes: 235
         run: |
           set -euo pipefail
           # A single, synchronously-checked Python process is the entire
@@ -395,3 +534,37 @@ jobs:
             echo "::error::Remote active dataset does not match the locally published dataset."
             exit 1
           fi
+
+      - name: Record this run's reservation-ledger entry
+        if: steps.params.outputs.manifest_present == 'true'
+        run: |
+          set -euo pipefail
+          # A live GraphQL Analytics observation lags real usage (ingestion
+          # delay). This durable, conservative ledger records what THIS
+          # publisher actually attempted this run so the next run's
+          # preflight can bridge that lag rather than treat a stale
+          # observation as complete -- see
+          # market_pipeline.publication.remote_usage.append_reservation_ledger_entry.
+          # Recorded from the resolved plan (this run's own budget
+          # decision), which is a conservative upper bound: the true
+          # attempted R2 operation count from r2_sync's retries is not
+          # separately exposed by its CLI today.
+          mkdir -p .cache
+          uv run python3 - resolved-publication-plan.json .cache/publication-ledger.json <<'PY'
+          import json
+          import sys
+          from datetime import datetime, timezone
+
+          from market_pipeline.publication.remote_usage import ReservationLedgerEntry, append_reservation_ledger_entry
+          from pathlib import Path
+
+          plan = json.load(open(sys.argv[1], encoding="utf-8"))
+          entry = ReservationLedgerEntry(
+              recorded_at=datetime.now(timezone.utc),
+              d1_mutations=int(plan["d1_mutations"]),
+              r2_class_a_operations=int(plan["r2_mutable_objects"]) + int(plan["r2_immutable_objects"]),
+              r2_class_b_operations=int(plan["r2_mutable_objects"]) + int(plan["r2_immutable_objects"]),
+              r2_bytes=int(plan.get("d1_import_bytes", 0)),
+          )
+          append_reservation_ledger_entry(Path(sys.argv[2]), entry, now=entry.recorded_at)
+          PY

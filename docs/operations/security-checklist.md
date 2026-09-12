@@ -179,6 +179,54 @@ Tokens > Create API Token), scope it to exactly the one bucket and
 permission above, and store the resulting Access Key ID / Secret Access Key
 as the two GitHub Environment secrets named above.
 
+### Account Analytics Read: capacity telemetry credential (R09/F11)
+
+`daily-data.yml`'s "Read production capacity telemetry (GraphQL Analytics)"
+step (`pipeline/market_pipeline/publication/remote_usage.py`, R09/F11) calls
+Cloudflare's authenticated GraphQL Analytics API
+(`https://api.cloudflare.com/client/v4/graphql`) directly, using the same
+`CLOUDFLARE_API_TOKEN` the D1 token above already uses -- this is an
+additional **permission on that existing token**, not a third credential.
+Add exactly:
+
+| Permission | Resource |
+| --- | --- |
+| `Account Analytics Read` | the owning account (Cloudflare does not offer a narrower per-database/per-bucket scope for this permission) |
+
+Because this permission is account-wide rather than scoped to
+`stonks-research`/`stonks-private-history` specifically, the GraphQL
+response it authorizes can, in principle, also reflect any other D1
+database or R2 bucket sharing the account (including a preview
+environment's resources). `validate_remote_usage` narrows this back down
+by rejecting any response whose `accountTag`/`databaseId`/`bucketName`
+triple does not exactly match `stonks-research`/`stonks-private-history`
+(see `pipeline/market_pipeline/publication/remote_usage.py`), but it cannot
+narrow the account-wide *free-tier limit* itself: this publisher's budget
+math (`DEFAULT_ACCOUNT_BUDGET_ALLOCATION`, currently 90%) deliberately
+reserves only a fraction of the account's stated D1/R2 limits for itself,
+leaving explicit headroom for the preview environment or any other usage
+sharing the account.
+
+**Adding this permission alone is not a fix for a silently-zero response.**
+A request denied for any other reason (wrong account, expired token, wrong
+resource, insufficient permission) still returns a well-formed-looking
+GraphQL response with an `errors` array (or, per the audit's citation of
+`wrangler d1 info`'s own behavior, could otherwise default missing metrics
+to zero) unless `validate_remote_usage` explicitly rejects it -- which is
+exactly what it does: a GraphQL `errors` entry, a missing account/database/
+bucket dimension, a malformed metric, a stale or future-dated observation,
+and a resource-identity mismatch are all rejected before any of the
+response's numbers are trusted as real usage. See that module's docstring
+for the exact payload shape this permission needs to return.
+
+**Manual:** in the Cloudflare dashboard, edit the existing `daily-data.yml`
+API token (My Profile > API Tokens) and add the `Account Analytics Read`
+permission scoped to the owning account; no new secret is needed. Also add
+the target D1 database's UUID (distinct from its name `stonks-research`) as
+a new `daily-data-refresh` GitHub Environment variable,
+`CLOUDFLARE_D1_DATABASE_ID` -- Cloudflare's GraphQL Analytics API keys D1
+metrics by database ID, not by name.
+
 Two tokens, one per environment, each scoped to only that environment's own
 resources (Cloudflare API Tokens support per-resource scoping, not just
 per-account):

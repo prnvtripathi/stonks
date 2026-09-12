@@ -4,8 +4,22 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+
+from market_pipeline.publication.remote_usage import (
+    DEFAULT_RESERVED_MANUAL_ATTEMPTS,
+    MonthlyAttemptPlan,
+    RemotePublicationBudgetError,
+    RemoteUsage,
+    ReservedTotals,
+    load_reservation_ledger,
+    plan_monthly_attempts,
+    reserved_since,
+    validate_remote_usage,
+)
 
 WEEKDAY_RUNS_PER_MONTH = 22
 MAX_D1_MUTATIONS_PER_RUN = 50_000
@@ -16,8 +30,19 @@ MAX_R2_CLASS_A_PER_MONTH = 800_000
 MAX_R2_CLASS_B_PER_MONTH = 5_000_000
 
 
-class RemotePublicationBudgetError(RuntimeError):
-    """Raised when a plan would exceed the deliberately conservative envelope."""
+def _default_weekday_runs_per_month(reference_date: date | None = None) -> int:
+    """The actual month's scheduled-attempt budget, not a hard-coded constant.
+
+    Finding F11/F14: a fixed ``WEEKDAY_RUNS_PER_MONTH = 22`` silently
+    undercounts a 23-weekday month and never accounts for manual
+    ``workflow_dispatch`` reruns. This is used as the CLI's own default
+    (``main``'s ``--weekday-runs-per-month``) rather than the deliberately
+    stable ``WEEKDAY_RUNS_PER_MONTH``/``assert_plan_within_free_tier``
+    default kept above for backward-compatible, deterministic unit tests
+    that pass a fixed plan literal.
+    """
+
+    return plan_monthly_attempts(reference_date or date.today()).monthly_attempts
 
 
 def parse_remote_publication_state(payload: Any) -> tuple[set[str], str | None]:
@@ -112,6 +137,155 @@ def assert_plan_within_free_tier(
     return {**plan, "d1_mutations": mutations, "stale_snapshot_rows": stale_count, "new_snapshot_ids": sorted(new_snapshot_ids), "remote_active_dataset_id": remote_active_dataset_id, "r2_class_a_monthly": class_a, "r2_class_b_monthly": class_b}
 
 
+@dataclass(frozen=True)
+class RemoteBudgetDecision:
+    """An authorized publication attempt, gated by validated remote telemetry."""
+
+    resolved_plan: dict[str, Any]
+    mutation_calls: tuple[str, ...]
+
+
+def assert_plan_within_remote_budget(
+    plan: Mapping[str, Any],
+    *,
+    remote_usage: RemoteUsage,
+    remote_snapshot_ids: set[str],
+    remote_active_dataset_id: str | None,
+    monthly_attempt_plan: MonthlyAttemptPlan,
+    reserved: ReservedTotals | None = None,
+    max_d1_mutations_per_run: int = MAX_D1_MUTATIONS_PER_RUN,
+    max_d1_rows_written_24h: int = MAX_D1_ROWS_WRITTEN_24H,
+    max_d1_database_bytes: int = MAX_D1_DATABASE_BYTES,
+    max_r2_class_a_per_month: int = MAX_R2_CLASS_A_PER_MONTH,
+    max_r2_class_b_per_month: int = MAX_R2_CLASS_B_PER_MONTH,
+) -> RemoteBudgetDecision:
+    """Gate a plan using validated Cloudflare telemetry (F11/F14).
+
+    This is the entry point ``main()`` uses once a validated
+    :class:`~market_pipeline.publication.remote_usage.RemoteUsage` is
+    available. Unlike :func:`assert_plan_within_free_tier`, which trusts
+    whatever ``d1_info`` mapping it is handed, this function *requires* an
+    already-validated ``RemoteUsage`` -- raw Wrangler zero-default JSON (or
+    any other unchecked payload) is rejected outright, never silently
+    treated as "zero usage". It keeps ``assert_plan_within_free_tier``'s
+    D1 mutation/row/byte and R2 class A/B math completely intact, sourcing
+    its numbers from the validated object instead, and adds two checks that
+    raw ``d1_info`` alone cannot make:
+
+    * the plan's monthly attempt envelope must match this month's
+      independently computed schedule (:func:`~market_pipeline.publication
+      .remote_usage.plan_monthly_attempts`) plus reserved manual attempts,
+      so a stale hard-coded weekday constant can never silently drift from
+      reality; and
+    * this publisher's own reservation-ledger totals recorded since the
+      telemetry's observation (bridging analytics ingestion lag) are folded
+      into the same-day D1 write and month-to-date R2 operation totals, so
+      operations already in flight are never invisible to the gate.
+    """
+
+    if not isinstance(remote_usage, RemoteUsage):
+        raise RemotePublicationBudgetError(
+            "remote_usage must be a validated RemoteUsage (see "
+            "market_pipeline.publication.remote_usage.validate_remote_usage); "
+            "raw Wrangler or GraphQL JSON is not an accepted source"
+        )
+    reserved_totals = reserved if reserved is not None else ReservedTotals()
+    weekday_runs_per_month = monthly_attempt_plan.monthly_attempts
+    d1_info = {
+        "database_size": remote_usage.d1_database_bytes,
+        "rows_written_24h": remote_usage.d1_rows_written_24h + reserved_totals.d1_mutations,
+    }
+    resolved = assert_plan_within_free_tier(
+        plan,
+        d1_info=d1_info,
+        remote_snapshot_ids=remote_snapshot_ids,
+        remote_active_dataset_id=remote_active_dataset_id,
+        max_d1_mutations_per_run=max_d1_mutations_per_run,
+        max_d1_rows_written_24h=max_d1_rows_written_24h,
+        max_d1_database_bytes=max_d1_database_bytes,
+        max_r2_class_a_per_month=max_r2_class_a_per_month,
+        max_r2_class_b_per_month=max_r2_class_b_per_month,
+        weekday_runs_per_month=weekday_runs_per_month,
+    )
+    # `assert_plan_within_free_tier`'s class_a/class_b figures are a
+    # worst-case projection for the whole month, derived only from this
+    # plan; they say nothing about operations the account has already
+    # spent this month. Guard against that blind spot directly using the
+    # validated, observed month-to-date counts (plus this publisher's own
+    # not-yet-observed reservation-ledger activity) -- this is exactly the
+    # live R2 usage read the pre-R09 preflight never made.
+    observed_class_a = remote_usage.r2_class_a_operations_month_to_date + reserved_totals.r2_class_a_operations
+    observed_class_b = remote_usage.r2_class_b_operations_month_to_date + reserved_totals.r2_class_b_operations
+    if observed_class_a >= max_r2_class_a_per_month:
+        raise RemotePublicationBudgetError(
+            f"observed R2 Class A operations this month ({observed_class_a}) already meet or exceed "
+            f"the safety envelope ({max_r2_class_a_per_month}); refusing to add this run's operations"
+        )
+    if observed_class_b >= max_r2_class_b_per_month:
+        raise RemotePublicationBudgetError(
+            f"observed R2 Class B operations this month ({observed_class_b}) already meet or exceed "
+            f"the safety envelope ({max_r2_class_b_per_month}); refusing to add this run's operations"
+        )
+    return RemoteBudgetDecision(resolved_plan=resolved, mutation_calls=("d1_import", "r2_upload"))
+
+
+@dataclass(frozen=True)
+class PublicationAttemptOutcome:
+    """A non-raising view of :func:`assert_plan_within_remote_budget`'s decision.
+
+    ``mutation_calls`` lists the remote mutation operations authorized for
+    this attempt (``"d1_import"``, ``"r2_upload"``); it is always empty
+    whenever ``rejection_reason`` is set. Rejection happens *before* any
+    mutation call is made -- an oversized or otherwise over-budget plan
+    never reaches the R2 sync or D1 import steps, so an empty
+    ``mutation_calls`` here is a direct, testable statement that no remote
+    write was ever authorized, not just that one later failed.
+    """
+
+    mutation_calls: tuple[str, ...]
+    rejection_reason: str | None = None
+    resolved_plan: dict[str, Any] | None = None
+
+    @property
+    def authorized(self) -> bool:
+        return self.rejection_reason is None
+
+
+def evaluate_publication_attempt(
+    plan: Mapping[str, Any],
+    *,
+    remote_usage: RemoteUsage,
+    remote_snapshot_ids: set[str],
+    remote_active_dataset_id: str | None,
+    monthly_attempt_plan: MonthlyAttemptPlan,
+    reserved: ReservedTotals | None = None,
+    max_d1_mutations_per_run: int = MAX_D1_MUTATIONS_PER_RUN,
+    max_d1_rows_written_24h: int = MAX_D1_ROWS_WRITTEN_24H,
+    max_d1_database_bytes: int = MAX_D1_DATABASE_BYTES,
+    max_r2_class_a_per_month: int = MAX_R2_CLASS_A_PER_MONTH,
+    max_r2_class_b_per_month: int = MAX_R2_CLASS_B_PER_MONTH,
+) -> PublicationAttemptOutcome:
+    """Gate one publication attempt without raising -- for reporting and tests."""
+
+    try:
+        decision = assert_plan_within_remote_budget(
+            plan,
+            remote_usage=remote_usage,
+            remote_snapshot_ids=remote_snapshot_ids,
+            remote_active_dataset_id=remote_active_dataset_id,
+            monthly_attempt_plan=monthly_attempt_plan,
+            reserved=reserved,
+            max_d1_mutations_per_run=max_d1_mutations_per_run,
+            max_d1_rows_written_24h=max_d1_rows_written_24h,
+            max_d1_database_bytes=max_d1_database_bytes,
+            max_r2_class_a_per_month=max_r2_class_a_per_month,
+            max_r2_class_b_per_month=max_r2_class_b_per_month,
+        )
+    except RemotePublicationBudgetError as exc:
+        return PublicationAttemptOutcome(mutation_calls=(), rejection_reason=str(exc))
+    return PublicationAttemptOutcome(mutation_calls=decision.mutation_calls, resolved_plan=decision.resolved_plan)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="validate a local-only remote publication plan")
     parser.add_argument("--plan", required=True)
@@ -123,7 +297,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--max-d1-database-bytes", type=int, default=MAX_D1_DATABASE_BYTES)
     parser.add_argument("--max-r2-class-a-per-month", type=int, default=MAX_R2_CLASS_A_PER_MONTH)
     parser.add_argument("--max-r2-class-b-per-month", type=int, default=MAX_R2_CLASS_B_PER_MONTH)
-    parser.add_argument("--weekday-runs-per-month", type=int, default=WEEKDAY_RUNS_PER_MONTH)
+    parser.add_argument("--weekday-runs-per-month", type=int, default=None, help="defaults to the actual current month's scheduled attempts (see plan_monthly_attempts)")
+    parser.add_argument(
+        "--remote-usage",
+        help=(
+            "validated GraphQL Analytics API response JSON (see "
+            "market_pipeline.publication.remote_usage). When given, this "
+            "supersedes --d1-info as the source of D1/R2 capacity numbers "
+            "(F11): raw Wrangler zero-default output is not an accepted "
+            "source for the gate itself."
+        ),
+    )
+    parser.add_argument("--expected-account-id", help="required with --remote-usage")
+    parser.add_argument("--expected-database-id", help="required with --remote-usage")
+    parser.add_argument("--expected-bucket-name", help="required with --remote-usage")
+    parser.add_argument("--reservation-ledger", help="durable reservation-ledger JSON path (optional, used with --remote-usage)")
+    parser.add_argument("--reserved-manual-attempts", type=int, default=DEFAULT_RESERVED_MANUAL_ATTEMPTS)
     args = parser.parse_args(argv)
     try:
         plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
@@ -132,18 +321,56 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not isinstance(plan, dict) or not isinstance(d1_info, dict):
             raise RemotePublicationBudgetError("invalid remote publication plan")
         remote_ids, active = parse_remote_publication_state(remote_state)
-        resolved = assert_plan_within_free_tier(
-            plan,
-            d1_info=d1_info,
-            remote_snapshot_ids=remote_ids,
-            remote_active_dataset_id=active,
-            max_d1_mutations_per_run=args.max_d1_mutations_per_run,
-            max_d1_rows_written_24h=args.max_d1_rows_written_24h,
-            max_d1_database_bytes=args.max_d1_database_bytes,
-            max_r2_class_a_per_month=args.max_r2_class_a_per_month,
-            max_r2_class_b_per_month=args.max_r2_class_b_per_month,
-            weekday_runs_per_month=args.weekday_runs_per_month,
-        )
+        if args.remote_usage:
+            if not (args.expected_account_id and args.expected_database_id and args.expected_bucket_name):
+                raise RemotePublicationBudgetError(
+                    "--expected-account-id, --expected-database-id, and --expected-bucket-name "
+                    "are required with --remote-usage"
+                )
+            now = datetime.now(timezone.utc)
+            raw_usage = json.loads(Path(args.remote_usage).read_text(encoding="utf-8"))
+            remote_usage = validate_remote_usage(
+                raw_usage,
+                {
+                    "account_id": args.expected_account_id,
+                    "database_id": args.expected_database_id,
+                    "bucket_name": args.expected_bucket_name,
+                },
+                now,
+            )
+            ledger = load_reservation_ledger(Path(args.reservation_ledger)) if args.reservation_ledger else ()
+            reserved = reserved_since(ledger, remote_usage.observed_at)
+            monthly_attempt_plan = plan_monthly_attempts(now.date(), reserved_manual_attempts=args.reserved_manual_attempts)
+            decision = assert_plan_within_remote_budget(
+                plan,
+                remote_usage=remote_usage,
+                remote_snapshot_ids=remote_ids,
+                remote_active_dataset_id=active,
+                monthly_attempt_plan=monthly_attempt_plan,
+                reserved=reserved,
+                max_d1_mutations_per_run=args.max_d1_mutations_per_run,
+                max_d1_rows_written_24h=args.max_d1_rows_written_24h,
+                max_d1_database_bytes=args.max_d1_database_bytes,
+                max_r2_class_a_per_month=args.max_r2_class_a_per_month,
+                max_r2_class_b_per_month=args.max_r2_class_b_per_month,
+            )
+            resolved = decision.resolved_plan
+        else:
+            weekday_runs_per_month = (
+                args.weekday_runs_per_month if args.weekday_runs_per_month is not None else _default_weekday_runs_per_month()
+            )
+            resolved = assert_plan_within_free_tier(
+                plan,
+                d1_info=d1_info,
+                remote_snapshot_ids=remote_ids,
+                remote_active_dataset_id=active,
+                max_d1_mutations_per_run=args.max_d1_mutations_per_run,
+                max_d1_rows_written_24h=args.max_d1_rows_written_24h,
+                max_d1_database_bytes=args.max_d1_database_bytes,
+                max_r2_class_a_per_month=args.max_r2_class_a_per_month,
+                max_r2_class_b_per_month=args.max_r2_class_b_per_month,
+                weekday_runs_per_month=weekday_runs_per_month,
+            )
         Path(args.resolved_plan).write_text(json.dumps(resolved, sort_keys=True) + "\n", encoding="utf-8")
     except (OSError, json.JSONDecodeError, RemotePublicationBudgetError) as exc:
         parser.error(str(exc))
@@ -154,4 +381,13 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["RemotePublicationBudgetError", "assert_plan_within_free_tier", "main"]
+__all__ = [
+    "PublicationAttemptOutcome",
+    "RemoteBudgetDecision",
+    "RemotePublicationBudgetError",
+    "assert_plan_within_free_tier",
+    "assert_plan_within_remote_budget",
+    "evaluate_publication_attempt",
+    "main",
+    "parse_remote_publication_state",
+]
