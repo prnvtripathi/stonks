@@ -145,6 +145,40 @@ never prints either credential. No live Cloudflare call was made while this
 bridge was implemented; the owner supplying this configuration is what enables
 the first remote R2 upload and D1 import.
 
+### R2 object transport credential (S3 API token): separate from the D1 token
+
+`daily-data.yml`'s "Upload and verify private R2 history objects" step
+(`pipeline/market_pipeline/publication/r2_sync.py`, R08/F09/F10) talks to R2
+through its S3-compatible API using `boto3`, not through `wrangler`. This
+requires a **separate** credential type from the `CLOUDFLARE_API_TOKEN`
+above: an R2 API token (an Access Key ID / Secret Access Key pair), created
+independently in the Cloudflare dashboard under R2 > Manage R2 API Tokens,
+scoped to:
+
+| Permission | Resource |
+| --- | --- |
+| Object Read & Write | `stonks-private-history` only |
+
+Store the pair as the `daily-data-refresh` GitHub Environment's
+`R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY` secrets. Do not scope this
+token to "Admin Read & Write" (which grants bucket-management operations
+this workflow never needs), to any other bucket (including
+`stonks-private-history-preview`), or to any non-R2 product -- unlike a
+Cloudflare API Token, an R2 API token cannot be scoped to D1, Workers, or any
+non-R2 resource at all, so this separation is structural, not just a policy
+choice. `r2_sync.py`'s CLI reads these two secrets plus the existing
+`CLOUDFLARE_ACCOUNT_ID` variable and constructs the R2 endpoint URL itself
+(`https://<account>.r2.cloudflarestorage.com`); it never reads
+`CLOUDFLARE_API_TOKEN`, and the D1 import step that follows it never reads
+`R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY`. A leaked R2 API token therefore
+cannot touch D1, and a leaked `CLOUDFLARE_API_TOKEN` cannot touch R2 objects
+through this path.
+
+**Manual:** create this token in the Cloudflare dashboard (R2 > Manage R2 API
+Tokens > Create API Token), scope it to exactly the one bucket and
+permission above, and store the resulting Access Key ID / Secret Access Key
+as the two GitHub Environment secrets named above.
+
 Two tokens, one per environment, each scoped to only that environment's own
 resources (Cloudflare API Tokens support per-resource scoping, not just
 per-account):

@@ -2,15 +2,29 @@
 
 These tests deliberately inspect workflow text only: they must not need a
 Cloudflare account, credentials, or a network call to prove the safety order.
+
+R08/F09/F10: the R2 upload step used to be a per-object ``wrangler r2 object
+put``/``get`` loop fed by Bash process substitution
+(``< <(python3 - ... <<'PY' ... PY)``). If that embedded producer failed,
+``set -euo pipefail`` did not propagate the failure into the enclosing
+``while`` loop's exit code, so a corrupted or partial publish could still
+fall through into the D1 import step. That whole loop is now replaced by one
+synchronously-checked invocation of
+``market_pipeline.publication.r2_sync`` -- its own bounded concurrency,
+retry, deadline, and reuse behavior is unit-tested directly in
+``pipeline/tests/integration/test_r2_sync.py``, not re-derived from workflow
+text here.
 """
 
 from pathlib import Path
 
 
+def _workflow_text() -> str:
+    return (Path(__file__).resolve().parents[3] / ".github/workflows/daily-data.yml").read_text(encoding="utf-8")
+
+
 def test_daily_workflow_uploads_and_verifies_history_before_d1_pointer_switch() -> None:
-    workflow = (Path(__file__).resolve().parents[3] / ".github/workflows/daily-data.yml").read_text(
-        encoding="utf-8"
-    )
+    workflow = _workflow_text()
 
     install = workflow.index("Install pinned Wrangler dependency")
     export = workflow.index("Export locally active dataset for D1")
@@ -24,11 +38,6 @@ def test_daily_workflow_uploads_and_verifies_history_before_d1_pointer_switch() 
     assert "pnpm install --frozen-lockfile" in workflow
     assert "--object-manifest active-history-objects.json" in workflow
     assert "active-history-objects.json" in workflow
-    assert 'remote_object="stonks-private-history/${object_key}"' in workflow
-    assert 'wrangler r2 object put "${remote_object}" --file "${history_file}" --remote --env production' in workflow
-    assert 'wrangler r2 object get "${remote_object}" --file "${verified_file}" --remote --env production' in workflow
-    assert "cmp --silent" in workflow
-    assert "find history -type f" not in workflow
     assert "MAX_D1_MUTATIONS_PER_RUN=50000" in workflow
     assert "WEEKDAY_RUNS_PER_MONTH=22" in workflow
     assert "market_pipeline.publication.preflight --plan active-publication-plan.json" in workflow
@@ -37,9 +46,6 @@ def test_daily_workflow_uploads_and_verifies_history_before_d1_pointer_switch() 
     assert "remote-publication-state.json" in workflow
     assert "SELECT 'snapshot' AS kind, instrument_id AS value FROM instrument_snapshots" in workflow
     assert "MAX_R2_CLASS_A_PER_MONTH=800000" in workflow
-    assert '"${object_mode}" = "bootstrap"' in workflow
-    assert '[[ "${object_key}" == history/* ]]' not in workflow
-    assert workflow.count('wrangler r2 object put "${remote_object}"') == 1
     assert "remote publication plan exceeds the free-tier safety envelope" in workflow
     assert "wrangler d1 execute stonks-research --env production --remote --file active-dataset.sql" in workflow
     assert "SELECT dataset_id FROM active_dataset WHERE singleton = 1" in workflow
@@ -53,24 +59,37 @@ def test_daily_workflow_uploads_and_verifies_history_before_d1_pointer_switch() 
     assert "stonks-private-history-preview" not in publication
 
 
-def test_daily_workflow_always_reuploads_mutable_current_year_history() -> None:
-    """A successful probe cannot prove a current year's append-only file is current."""
+def test_daily_workflow_r2_upload_step_is_one_python_process_with_no_process_substitution() -> None:
+    """F09/F10: no per-object subshell, no process substitution, one exit code."""
 
-    workflow = (Path(__file__).resolve().parents[3] / ".github/workflows/daily-data.yml").read_text(
-        encoding="utf-8"
-    )
+    workflow = _workflow_text()
 
-    upload_loop = workflow[workflow.index("Upload and verify private R2 history objects"):]
-    assert 'wrangler r2 object put "${remote_object}"' in upload_loop
-    assert 'wrangler r2 object get "${remote_object}"' in upload_loop
-    assert '[[ "${object_key}" == history/* ]]' not in upload_loop
+    r2_start = workflow.index("Upload and verify private R2 history objects")
+    d1_start = workflow.index("Import active dataset into production D1")
+    upload_step = workflow[r2_start:d1_start]
+
+    assert "set -euo pipefail" in upload_step
+    assert "python -m market_pipeline.publication.r2_sync" in upload_step
+    assert "--bundle active-history-objects.json" in upload_step
+    assert "--history-root history" in upload_step
+    # The historical unsafe pattern must be fully gone, not merely reduced.
+    assert "<(" not in upload_step  # no process substitution
+    assert "while IFS" not in upload_step  # no per-object read loop
+    assert "wrangler r2 object" not in upload_step
+    assert "resolved-publication-plan.json" not in upload_step
+
+    # The R2 transport credential is distinct from the D1/Wrangler token.
+    assert "R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}" in workflow
+    assert "R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}" in workflow
 
 
-def test_daily_workflow_bootstraps_closed_history_for_new_remote_instruments() -> None:
-    workflow = (Path(__file__).resolve().parents[3] / ".github/workflows/daily-data.yml").read_text(
-        encoding="utf-8"
-    )
+def test_daily_workflow_does_not_gate_d1_import_with_always() -> None:
+    """The D1 import step must not opt back into running after a failed upload."""
 
-    upload_loop = workflow[workflow.index("Upload and verify private R2 history objects"):]
-    assert 'instrument_id in new_ids' in upload_loop
-    assert 'mode == "immutable" and (bootstrap or instrument_id in new_ids)' in upload_loop
+    workflow = _workflow_text()
+    d1_start = workflow.index("Import active dataset into production D1")
+    d1_end = workflow.index("Verify remote active dataset")
+    d1_step = workflow[d1_start:d1_end]
+
+    assert "if: always()" not in d1_step
+    assert "continue-on-error" not in d1_step

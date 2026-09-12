@@ -75,6 +75,15 @@ jobs:
       # They are intentionally never echoed or copied into an artifact.
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      # R2's S3-compatible API is authenticated separately from the
+      # Cloudflare API token above: this is an R2 API token (Access Key
+      # ID / Secret Access Key pair) scoped to only the
+      # stonks-private-history bucket, created independently in the
+      # Cloudflare dashboard (R2 > Manage R2 API Tokens). It never has
+      # D1, Workers, or account-wide permissions -- see
+      # docs/operations/security-checklist.md section 7.
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -339,56 +348,21 @@ jobs:
         if: steps.params.outputs.manifest_present == 'true'
         run: |
           set -euo pipefail
-          while IFS=$'\t' read -r object_mode object_key; do
-            history_file="history/${object_key}"
-            remote_object="stonks-private-history/${object_key}"
-            verified_file="$(mktemp)"
-            trap 'rm -f "${verified_file}"' EXIT
-            if [ "${object_mode}" = "mutable" ] || [ "${object_mode}" = "bootstrap" ]; then
-              pnpm --dir apps/api exec wrangler r2 object put "${remote_object}" --file "${history_file}" --remote --env production
-            fi
-            pnpm --dir apps/api exec wrangler r2 object get "${remote_object}" --file "${verified_file}" --remote --env production
-            cmp --silent "${history_file}" "${verified_file}"
-            rm -f "${verified_file}"
-            trap - EXIT
-          done < <(python3 - active-history-objects.json resolved-publication-plan.json <<'PY'
-          import json
-          import sys
-          from pathlib import Path, PurePosixPath
-
-          manifest_path = Path(sys.argv[1])
-          resolved_path = Path(sys.argv[2])
-          root = Path("history").resolve()
-          try:
-              manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-              resolved = json.loads(resolved_path.read_text(encoding="utf-8"))
-          except (OSError, json.JSONDecodeError) as exc:
-              raise SystemExit(f"invalid active history manifest: {exc}")
-          if not isinstance(manifest, dict) or set(manifest) != {"mutable", "immutable"} or not isinstance(resolved, dict):
-              raise SystemExit("active history manifest must contain at least one object")
-          bootstrap = resolved.get("remote_active_dataset_id") is None
-          new_ids = resolved.get("new_snapshot_ids")
-          if not isinstance(new_ids, list) or any(not isinstance(item, str) for item in new_ids):
-              raise SystemExit("resolved publication state is invalid")
-          new_ids = set(new_ids)
-          for mode in ("mutable", "immutable"):
-              keys = manifest.get(mode)
-              if not isinstance(keys, list):
-                  raise SystemExit("active history manifest has an invalid object group")
-              for key in keys:
-                  if not isinstance(key, str) or not key or "\x00" in key or "\n" in key or "\r" in key:
-                      raise SystemExit("active history manifest has an invalid object key")
-                  relative = PurePosixPath(key)
-                  if relative.is_absolute() or ".." in relative.parts or relative.parts[0] not in {"history", "charts"}:
-                      raise SystemExit("active history manifest object escapes the history root")
-                  local = (root / relative).resolve()
-                  if not local.is_relative_to(root) or not local.is_file():
-                      raise SystemExit(f"active history manifest object is missing: {key}")
-                  instrument_id = relative.parts[2] if mode == "immutable" else ""
-                  bootstrap_key = mode == "immutable" and (bootstrap or instrument_id in new_ids)
-                  print(("bootstrap" if bootstrap_key else mode) + "\t" + key)
-          PY
-          )
+          # A single, synchronously-checked Python process is the entire
+          # safety boundary here (findings F09/F10): no process
+          # substitution, no per-object subshell, no `while read` loop
+          # whose exit code could be swallowed by the pipe/substitution
+          # around it. `set -euo pipefail` on this step now means exactly
+          # what it says: any nonzero exit here fails the step outright,
+          # and GitHub Actions skips every following promotion step
+          # (including the D1 import that follows this one) unless a
+          # later step explicitly opts back in with an always-run
+          # condition, which none of the remaining promotion steps do.
+          uv run python -m market_pipeline.publication.r2_sync \
+            --bundle active-history-objects.json \
+            --history-root history \
+            --max-workers 16 \
+            --deadline-seconds 14400
 
       - name: Import active dataset into production D1
         if: steps.params.outputs.manifest_present == 'true'
