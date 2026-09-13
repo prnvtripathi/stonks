@@ -275,3 +275,97 @@ def test_compose_command_delayed_source_still_publishes_and_preserves_dataset_id
     # invented a new dataset or destroyed the existing one.
     assert second_payload["refresh"]["active_dataset_id"] == last_good_dataset_id
     assert second_payload["refresh"]["dataset_id"] == last_good_dataset_id
+
+
+# --- Final-review fix: `compose` must apply the SAME real coverage/budget ---
+# --- promotion gates `daily` already has, not a structurally-inert or a  ---
+# --- guaranteed-false-block stand-in.                                    ---
+
+
+def _multi_scheme_nav_report(effective_date: str, count: int) -> bytes:
+    """A real, parseable AMFI NAV report with ``count`` distinct schemes."""
+
+    day = datetime.fromisoformat(effective_date).strftime("%d-%b-%Y")
+    lines = [
+        "Scheme Code;ISIN Div Payout/ ISIN Growth;ISIN Div Reinvestment;"
+        "Scheme Name;Net Asset Value;Date",
+        "",
+        "Alpha Asset Management Mutual Fund",
+        "",
+        "Open Ended Schemes(Equity Scheme - Large Cap Fund)",
+    ]
+    for index in range(count):
+        code = 119551 + index
+        isin_growth = f"INF{index:03d}119551AA1"
+        isin_reinvest = f"INF{index:03d}119551AB9"
+        lines.append(
+            f"{code};{isin_growth};{isin_reinvest};Alpha Bluechip Fund {index} - Direct Plan - Growth;"
+            f"100.5;{day}"
+        )
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def _multi_scheme_artifact(effective_date: str, count: int) -> dict[str, Any]:
+    body = _multi_scheme_nav_report(effective_date, count)
+    return {
+        "artifact": {
+            "source_id": "amfi-nav",
+            "source_url": SOURCE_URL,
+            "retrieved_at": datetime.now(UTC).isoformat(),
+            "effective_date": effective_date,
+            "checksum": hashlib.sha256(body).hexdigest(),
+            "adapter_version": "v1",
+            "terms_url": TERMS_URL,
+            "filename": "NAVAll.txt",
+        },
+        "body_base64": base64.b64encode(body).decode(),
+    }
+
+
+def test_compose_previous_count_no_longer_false_blocks_a_healthy_run(tmp_path: Path, capsys: Any) -> None:
+    """Reproduces the reviewer's exact "0 of 5000" false-block: before the
+    fix, `_run_compose` never passed `provider_by_category` into
+    `run_scheduled_refresh`, so every `CandidateCoverage.instrument_count`
+    computed on this path was 0 regardless of the real candidate size. With
+    `--previous-count` supplied (as the daily-data.yml dispatch path already
+    does), that meant `ratio = 0/previous_count` -- a guaranteed block on a
+    genuinely healthy, fully-covered run.
+    """
+
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"artifacts": [_multi_scheme_artifact("2026-09-01", 10)]}))
+    result = main([
+        "--db", str(tmp_path / "market.db"),
+        "compose", "--date", "2026-09-01", "--manifest", str(manifest),
+        "--previous-count", "10",
+    ])
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert payload["refresh"]["status"] == "published"
+    coverage = payload["refresh"]["source_status"]["amfi-nav"]["coverage"]
+    assert coverage["instrument_count"] == 10
+
+
+def test_compose_previous_count_still_blocks_a_genuinely_truncated_candidate(
+    tmp_path: Path, capsys: Any
+) -> None:
+    """The other half of the same fix: a real coverage drop (not the
+    structurally-inert `ratio == 1.0` this path used to always report) must
+    still be correctly BLOCKED once real instrument counts are wired in.
+    """
+
+    manifest = tmp_path / "manifest.json"
+    # Only 2 of the previously-published 10 schemes are present: a genuine
+    # 20% coverage ratio, well below the 90% minimum.
+    manifest.write_text(json.dumps({"artifacts": [_multi_scheme_artifact("2026-09-01", 2)]}))
+    result = main([
+        "--db", str(tmp_path / "market.db"),
+        "compose", "--date", "2026-09-01", "--manifest", str(manifest),
+        "--previous-count", "10",
+    ])
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 3
+    assert payload["refresh"]["status"] == "blocked"
+    assert payload["refresh"]["dataset_id"] is None
+    coverage = payload["refresh"]["source_status"]["amfi-nav"]["coverage"]
+    assert coverage["instrument_count"] == 2

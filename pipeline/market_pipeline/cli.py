@@ -275,6 +275,33 @@ def _run_compose(
         )
         for source_id in sources
     ]
+    # F16/R01 fix (final review, Critical finding): this command previously
+    # never supplied `provider_by_category`, so `resolve_source_statuses`
+    # could never compute a real `CandidateCoverage.instrument_count` for any
+    # scheduled source -- every count silently came back 0, which made the
+    # R01 coverage-drop check either structurally inert (no --previous-count:
+    # ratio always 1.0) or a guaranteed false block (--previous-count
+    # supplied: "0 of N" every time, even on a genuinely healthy run). Only
+    # "amfi-nav" is ever actually wired end to end through this CLI today
+    # (jobs/publish.py's own WIRED_SOURCES), and every instrument it produces
+    # is published with provider "amfi" -- mapping only that one category is
+    # the same honest mapping cli.py's own `_candidate_coverage` (used by the
+    # daily/backfill path) already applies; mapping every requested category
+    # to "amfi" instead would double-count the same instruments under an
+    # unrelated, unwired source name in a multi-source invocation.
+    provider_by_category = {"amfi-nav": "amfi"}
+    # Mirror main()'s own daily/backfill baseline resolution exactly: an
+    # explicit --previous-count always wins for a single-source scope, the
+    # last safe-to-promote run recorded in this database is the baseline for
+    # the cron-triggered path (no --previous-count available), and only a
+    # genuine first-ever run for this scope falls back to comparing the
+    # candidate against itself.
+    source_baselines = _last_published_candidate_coverage(connection, sources)
+    previous_count = args.previous_count
+    if previous_count is not None and len(sources) <= 1:
+        # Keep the legacy aggregate override for a one-source invocation, but
+        # never let it hide a per-source drop in a multi-source candidate.
+        source_baselines = ()
     refresh = run_scheduled_refresh(
         connection,
         publisher,
@@ -284,8 +311,13 @@ def _run_compose(
         amfi_source_ids=sources,
         history_store=history_store,
         min_coverage_ratio=args.min_coverage_ratio,
-        previous_count=args.previous_count,
+        previous_count=previous_count,
+        source_baselines=source_baselines,
+        provider_by_category=provider_by_category,
     )
+    if refresh.status == "published" and refresh.dataset_id is not None:
+        coverage_rows = [status.coverage for status in refresh.source_status.values() if status.coverage is not None]
+        _record_published_candidate_coverage(connection, sources, coverage_rows, refresh.dataset_id)
     storage = publisher.budget_report()
     storage_report = budget_report(
         used=storage.used_bytes,

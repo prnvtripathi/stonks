@@ -353,6 +353,20 @@ nothing in the schedule is expected to publish that day at all, e.g. a
 weekend) and `source_status`, alongside the same `start`/`end`/`completed`/
 `missing_dates`/`warnings`/`budget` fields `daily`/`backfill` already report.
 
+Final-review fix (this fix wave): `compose` previously never supplied real
+per-source instrument counts into its own coverage check, so the R01
+coverage-drop gate was either structurally inert (no `--previous-count`:
+ratio always compared the candidate against itself) or a guaranteed false
+block (`--previous-count` supplied: every run compared a real baseline
+against a candidate count of zero). The R09 D1 storage-budget gate was also
+only computed for the JSON report, after publication would already have
+happened, rather than gating it. Both are now real: `compose` reads/writes
+the same per-source coverage baseline table `daily`/`backfill` use, computes
+real instrument counts from the composed build's own instrument table, and
+applies the storage-budget check inside `run_scheduled_refresh` before
+`publish_checkpointed_dataset` runs -- `compose` now has the same coverage/
+budget promotion-gate guarantees `daily` already had.
+
 Requesting only `--source amfi-nav` (the default, and today's only
 production source) behaves identically to `daily`'s own promotion outcome:
 both build through `build_composed_candidate`, whose AMFI-only path is a

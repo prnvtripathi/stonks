@@ -38,6 +38,7 @@ permission stays denied in production (S01), so no test here uses the real
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace as dataclass_replace
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -411,6 +412,30 @@ def test_missing_security_master_fails_closed_instead_of_publishing_an_empty_uni
 ) -> None:
     inputs = [item for item in nse_universe["inputs"] if item.role is not SourceInputRole.SECURITY_MASTER]
     with pytest.raises(PublicationInputError):
+        build_nse_candidate(inputs, nse_universe["raw_store"], EFFECTIVE_DATE)
+
+
+def test_role_source_id_mismatch_fails_closed(nse_universe: dict[str, Any]) -> None:
+    """A wiring bug that mislabels a REAL registered source's role must not
+    be silently trusted as official data of the wrong kind.
+
+    Mirrors ``jobs/reference_candidate.py``'s own
+    ``test_role_source_id_mismatch_fails_closed``: relabels a genuinely
+    present input's ``source_id`` to the real, registered ``nse-eod`` --
+    which this NSE candidate build only ever trusts as EOD_OBSERVATIONS data
+    -- while keeping its role as ``SECURITY_MASTER``. This must be rejected
+    by ``_require_role_source_id``, not silently published with fabricated
+    "official" provenance for the wrong role.
+    """
+
+    real_master_input = next(
+        item for item in nse_universe["inputs"] if item.role is SourceInputRole.SECURITY_MASTER
+    )
+    mislabeled = dataclass_replace(real_master_input, source_id="nse-eod")
+    inputs = [item for item in nse_universe["inputs"] if item.role is not SourceInputRole.SECURITY_MASTER]
+    inputs.append(mislabeled)
+
+    with pytest.raises(PublicationInputError, match="source_id"):
         build_nse_candidate(inputs, nse_universe["raw_store"], EFFECTIVE_DATE)
 
 

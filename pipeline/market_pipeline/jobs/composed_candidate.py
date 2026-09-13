@@ -88,6 +88,7 @@ from market_pipeline.jobs.reference_candidate import (
     build_reference_rows,
 )
 from market_pipeline.jobs.source_inputs import AcquisitionMode, SourceInput
+from market_pipeline.monitoring.budgets import budget_report
 from market_pipeline.publication.input_manifest import InputManifestError, manifest_with_fingerprint
 from market_pipeline.storage.d1_publisher import D1Publisher
 from market_pipeline.storage.history_store import HistoryStore
@@ -153,6 +154,7 @@ class SourceStatus:
     state: str
     detail: str = ""
     coverage: CandidateCoverage | None = None
+    max_delay_days: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -164,6 +166,7 @@ class SourceStatus:
             "state": self.state,
             "detail": self.detail,
             "coverage": self.coverage.as_dict() if self.coverage is not None else None,
+            "max_delay_days": self.max_delay_days,
         }
 
 
@@ -473,8 +476,23 @@ def build_composed_candidate(
             str(row["instrument_id"]): str(row["asset_class"])
             for row in nse_build.candidate["tables"]["instruments"]
         }
+        # Pass S02's own corporate-action-adjusted close series through
+        # verbatim (its `DatasetBuild.histories` is already keyed exactly
+        # `str(instrument_id) -> (asset_class, ((date, adjusted_close), ...))`)
+        # so `benchmark_rs_*` is computed from the SAME adjusted basis as
+        # `return_*`/other S02 metrics for the same instrument, never a
+        # second, independently-re-derived UNADJUSTED series -- see
+        # `build_reference_rows`'s own `adjusted_price_series` docstring.
+        adjusted_price_series = {
+            instrument_id: dict(points) for instrument_id, (_, points) in nse_build.histories.items()
+        }
         reference_rows = build_reference_rows(
-            list(reference_inputs), raw_store, instrument_ids, effective_date, mappings_path=mappings_path
+            list(reference_inputs),
+            raw_store,
+            instrument_ids,
+            effective_date,
+            mappings_path=mappings_path,
+            adjusted_price_series=adjusted_price_series,
         )
     return compose_datasets(amfi=amfi_build, nse=nse_build, reference=reference_rows, effective_date=effective_date)
 
@@ -551,6 +569,7 @@ def resolve_source_statuses(
     categories = {entry.source_id: entry.category for entry in schedule}
     modes = {entry.source_id: entry.acquisition_mode for entry in schedule}
 
+    max_delay_by_source = {entry.source_id: entry.max_delay_days for entry in schedule}
     statuses: dict[str, SourceStatus] = {}
     for freshness in report.source_freshness:
         coverage = coverage_by_source.get(freshness.source_id)
@@ -563,6 +582,7 @@ def resolve_source_statuses(
             state=freshness.status,
             detail=freshness.detail,
             coverage=coverage,
+            max_delay_days=max_delay_by_source.get(freshness.source_id, 0),
         )
     return statuses
 
@@ -661,8 +681,17 @@ def run_scheduled_refresh(
         source_id: SourceObservation(
             expected=status.state != "not_expected",
             failed=status.state == "failed",
-            delay_days=1 if status.state == "delayed" else 0,
-            max_delay_days=1 if status.state == "delayed" else 0,
+            # Use the real computed expected-vs-loaded gap (already resolved
+            # once, correctly, inside resolve_source_statuses/reconcile), not
+            # a hardcoded 1: a source stale by 30 days must not be treated
+            # identically to one stale by 1 day just because both happen to
+            # exceed a 1-day tolerance.
+            delay_days=(
+                abs((status.expected_date - status.loaded_date).days)
+                if status.expected_date is not None and status.loaded_date is not None
+                else (status.max_delay_days + 1 if status.state == "failed" else 0)
+            ),
+            max_delay_days=status.max_delay_days,
             detail=status.detail,
         )
         for source_id, status in statuses.items()
@@ -683,7 +712,18 @@ def run_scheduled_refresh(
         candidate_coverage=coverage_rows,
         source_baselines=source_baselines,
     )
-    safe_to_promote, blocking_reasons = evaluate_pre_promotion(report)
+    # R09 D1 storage-budget promotion gate: this must be applied BEFORE
+    # publication happens on the compose path too, exactly as `daily`'s own
+    # main() already does -- not merely computed afterwards for the JSON
+    # report, by which point promotion would already have occurred.
+    storage = publisher.budget_report()
+    storage_report = budget_report(
+        used=storage.used_bytes,
+        limit=storage.limit_bytes,
+        warning_threshold=storage.warning_threshold,
+        source="d1",
+    )
+    safe_to_promote, blocking_reasons = evaluate_pre_promotion(report, [storage_report])
     if build_error is not None:
         # Defense-in-depth: a composition failure not otherwise reflected by
         # a single source's own freshness state (e.g. an instrument_id

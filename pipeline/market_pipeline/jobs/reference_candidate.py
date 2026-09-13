@@ -519,6 +519,7 @@ def build_reference_rows(
     effective_date: date,
     *,
     mappings_path: str | Path = DEFAULT_MAPPINGS_PATH,
+    adjusted_price_series: Mapping[str, Mapping[date, Decimal]] | None = None,
 ) -> ReferenceRows:
     """Compose real NSE filings and Nifty 500 benchmark observations.
 
@@ -527,6 +528,22 @@ def build_reference_rows(
     shape -- this bounds the instrument-ID space and lets fundamentals
     distinguish a genuinely missing equity filing from a metric that never
     applies to a non-equity asset class.
+
+    ``adjusted_price_series``, when supplied, is the SAME corporate-action
+    adjusted close series ``jobs/nse_candidate.py`` already computed for the
+    composed run (its own ``DatasetBuild.histories``, keyed the same way:
+    ``str(instrument_id) -> {date: adjusted_close}``) -- the global pipeline
+    constraint is to apply corporate-action adjustments before ANY equity
+    return/RS calculation, and ``benchmark_rs_*`` is exactly that kind of
+    calculation. Without this, this module would re-parse the same raw
+    bhavcopies through ``_asset_price_series`` and align the RS window
+    against UNADJUSTED closes -- a different, inconsistent price basis from
+    the ``return_*``/other RS metrics S02 publishes for the very same
+    instrument in the same composed dataset. When omitted (S03's own
+    standalone component tests, which never see a NSE build), this falls
+    back to deriving a raw close series directly from ``eod_inputs``, exactly
+    as before -- callers that only need reference rows for a mapping/filing
+    story, isolated from S02, still work unchanged.
 
     ``mappings_path`` is an explicit, optional override of the reviewed
     ``content/benchmarks/mappings.json`` file (default), so tests can supply
@@ -560,7 +577,12 @@ def build_reference_rows(
     period_dtos, fundamental_metrics = _build_fundamental_rows(
         filing_inputs, raw_store, instrument_ids, effective_date
     )
-    asset_prices = _asset_price_series(eod_inputs, raw_store, instrument_ids)
+    if adjusted_price_series is not None:
+        # Use S02's own corporate-action-adjusted series verbatim: never
+        # re-derive a second, unadjusted price basis for the same instrument.
+        asset_prices: Mapping[str, Mapping[date, Decimal]] = adjusted_price_series
+    else:
+        asset_prices = _asset_price_series(eod_inputs, raw_store, instrument_ids)
     observation_dtos, benchmark_metrics = _build_benchmark_rows(
         benchmark_inputs, raw_store, instrument_ids, asset_prices, mappings, effective_date
     )

@@ -98,6 +98,48 @@ FUNDAMENTAL_METRICS: tuple[str, ...] = fundamentals_normalization.V1_FINANCIAL_F
 _REQUIRED_ROLES = frozenset({SourceInputRole.EOD_OBSERVATIONS, SourceInputRole.SECURITY_MASTER})
 _VOLUME_COLUMNS = ("VOLUME", "TOTTRDQTY", "TOT_TRD_QTY", "TTL_TRD_QNTY")
 
+# The one role a REGISTERED official source is trusted for in this module.
+# Only "nse-eod" has an established canonical mapping today (there is no
+# separate registered security-master/corporate-actions source); every other
+# role continues to accept an unregistered test/fixture source_id (S02's own
+# test suite pattern, since real NSE supplied-use permission remains pending
+# -- see the module docstring), which `_sources_table` already describes
+# honestly with no official URL. This guard exists purely to close the gap
+# where a REAL registered source_id (this one or any other, e.g. a benchmark
+# or filings artifact) is mislabeled onto the wrong role by a wiring bug and
+# would otherwise be silently trusted as official data of the wrong kind.
+_ROLE_BY_REGISTERED_SOURCE_ID: dict[str, SourceInputRole] = {
+    "nse-eod": SourceInputRole.EOD_OBSERVATIONS,
+}
+
+
+def _require_role_source_id(source_input: SourceInput) -> None:
+    """Verify a REGISTERED official ``source_input.source_id`` is used only for its own role.
+
+    ``SourceInput.role`` is an independent, caller-assigned dimension from
+    ``source_id`` (per its own docstring in ``jobs/source_inputs.py``), so
+    nothing about admission itself guarantees a ``role=SECURITY_MASTER`` (or
+    ``CORPORATE_ACTIONS``) input's ``source_id`` isn't actually the real,
+    registered ``nse-eod`` EOD source (or another official source entirely)
+    mislabeled by a wiring bug. A source ID absent from the registry (this
+    module's own test suite's pattern) is left untouched here -- this guard
+    only fires once a source_id really is on the official allowlist, closing
+    the gap a fixed ``get_source_policy("nse-eod")`` lookup would otherwise
+    leave open.
+    """
+
+    try:
+        policy = get_source_policy(source_input.source_id)
+    except SourcePolicyError:
+        return
+    expected_role = _ROLE_BY_REGISTERED_SOURCE_ID.get(policy.source_id)
+    if expected_role != source_input.role:
+        raise PublicationInputError(
+            f"{source_input.role.value} input cites source_id {source_input.source_id!r}, but that "
+            f"official source is not registered as valid {source_input.role.value} data for the "
+            "NSE candidate build"
+        )
+
 
 @dataclass
 class _InstrumentSeries:
@@ -214,6 +256,9 @@ def build_nse_candidate(
         # observations at all) is a hard publication failure, never a
         # silently-empty-but-technically-successful universe.
         raise PublicationInputError(str(exc)) from exc
+
+    for source_input in inputs:
+        _require_role_source_id(source_input)
 
     eod_inputs = sorted(
         (item for item in inputs if item.role is SourceInputRole.EOD_OBSERVATIONS),

@@ -34,6 +34,7 @@ own real, already-hardened AMFI path, not just doubles all the way down.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -368,13 +369,17 @@ def composed_universe(tmp_path: Path) -> dict[str, Any]:
     filings_input = _admit_filings_input(fixture_raw, _filings_csv(), T0)
     benchmark_input = _admit_benchmark_input(fixture_raw, _benchmark_csv(), T0)
     # The RS window's start-date EOD observation must also be admitted so
-    # build_reference_rows can align the asset's own price series with the
-    # benchmark's -- a second, distinct EOD source input, at RS_START_DATE.
+    # S02's own NSE build has a price point at RS_START_DATE too -- reference
+    # rows now consume S02's corporate-action-adjusted series verbatim (see
+    # the final-review fix for price-basis consistency) rather than
+    # re-deriving one independently, so this date must be part of the NSE
+    # build's own `nse_inputs`, not only `reference_inputs`.
     rs_start_eod = _admit_nse(
         manifest_root, fixture_raw, policies, source_ids,
         role=SourceInputRole.EOD_OBSERVATIONS, relative_path="eod-rs-start.csv",
         body=_bhavcopy_csv(RS_START_DATE), effective=RS_START_DATE,
     )
+    nse_inputs.append(rs_start_eod)
     reference_inputs = [filings_input, benchmark_input, rs_start_eod, nse_inputs[0]]
 
     mappings_path = _mappings_json(tmp_path / "mappings.json")
@@ -761,6 +766,120 @@ def test_failed_required_source_preserves_the_last_good_dataset(schedule_env: di
     )
     assert failed_required_source.status in ("blocked", "failed")
     assert failed_required_source.active_dataset_id == last_good_dataset_id
+
+
+# --- Final-review fix: S02/S03 must share ONE adjusted price basis --------
+
+
+def test_composed_benchmark_rs_uses_the_same_adjusted_series_as_return_metrics(tmp_path: Path) -> None:
+    """A 2:1 split inside the RS window must be reflected identically in
+    `benchmark_rs_*` (S03) and `return_*` (S02) for the same instrument --
+    never a raw, unadjusted price basis for one and an adjusted basis for
+    the other.
+
+    The raw close jumps 220 -> 110 across the split (a fake ~-50% "return"
+    if left unadjusted); the corporate-action-adjusted close is flat
+    110 -> 110 (a genuine 0% return). If `benchmark_rs_3m` were ever computed
+    from a second, independently re-derived RAW series (the pre-fix bug),
+    its value would reflect the -50% move; this asserts it reflects the
+    adjusted, genuinely-flat one instead.
+    """
+
+    connection = sqlite3.connect(":memory:")
+    raw_store = _FakeRawStore()
+    manifest_root = tmp_path / "nse-manifest"
+
+    isin = "INE0SPLITRS0001"
+    equity_id = _instrument_id(isin, AssetClass.EQUITY)
+
+    source_ids = {
+        SourceInputRole.EOD_OBSERVATIONS: f"{FIXTURE_SOURCE_ID}-split-eod",
+        SourceInputRole.SECURITY_MASTER: f"{FIXTURE_SOURCE_ID}-split-master",
+        SourceInputRole.CORPORATE_ACTIONS: f"{FIXTURE_SOURCE_ID}-split-actions",
+    }
+    policies = {role: _fixture_policy(source_id=sid) for role, sid in source_ids.items()}
+
+    def _bhavcopy(day: date, close: str) -> bytes:
+        header = "SYMBOL,SERIES,TYPE,NAME OF COMPANY,ISIN,CLOSE,VOLUME,TIMESTAMP"
+        return ("\n".join([header, _bhavcopy_row("SPLITRS", isin, close, day)]) + "\n").encode("utf-8")
+
+    def _security_master() -> bytes:
+        header = "SYMBOL,SERIES,TYPE,NAME OF COMPANY,ISIN NUMBER"
+        return ("\n".join([header, f"SPLITRS,EQ,,Split RS Equity Limited,{isin}"]) + "\n").encode("utf-8")
+
+    def _actions() -> bytes:
+        return json.dumps({
+            "actions": [
+                {"isin": isin, "action_date": T0.isoformat(), "action_type": "split", "numerator": 2, "denominator": 1}
+            ]
+        }).encode("utf-8")
+
+    nse_inputs = [
+        _admit_nse(
+            manifest_root, raw_store, policies, source_ids,
+            role=SourceInputRole.EOD_OBSERVATIONS, relative_path="eod-t0.csv", body=_bhavcopy(T0, "110"), effective=T0,
+        ),
+        _admit_nse(
+            manifest_root, raw_store, policies, source_ids,
+            role=SourceInputRole.SECURITY_MASTER, relative_path="master-t0.csv", body=_security_master(), effective=T0,
+        ),
+        _admit_nse(
+            manifest_root, raw_store, policies, source_ids,
+            role=SourceInputRole.EOD_OBSERVATIONS, relative_path="eod-rs-start.csv",
+            body=_bhavcopy(RS_START_DATE, "220"), effective=RS_START_DATE,
+        ),
+        _admit_nse(
+            manifest_root, raw_store, policies, source_ids,
+            role=SourceInputRole.CORPORATE_ACTIONS, relative_path="actions-t0.json", body=_actions(), effective=T0,
+        ),
+    ]
+
+    mappings_path = tmp_path / "mappings.json"
+    mappings_path.write_text(
+        json.dumps([{
+            "identifier": equity_id,
+            "identifier_type": "instrument",
+            "benchmark_id": "NIFTY500",
+            "valid_from": "2020-01-01",
+            "valid_to": None,
+            "source_reference": "https://www.niftyindices.com/reports/historical-data",
+        }]),
+        encoding="utf-8",
+    )
+    benchmark_input = _admit_benchmark_input(raw_store, _benchmark_csv(), T0)
+
+    build = build_composed_candidate(
+        connection, raw_store,
+        nse_inputs=nse_inputs,
+        reference_inputs=[benchmark_input],
+        effective_date=T0,
+        mappings_path=mappings_path,
+    )
+
+    # S02's own adjusted history: the split factor (0.5) applied to the
+    # pre-split RS_START_DATE close (220) makes the adjusted series flat.
+    adjusted_points = dict(build.histories[equity_id][1])
+    assert adjusted_points[RS_START_DATE] == Decimal("110")
+    assert adjusted_points[T0] == Decimal("110")
+
+    benchmark_rows = [
+        row for row in build.candidate["tables"]["latest_metrics"]
+        if row["instrument_id"] == equity_id and row["metric"] == "benchmark_rs_3m"
+    ]
+    assert len(benchmark_rows) == 1
+    assert benchmark_rows[0]["state"] == "present"
+
+    asset_return = Decimal("110") / Decimal("110") - 1  # 0%, from the ADJUSTED series
+    benchmark_return = Decimal("11000.00") / Decimal("10000.00") - 1  # 10%
+    expected_rs = (Decimal(1) + asset_return) / (Decimal(1) + benchmark_return) - Decimal(1)
+    actual_rs = Decimal(benchmark_rows[0]["raw_value"])
+    assert actual_rs.quantize(Decimal("0.00000001")) == expected_rs.quantize(Decimal("0.00000001"))
+
+    # The value a still-broken re-derivation from RAW (unadjusted) prices
+    # would have produced -- proving this isn't accidentally still that.
+    wrong_raw_return = Decimal("110") / Decimal("220") - 1  # -50%
+    wrong_rs = (Decimal(1) + wrong_raw_return) / (Decimal(1) + benchmark_return) - Decimal(1)
+    assert actual_rs != wrong_rs
 
 
 def test_no_source_scheduled_reports_skipped_not_completed(schedule_env: dict[str, Any]) -> None:
