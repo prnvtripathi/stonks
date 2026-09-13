@@ -105,6 +105,7 @@ def resolve_supplied_source_input(
     policy: SourcePolicy,
     permission_record_id: str,
     filename: str | None = None,
+    allow_unregistered_source: bool = False,
 ) -> tuple[SourceArtifact, bytes, SourceInput]:
     """Load, admit, and role-tag one operator-supplied artifact.
 
@@ -120,6 +121,12 @@ def resolve_supplied_source_input(
     Admission fails closed on any forged URL, checksum mismatch, or
     unauthorized acquisition mode; this function grants no new permission
     itself.
+
+    `allow_unregistered_source` is forwarded to `admit()` unchanged and
+    defaults to `False`: a manifest entry for a source ID absent from
+    `SOURCE_POLICIES` is rejected by default, exactly like `admit()`. Pass
+    `True` only for a deliberate, isolated test fixture -- never in
+    production job wiring.
     """
 
     if effective_date != expected_date:
@@ -140,7 +147,7 @@ def resolve_supplied_source_input(
         acquisition_mode="supplied",
         permission_record_id=permission_record_id,
     )
-    admitted = admit(artifact, policy)
+    admitted = admit(artifact, policy, allow_unregistered_source=allow_unregistered_source)
     assert admitted.artifact_id is not None  # admit() never clears artifact_id
     source_input = SourceInput(
         source_id=source_id,

@@ -144,28 +144,43 @@ def assert_artifact_policy(
         raise SourcePolicyError(f"unsupported acquisition mode: {acquisition_mode}")
 
 
-def admit(artifact: SourceArtifact, policy: SourcePolicy) -> SourceArtifact:
+def admit(
+    artifact: SourceArtifact,
+    policy: SourcePolicy,
+    *,
+    allow_unregistered_source: bool = False,
+) -> SourceArtifact:
     """Validate one artifact's full provenance against an explicit policy.
 
     This is the mode-aware admission entry point: it does not fetch bytes,
-    only decides whether `artifact` may be admitted under `policy`. Callers
-    that resolve a source's policy from the canonical registry (e.g.
-    `assert_artifact_policy`, used by the raw store) get the full
-    canonical-equality protection against a forged policy object, because
-    `SOURCE_POLICIES.get(artifact.source_id)` is consulted whenever the
-    source ID is registered. A caller may also pass an entirely
-    test-injected `SourcePolicy` for a source ID that is not in the
-    canonical registry (e.g. a fixture proving the supplied-use pathway) --
-    that path is exercised only in tests, never by production code, because
-    every production call site resolves `policy` via `get_source_policy`/
-    `SOURCE_POLICIES` first and therefore never reaches an unregistered
-    source ID.
+    only decides whether `artifact` may be admitted under `policy`. By
+    default this restores the original `assert_artifact_policy` invariant
+    that an unregistered source ID (one absent from `SOURCE_POLICIES`) is
+    never admitted, regardless of what the caller's `policy` object claims --
+    this is enforced by `admit()` itself, not merely by convention that every
+    caller happens to resolve `policy` via `get_source_policy` first.
+
+    Callers that resolve a source's policy from the canonical registry (e.g.
+    `assert_artifact_policy`, used by the raw store) additionally get full
+    canonical-equality protection against a forged policy object for a
+    *registered* source ID.
+
+    `allow_unregistered_source=True` is an explicit, narrow opt-in for tests
+    that must prove the mode-aware admission logic in isolation using a
+    wholly fictional source ID (never a real registry entry) -- e.g. a
+    fixture demonstrating the "authorized supplied use" pathway without
+    touching `SOURCE_POLICIES`. No production call site sets this; it must
+    never be passed for a source ID that could plausibly collide with a real
+    or future registry entry.
     """
 
     if artifact.source_id != policy.source_id:
         raise SourcePolicyError("artifact source ID does not match the supplied policy")
     canonical = SOURCE_POLICIES.get(artifact.source_id)
-    if canonical is not None and policy != canonical:
+    if canonical is None:
+        if not allow_unregistered_source:
+            raise SourcePolicyError(f"source is not on the official allowlist: {artifact.source_id}")
+    elif policy != canonical:
         raise SourcePolicyError(f"artifact policy does not match canonical registry entry: {artifact.source_id}")
     _assert_url_allowed_for_policy(policy, artifact.source_url)
     if artifact.terms_url != policy.terms_url:

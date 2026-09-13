@@ -124,7 +124,31 @@ def test_supplied_nse_without_recorded_permission_remains_denied() -> None:
 def test_authorized_supplied_use_admits_valid_provenance() -> None:
     valid_supplied_fixture = _artifact()
     supplied_use_fixture_policy = _supplied_use_fixture_policy()
-    admitted = admit(valid_supplied_fixture, supplied_use_fixture_policy)
+    admitted = admit(valid_supplied_fixture, supplied_use_fixture_policy, allow_unregistered_source=True)
+    assert admitted.acquisition_mode == "supplied"
+
+
+def test_admit_rejects_an_unregistered_source_id_by_default_regardless_of_claimed_permission() -> None:
+    """admit() itself must never admit a source ID absent from SOURCE_POLICIES.
+
+    This must hold even when the caller-supplied policy claims every
+    permission a real registry entry could have -- `allow_unregistered_source`
+    is an explicit, narrow opt-in, never the default.
+    """
+
+    assert FIXTURE_SOURCE_ID not in SOURCE_POLICIES
+    generous_policy = _supplied_use_fixture_policy(automation_allowed=True)
+    network_artifact = _artifact(acquisition_mode="network")
+    supplied_artifact = _artifact()
+
+    with pytest.raises(SourcePolicyError):
+        admit(network_artifact, generous_policy)
+    with pytest.raises(SourcePolicyError):
+        admit(supplied_artifact, generous_policy)
+    # The identical artifact/policy pair *is* admitted once the caller
+    # explicitly opts in -- proving the rejection above is really about the
+    # unregistered source ID, not some other mismatch.
+    admitted = admit(supplied_artifact, generous_policy, allow_unregistered_source=True)
     assert admitted.acquisition_mode == "supplied"
 
 
@@ -145,28 +169,28 @@ def test_forged_source_url_is_rejected() -> None:
     policy = _supplied_use_fixture_policy()
     forged = _artifact(source_url="https://attacker.example/looks-official.csv")
     with pytest.raises(SourcePolicyError):
-        admit(forged, policy)
+        admit(forged, policy, allow_unregistered_source=True)
 
 
 def test_forged_terms_url_is_rejected() -> None:
     policy = _supplied_use_fixture_policy()
     forged = _artifact(terms_url="https://attacker.example/terms")
     with pytest.raises(SourcePolicyError):
-        admit(forged, policy)
+        admit(forged, policy, allow_unregistered_source=True)
 
 
 def test_missing_permission_record_id_is_rejected_even_when_policy_allows_supplied_use() -> None:
     policy = _supplied_use_fixture_policy()
     artifact = _artifact(permission_record_id=None)
     with pytest.raises(SourcePolicyError):
-        admit(artifact, policy)
+        admit(artifact, policy, allow_unregistered_source=True)
 
 
 def test_mismatched_permission_record_id_is_rejected() -> None:
     policy = _supplied_use_fixture_policy()
     artifact = _artifact(permission_record_id="a-different-permission-entirely")
     with pytest.raises(SourcePolicyError):
-        admit(artifact, policy)
+        admit(artifact, policy, allow_unregistered_source=True)
 
 
 def test_policy_source_id_mismatch_is_rejected() -> None:
@@ -202,7 +226,7 @@ def test_wrong_checksum_is_rejected_after_a_supplied_artifact_is_otherwise_admit
     artifact = _artifact(checksum=sha256(b"different bytes").hexdigest())
     policy = _supplied_use_fixture_policy()
 
-    admitted = admit(artifact, policy)  # policy/provenance checks pass
+    admitted = admit(artifact, policy, allow_unregistered_source=True)  # policy/provenance checks pass
 
     with pytest.raises(ImmutableRawStoreError):
         _check_body(admitted, body)
@@ -254,6 +278,7 @@ def _resolve(manifest_root: Path, **overrides: object) -> tuple[SourceArtifact, 
         adapter_version="1.0.0",
         policy=_supplied_use_fixture_policy(),
         permission_record_id=FIXTURE_PERMISSION_REFERENCE,
+        allow_unregistered_source=True,
     )
     defaults.update(overrides)
     return resolve_supplied_source_input(**defaults)  # type: ignore[arg-type]
