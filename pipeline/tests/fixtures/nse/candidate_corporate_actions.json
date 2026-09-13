@@ -1,0 +1,12 @@
+{
+  "actions": [
+    {
+      "isin": "INE0SPLIT001",
+      "symbol": "SPLITCO",
+      "action_date": "2026-09-11",
+      "action_type": "split",
+      "numerator": 2,
+      "denominator": 1
+    }
+  ]
+}
