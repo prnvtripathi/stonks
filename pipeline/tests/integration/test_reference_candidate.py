@@ -27,8 +27,10 @@ supplied-use permission stays denied in production).
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from dataclasses import replace as dataclass_replace
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
@@ -46,6 +48,8 @@ from market_pipeline.jobs.source_inputs import (
     SourceInputRole,
     resolve_supplied_source_input,
 )
+from market_pipeline.sources.registry import admit, get_source_policy
+from market_pipeline.storage.raw_store import _object_key
 
 EFFECTIVE_DATE = date(2026, 9, 11)
 RS_WINDOW_DAYS = 91  # matches BENCHMARK_WINDOWS_DAYS's "benchmark_rs_3m" entry
@@ -183,13 +187,83 @@ def _empty_mappings_json(path: Path) -> Path:
     return path
 
 
+def _admit_filings_input(raw_store: _FakeRawStore, body: bytes, effective_date: date) -> SourceInput:
+    """Hand-construct a ``role=FILINGS``/``source_id="nse-filings-xbrl"`` input.
+
+    ``reference_candidate.py``'s new role/source-ID guard requires this exact
+    literal source ID for the FILINGS role (see ``_require_role_source_id``).
+    Real NSE filings admission is denied in production today (S01: neither
+    ``automation_allowed`` nor ``supplied_use_allowed`` is set for
+    ``nse-filings-xbrl``), so there is no legitimate way to exercise
+    ``admit()`` for this source ID at all yet -- this directly constructs the
+    ``SourceInput`` `build_reference_rows` expects as its own precondition
+    (an already-admitted artifact), to test its composition logic in
+    isolation from S01's separately-tested, currently-fully-closed admission
+    gate for this specific source.
+    """
+
+    checksum = sha256(body).hexdigest()
+    filename = f"nse-filings-xbrl-{effective_date.isoformat()}.csv"
+    source_input = SourceInput(
+        source_id="nse-filings-xbrl",
+        role=SourceInputRole.FILINGS,
+        expected_date=effective_date,
+        loaded_date=effective_date,
+        artifact_id=uuid5(NAMESPACE_URL, f"stonks/test-fixture-artifact/{filename}/{checksum}"),
+        checksum=checksum,
+        object_key=f"raw/nse-filings-xbrl/{effective_date.isoformat()}/{checksum}/{filename}",
+        adapter_version="1.0.0",
+        acquisition_mode="supplied",
+    )
+    raw_store.seed(source_input, body)
+    return source_input
+
+
+def _admit_benchmark_input(raw_store: _FakeRawStore, body: bytes, effective_date: date) -> SourceInput:
+    """Admit a real ``nifty-500`` artifact through the genuine ``admit()`` gate.
+
+    Unlike NSE filings, ``nifty-500``'s registry entry already has
+    ``automation_allowed=True`` (see ``sources/registry.py``), so a
+    network-mode artifact using the real, unmodified canonical policy is
+    legitimately admittable today -- no test-only fixture policy is needed.
+    This does not perform an actual network fetch; it only proves what a
+    future network adapter's admitted output would look like.
+    """
+
+    policy = get_source_policy("nifty-500")
+    filename = f"nifty500-{effective_date.isoformat()}.csv"
+    artifact = SourceArtifact(
+        source_id="nifty-500",
+        source_url=f"{policy.source_url}/{filename}",
+        retrieved_at=datetime.now(timezone.utc),
+        effective_date=effective_date,
+        checksum=sha256(body).hexdigest(),
+        adapter_version="1.0.0",
+        terms_url=policy.terms_url,
+        filename=filename,
+    )
+    admitted = admit(artifact, policy)
+    assert admitted.artifact_id is not None
+    source_input = SourceInput(
+        source_id="nifty-500",
+        role=SourceInputRole.BENCHMARK_OBSERVATIONS,
+        expected_date=effective_date,
+        loaded_date=effective_date,
+        artifact_id=admitted.artifact_id,
+        checksum=admitted.checksum,
+        object_key=_object_key(admitted),
+        adapter_version="1.0.0",
+        acquisition_mode="network",
+    )
+    raw_store.seed(source_input, body)
+    return source_input
+
+
 @pytest.fixture(scope="module")
 def reference_universe(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
     manifest_root = tmp_path_factory.mktemp("reference-candidate-manifest")
     raw_store = _FakeRawStore()
     source_ids = {
-        SourceInputRole.FILINGS: f"{FIXTURE_SOURCE_ID}-filings",
-        SourceInputRole.BENCHMARK_OBSERVATIONS: f"{FIXTURE_SOURCE_ID}-benchmark",
         SourceInputRole.EOD_OBSERVATIONS: f"{FIXTURE_SOURCE_ID}-eod",
     }
     policies = {role: _fixture_policy(source_id=source_id) for role, source_id in source_ids.items()}
@@ -213,18 +287,8 @@ def reference_universe(tmp_path_factory: pytest.TempPathFactory) -> dict[str, An
         raw_store.seed(source_input, body)
         return source_input
 
-    (manifest_root / "filings.csv").write_bytes(_filings_csv())
-    inputs.append(_admit(role=SourceInputRole.FILINGS, relative_path="filings.csv", effective=EFFECTIVE_DATE, filename="filings.csv"))
-
-    (manifest_root / "benchmark.csv").write_bytes(_benchmark_csv())
-    inputs.append(
-        _admit(
-            role=SourceInputRole.BENCHMARK_OBSERVATIONS,
-            relative_path="benchmark.csv",
-            effective=EFFECTIVE_DATE,
-            filename="benchmark.csv",
-        )
-    )
+    inputs.append(_admit_filings_input(raw_store, _filings_csv(), EFFECTIVE_DATE))
+    inputs.append(_admit_benchmark_input(raw_store, _benchmark_csv(), EFFECTIVE_DATE))
 
     # EQUITY_A/EQUITY_B get both RS-window endpoints; EQUITY_F only gets the
     # effective-date session (its start-of-window observation is missing).
@@ -380,3 +444,34 @@ def test_malformed_mapping_file_fails_closed(reference_universe: dict[str, Any],
     bad_path.write_text("{not valid json", encoding="utf-8")
     with pytest.raises(PublicationInputError):
         _build(reference_universe, mappings_path=bad_path)
+
+
+# --- Fail-closed: a role attached to the wrong official source ID ----------
+
+
+def test_role_source_id_mismatch_fails_closed(reference_universe: dict[str, Any]) -> None:
+    """A wiring bug that mislabels an admitted artifact's role must not be
+    silently trusted as data from that role's official source.
+
+    Takes the genuinely-admitted, real ``nifty-500`` `SourceInput` and
+    relabels its `role` as `FILINGS` -- a caller bug that could otherwise
+    happen independently of `source_id` (per `SourceInputRole`'s own
+    docstring: role is "not inferable from source_id alone"). This must be
+    rejected by `_require_role_source_id`, not silently treated as an
+    official NSE filing.
+    """
+
+    universe = reference_universe
+    real_benchmark_input = next(
+        item for item in universe["inputs"] if item.role is SourceInputRole.BENCHMARK_OBSERVATIONS
+    )
+    mislabeled = dataclass_replace(real_benchmark_input, role=SourceInputRole.FILINGS)
+
+    with pytest.raises(PublicationInputError, match="source_id"):
+        build_reference_rows(
+            [mislabeled],
+            universe["raw_store"],
+            INSTRUMENT_IDS,
+            EFFECTIVE_DATE,
+            mappings_path=universe["mappings_path"],
+        )

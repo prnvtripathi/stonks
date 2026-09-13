@@ -28,6 +28,13 @@ Design notes
   resolved these ``SourceInput`` values in the first place; this
   reconstruction only lets the parse-layer's own bytes-are-really-official
   check run against the checksum the pipeline already verified.
+  ``SourceInput.role`` is an independent, caller-assigned dimension from
+  ``source_id`` (per its own docstring), so ``_require_role_source_id`` looks
+  the policy up *by the input's own recorded* ``source_id`` and rejects any
+  role/source-ID combination other than the one official pairing --
+  otherwise a wiring bug that attached the wrong role to an admitted
+  artifact (e.g. a real ``nifty-500`` artifact mislabeled ``role=FILINGS``)
+  would be silently treated as official data of the wrong kind.
 * Benchmark RS here only ever runs when both the asset's own price
   observation and the mapped benchmark's observation exist on the *exact*
   same calendar date at both ends of the window -- never a nearest-available
@@ -37,6 +44,15 @@ Design notes
   into one derived ratio: every published metric comes from exactly one
   chosen filed period, so there is no standalone/consolidated cross-mixing
   to guard against structurally.
+* Benchmark mappings today only resolve ``identifier_type == "instrument"``
+  entries (see ``_resolve_mapping``). Real-world MF benchmark mappings are
+  conventionally category-based (a fund's *category* maps to a benchmark,
+  not each individual scheme), so no mutual fund's benchmark RS can resolve
+  to a present value under this implementation yet -- it correctly falls
+  back to ``missing`` (never a fabricated substitute, per R03), but
+  category-level mapping resolution (the practical MF case) is explicitly
+  tracked future work, not something this task completes. This task
+  completes F05 for instrument-level mappings only.
 """
 
 from __future__ import annotations
@@ -49,7 +65,7 @@ from pathlib import Path
 from typing import Any
 
 from market_pipeline.analytics import rs as rs_analytics
-from market_pipeline.domain.models import SourceArtifact
+from market_pipeline.domain.models import SourceArtifact, SourcePolicy
 from market_pipeline.jobs.publish import PublicationInputError
 from market_pipeline.jobs.source_inputs import SourceInput, SourceInputRole
 from market_pipeline.normalization import fundamentals as fundamentals_normalization
@@ -61,6 +77,7 @@ from market_pipeline.normalization.nse import normalize_nse_rows, parse_nse_bhav
 from market_pipeline.publication.input_manifest import InputManifestError, manifest_with_fingerprint
 from market_pipeline.sources.base import RawStore
 from market_pipeline.sources.benchmark import (
+    BENCHMARK_SOURCE_ID,
     BenchmarkMapping,
     BenchmarkObservation,
     BenchmarkProvenanceError,
@@ -73,6 +90,20 @@ from market_pipeline.sources.nse_filings import (
     parse_financial_results_xbrl,
 )
 from market_pipeline.sources.registry import SourcePolicyError, get_source_policy
+
+FILINGS_SOURCE_ID = "nse-filings-xbrl"
+
+# The one registered source ID this module trusts for each role. `SourceInput
+# .role` is an independent, caller-assigned dimension from `source_id` (see
+# `jobs/source_inputs.py`'s own docstring) -- nothing about admission itself
+# guarantees a `role=FILINGS` input's `source_id` is really `nse-filings-xbrl`
+# rather than, say, a benchmark artifact mislabeled by a wiring bug. Every
+# canonical-artifact reconstruction below checks this explicitly, so a
+# role/source-ID mismatch fails closed instead of being silently trusted.
+_ROLE_CANONICAL_SOURCE_IDS: dict[SourceInputRole, str] = {
+    SourceInputRole.FILINGS: FILINGS_SOURCE_ID,
+    SourceInputRole.BENCHMARK_OBSERVATIONS: BENCHMARK_SOURCE_ID,
+}
 
 FUNDAMENTAL_METRICS: tuple[str, ...] = fundamentals_normalization.V1_FINANCIAL_FIELDS
 
@@ -140,6 +171,34 @@ def _looks_like_xbrl(body: bytes) -> bool:
     return stripped.startswith(b"<?xml") or stripped.startswith(b"<")
 
 
+def _require_role_source_id(source_input: SourceInput, role: SourceInputRole) -> SourcePolicy:
+    """Verify ``source_input.source_id`` really is the one official source for ``role``.
+
+    Looks the policy up *by the input's own recorded ``source_id``* (never by
+    a fixed literal), then checks that the resolved policy is the one this
+    role is allowed to trust. This closes the gap a fixed
+    ``get_source_policy("nse-filings-xbrl")``/``get_source_policy("nifty-500")``
+    call would otherwise leave open: if ``source_input.source_id`` were, say,
+    an unregistered ID or another role's real official source, this raises
+    instead of silently reconstructing a canonical artifact around it.
+    """
+
+    expected = _ROLE_CANONICAL_SOURCE_IDS[role]
+    try:
+        policy = get_source_policy(source_input.source_id)
+    except SourcePolicyError as exc:
+        raise PublicationInputError(
+            f"{role.value} input cites source_id {source_input.source_id!r}, "
+            f"which is not on the official source allowlist"
+        ) from exc
+    if policy.source_id != expected:
+        raise PublicationInputError(
+            f"{role.value} input has source_id {source_input.source_id!r}, but only "
+            f"{expected!r} is treated as official {role.value} data"
+        )
+    return policy
+
+
 def _canonical_filing_artifact(source_input: SourceInput) -> SourceArtifact:
     """Reconstruct the canonical ``nse-filings-xbrl`` artifact for provenance re-validation.
 
@@ -147,12 +206,14 @@ def _canonical_filing_artifact(source_input: SourceInput) -> SourceArtifact:
     ``SourceArtifact`` (only lineage metadata); this rebuilds one shaped
     exactly like the real, permanently-fixed official source so
     ``sources/nse_filings.py``'s own checksum/URL provenance check still runs
-    against the pipeline's already-verified checksum.
+    against the pipeline's already-verified checksum. ``_require_role_source_id``
+    guarantees ``source_input.source_id`` really is ``nse-filings-xbrl`` before
+    this reconstruction happens at all.
     """
 
-    policy = get_source_policy("nse-filings-xbrl")
+    policy = _require_role_source_id(source_input, SourceInputRole.FILINGS)
     return SourceArtifact(
-        source_id="nse-filings-xbrl",
+        source_id=policy.source_id,
         source_url=policy.source_url,
         retrieved_at=datetime.combine(source_input.loaded_date, datetime.min.time(), tzinfo=UTC),
         effective_date=source_input.loaded_date,
@@ -164,9 +225,9 @@ def _canonical_filing_artifact(source_input: SourceInput) -> SourceArtifact:
 
 
 def _canonical_benchmark_artifact(source_input: SourceInput) -> SourceArtifact:
-    policy = get_source_policy("nifty-500")
+    policy = _require_role_source_id(source_input, SourceInputRole.BENCHMARK_OBSERVATIONS)
     return SourceArtifact(
-        source_id="nifty-500",
+        source_id=policy.source_id,
         source_url=policy.source_url,
         retrieved_at=datetime.combine(source_input.loaded_date, datetime.min.time(), tzinfo=UTC),
         effective_date=source_input.loaded_date,
