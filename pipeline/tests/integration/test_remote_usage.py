@@ -3,6 +3,7 @@ from __future__ import annotations
 import calendar
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 from market_pipeline.publication.remote_usage import (
@@ -10,6 +11,7 @@ from market_pipeline.publication.remote_usage import (
     RemotePublicationBudgetError,
     RemoteUsage,
     ReservationLedgerEntry,
+    ReservedTotals,
     append_reservation_ledger_entry,
     load_reservation_ledger,
     plan_monthly_attempts,
@@ -22,8 +24,8 @@ NOW = datetime(2026, 9, 12, 8, 0, 0, tzinfo=timezone.utc)
 EXPECTED_RESOURCES = {"account_id": "acct-1", "database_id": "db-1", "bucket_name": "stonks-private-history"}
 
 
-def _payload(**overrides: object) -> dict:
-    payload = {
+def _payload(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
         "errors": None,
         "data": {
             "viewer": {
@@ -101,7 +103,7 @@ def test_validate_remote_usage_calls_out_missing_analytics_permission() -> None:
         lambda p: p["data"]["viewer"]["accounts"][0]["r2"].__delitem__("bucketName"),
     ],
 )
-def test_validate_remote_usage_rejects_absent_account_or_database(mutate) -> None:
+def test_validate_remote_usage_rejects_absent_account_or_database(mutate: Any) -> None:
     payload = _payload()
     mutate(payload)
     with pytest.raises(RemotePublicationBudgetError):
@@ -119,7 +121,7 @@ def test_validate_remote_usage_rejects_absent_account_or_database(mutate) -> Non
         (("r2", "classBOperationsMonthToDate"), True),
     ],
 )
-def test_validate_remote_usage_rejects_malformed_metrics(path, value) -> None:
+def test_validate_remote_usage_rejects_malformed_metrics(path: tuple[str, str], value: Any) -> None:
     payload = _payload()
     section, key = path
     payload["data"]["viewer"]["accounts"][0][section][key] = value
@@ -273,7 +275,7 @@ def test_load_reservation_ledger_rejects_malformed_json(tmp_path: Path) -> None:
 # --- End-to-end budget gating with validated telemetry --------------------------------
 
 
-def _twelve_thousand_instrument_rolling_three_year_plan(*, weekday_runs_per_month: int) -> dict:
+def _twelve_thousand_instrument_rolling_three_year_plan(*, weekday_runs_per_month: int) -> dict[str, object]:
     """A realistic-scale plan: 12,000 instruments, a rolling three-year history window.
 
     Payload sizes are modeled on this publisher's actual serialized shapes
@@ -419,11 +421,7 @@ def test_evaluate_publication_attempt_rejects_oversized_r2_retained_bytes_before
 def test_evaluate_publication_attempt_folds_reserved_ledger_bytes_into_the_r2_byte_budget() -> None:
     """Not-yet-observed reservation-ledger bytes must count against the R2 byte cap too."""
 
-    from market_pipeline.publication.preflight import (
-        MAX_R2_BYTES,
-        ReservedTotals,
-        evaluate_publication_attempt,
-    )
+    from market_pipeline.publication.preflight import MAX_R2_BYTES, evaluate_publication_attempt
 
     monthly_attempt_plan = plan_monthly_attempts(NOW.date(), reserved_manual_attempts=4)
     plan = _twelve_thousand_instrument_rolling_three_year_plan(weekday_runs_per_month=monthly_attempt_plan.monthly_attempts)

@@ -377,9 +377,9 @@ def build_candidate(
     # Return/risk/momentum values consume a whole time series. The persisted
     # manifest, rather than the final daily file, is their authoritative
     # lineage; attaching only ``artifact_id`` here would be misleading.
-    for metric in metrics:
-        metric["source_artifact_id"] = None
-        metric["metadata"]["input_manifest_sha256"] = fingerprint
+    for metric_row in metrics:
+        metric_row["source_artifact_id"] = None
+        metric_row["metadata"]["input_manifest_sha256"] = fingerprint
     scores = momentum_scores(momentum_records)
     policy = get_source_policy("amfi-nav")
     now = datetime.now(UTC).isoformat()

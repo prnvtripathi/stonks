@@ -179,7 +179,7 @@ describe("listRuns and getRun return bounded summaries", () => {
   });
 
   it("bounds listRuns to a default page size even when a caller passes no options, and reports the full total", async () => {
-    const { db, sqlite, probe } = createSqliteD1();
+    const { db, sqlite } = createSqliteD1();
     seedDataset(sqlite, "dataset-1");
     seedScreen(sqlite, "screen-1", "Momentum", "Volume > 0");
     const insertRun = sqlite.prepare("INSERT INTO screen_runs (dataset_id, run_id, screen_id, effective_date, status, result_count, source, language_version, completed_at) VALUES (?,?,?,?,?,?,?,?,?)");

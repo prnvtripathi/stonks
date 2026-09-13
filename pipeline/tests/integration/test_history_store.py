@@ -13,6 +13,12 @@ from market_pipeline.storage.history_store import HistoryStore, HistoryStoreErro
 _KEY_PATTERN = re.compile(r"history/([a-z0-9_]+)/([a-zA-Z0-9_-]+)/(\d{4})/([0-9a-f]{64})\.parquet")
 
 
+def _key_match(key: str) -> re.Match[str]:
+    match = _KEY_PATTERN.fullmatch(key)
+    assert match is not None
+    return match
+
+
 def test_history_partitions_are_content_addressed_and_chart_bytes_are_deterministic(tmp_path: Path) -> None:
     store = HistoryStore(tmp_path)
     rows = [
@@ -26,7 +32,7 @@ def test_history_partitions_are_content_addressed_and_chart_bytes_are_determinis
         assert match is not None
         assert match.group(4) == item.sha256
         assert item.bytes == len(Path(tmp_path / key).read_bytes())
-    assert [int(_KEY_PATTERN.fullmatch(k).group(3)) for k in keys] == [2023, 2024]
+    assert [int(_key_match(k).group(3)) for k in keys] == [2023, 2024]
     assert store.read_history("equity", "INE123", 2024, written[1].sha256)[0]["close"] == 101.0
 
     first = store.write_chart("dataset-a", "INE123", {"z": 1, "a": [2, 3]})
@@ -83,9 +89,9 @@ def test_year_boundary_writes_are_partitioned_by_calendar_year(tmp_path: Path) -
             {"effective_date": "2024-01-01", "close": 101.0},
         ],
     )
-    years = sorted(int(_KEY_PATTERN.fullmatch(item.key).group(3)) for item in written)
+    years = sorted(int(_key_match(item.key).group(3)) for item in written)
     assert years == [2023, 2024]
-    by_year = {int(_KEY_PATTERN.fullmatch(item.key).group(3)): item for item in written}
+    by_year = {int(_key_match(item.key).group(3)): item for item in written}
     assert store.read_history("equity", "INE123", 2023, by_year[2023].sha256)[0]["close"] == 99.0
     assert store.read_history("equity", "INE123", 2024, by_year[2024].sha256)[0]["close"] == 101.0
 

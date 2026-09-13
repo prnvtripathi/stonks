@@ -517,7 +517,7 @@ def test_compose_datasets_rejects_instrument_id_collision(composed_universe: dic
         # is nonsensical, but it proves the collision guard fires on any
         # true duplicate instrument_id rather than trusting disjoint
         # provider namespaces blindly.
-        compose_datasets(amfi=amfi_build, nse=amfi_build, effective_date=T0)  # type: ignore[arg-type]
+        compose_datasets(amfi=amfi_build, nse=amfi_build, effective_date=T0)
 
 
 def test_reference_without_nse_is_rejected(composed_universe: dict[str, Any]) -> None:
@@ -712,9 +712,13 @@ def test_delayed_amfi_source_is_independent_of_a_complete_nse_source(schedule_en
         amfi_source_ids=["amfi-nav"], nse_inputs=schedule_env["nse_inputs_t1"],
     )
     status = result.source_status
+    amfi_loaded_date = status["amfi-nav"].loaded_date
+    nse_loaded_date = status[f"{FIXTURE_SOURCE_ID}-eod"].loaded_date
+    assert amfi_loaded_date is not None
+    assert nse_loaded_date is not None
     # Oracle (verbatim intent from the plan, adapted to this repo's real
     # per-source category labels):
-    assert status["amfi-nav"].loaded_date < status[f"{FIXTURE_SOURCE_ID}-eod"].loaded_date
+    assert amfi_loaded_date < nse_loaded_date
     assert status["amfi-nav"].state == "delayed"
     assert status[f"{FIXTURE_SOURCE_ID}-eod"].state == "complete"
     assert result.status == "published"

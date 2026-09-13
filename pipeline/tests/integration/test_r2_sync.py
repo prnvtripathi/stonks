@@ -338,7 +338,7 @@ def test_no_such_key_translating_client_converts_real_botocore_missing_key_error
     raise.
     """
 
-    from botocore.exceptions import ClientError
+    from botocore.exceptions import ClientError  # type: ignore[import-untyped]
     from market_pipeline.publication.r2_sync import NoSuchKeyTranslatingClient
 
     class _RawBotoLikeClient:

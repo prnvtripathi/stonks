@@ -150,6 +150,7 @@ def _run(db: Path, raw_root: Path, args: list[str], capsys: Any) -> dict[str, An
     db.parent.mkdir(parents=True, exist_ok=True)
     exit_code = main(["--db", str(db), "--raw-store", str(raw_root), *args])
     payload = json.loads(capsys.readouterr().out)
+    assert isinstance(payload, dict)
     assert exit_code == 0, payload
     assert payload["publication"]["promoted"] is True, payload
     return payload
