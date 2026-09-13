@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -139,6 +139,14 @@ class SourcePolicy(BaseModel):
     permission_reference: str | None = None
     approved_url_prefixes: tuple[str, ...] = ()
     description: str = ""
+    # `automation_allowed` governs live network fetch only. Supplied-file
+    # admission (an operator-provided artifact, never fetched over the
+    # network by this pipeline) is a separate permission decision: it must
+    # be explicitly recorded here before any supplied artifact for a source
+    # can be admitted. Defaulting to False means no existing registry entry
+    # gains a new permission merely by this field's addition.
+    supplied_use_allowed: bool = False
+    supplied_use_permission_reference: str | None = None
 
 
 class SourceArtifact(BaseModel):
@@ -155,6 +163,17 @@ class SourceArtifact(BaseModel):
     terms_url: str
     filename: str = "artifact.bin"
     artifact_id: UUID | None = None
+    # Distinguishes an operator-supplied file from a live network fetch.
+    # Defaults to "network" so every pre-existing artifact record (which
+    # predates this field and was always produced by a network-shaped
+    # SourceAdapter.fetch() call) retains its original strict
+    # automation-permission interpretation rather than silently becoming a
+    # "supplied" record with a different, newly-relaxed permission check.
+    acquisition_mode: Literal["supplied", "network"] = "network"
+    # Identifies the specific recorded permission decision that authorized a
+    # "supplied" artifact's admission. Not meaningful for "network" mode,
+    # which is governed solely by `SourcePolicy.automation_allowed`.
+    permission_record_id: str | None = None
 
     @model_validator(mode="before")
     @classmethod

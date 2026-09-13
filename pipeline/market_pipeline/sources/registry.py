@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from market_pipeline.domain.models import SourcePolicy
+from market_pipeline.domain.models import SourceArtifact, SourcePolicy
 
 if TYPE_CHECKING:
     from market_pipeline.sources.base import SourceAdapter
@@ -71,19 +71,64 @@ def get_source_policy(source_id: str) -> SourcePolicy:
 
 
 def assert_source_enabled(policy: SourcePolicy) -> None:
+    """Check whether a live network fetch may run for this source.
+
+    This governs `SourceAdapter.fetch()` only. It is unrelated to whether a
+    separately-supplied (operator-provided, never network-fetched by this
+    pipeline) artifact for the same source may be admitted; see
+    `_assert_supplied_use_permitted` for that decision.
+    """
+
     canonical = SOURCE_POLICIES.get(policy.source_id)
     if canonical is None:
         raise SourcePolicyError(f"source is not on the official allowlist: {policy.source_id}")
     if policy != canonical:
         raise SourcePolicyError(f"source policy does not match canonical registry entry: {policy.source_id}")
-    if not canonical.automation_allowed or not canonical.retention_allowed:
+    _assert_network_permitted(canonical)
+
+
+def _assert_network_permitted(policy: SourcePolicy) -> None:
+    """Validate a policy's live-network-fetch permission fields only."""
+
+    if not policy.automation_allowed or not policy.retention_allowed:
         raise SourcePolicyError(f"automation is disabled for source: {policy.source_id}")
-    if not canonical.terms_url.startswith("https://") or canonical.permission_reference is None:
+    if not policy.terms_url.startswith("https://") or policy.permission_reference is None:
         raise SourcePolicyError(f"source terms reference is required: {policy.source_id}")
 
 
-def assert_artifact_policy(*, source_id: str, source_url: str, terms_url: str) -> None:
-    """Reject artifact provenance that is not the complete canonical policy."""
+def _assert_supplied_use_permitted(policy: SourcePolicy) -> None:
+    """Validate a policy's supplied-file retention/use permission fields only.
+
+    This is a distinct permission decision from `automation_allowed`: a
+    source whose terms currently prohibit automated collection may still,
+    separately, have recorded permission for an operator to supply and
+    retain individual official files. No source in the canonical registry
+    has this permission recorded today (see `SOURCE_POLICIES`), so a real
+    supplied artifact for `nse-eod`/`nse-filings-xbrl` remains denied until
+    an operator/owner explicitly records that decision.
+    """
+
+    if not policy.supplied_use_allowed or not policy.retention_allowed:
+        raise SourcePolicyError(f"supplied-file use/retention is not authorized for source: {policy.source_id}")
+    if not policy.terms_url.startswith("https://") or policy.supplied_use_permission_reference is None:
+        raise SourcePolicyError(f"supplied-use permission reference is required: {policy.source_id}")
+
+
+def assert_artifact_policy(
+    *,
+    source_id: str,
+    source_url: str,
+    terms_url: str,
+    acquisition_mode: str = "network",
+) -> None:
+    """Reject artifact provenance that is not the complete canonical policy.
+
+    `acquisition_mode` selects which permission is checked: "network" (the
+    default, matching this function's original, sole pre-existing behavior)
+    requires `automation_allowed`; "supplied" requires the separate
+    `supplied_use_allowed` permission instead. Both modes still require
+    exact-match official URL/provenance.
+    """
 
     canonical = SOURCE_POLICIES.get(source_id)
     if canonical is None:
@@ -91,7 +136,52 @@ def assert_artifact_policy(*, source_id: str, source_url: str, terms_url: str) -
     assert_source_url_allowed(source_id, source_url)
     if terms_url != canonical.terms_url:
         raise SourcePolicyError(f"artifact provenance does not match canonical source: {source_id}")
-    assert_source_enabled(canonical)
+    if acquisition_mode == "network":
+        assert_source_enabled(canonical)
+    elif acquisition_mode == "supplied":
+        _assert_supplied_use_permitted(canonical)
+    else:
+        raise SourcePolicyError(f"unsupported acquisition mode: {acquisition_mode}")
+
+
+def admit(artifact: SourceArtifact, policy: SourcePolicy) -> SourceArtifact:
+    """Validate one artifact's full provenance against an explicit policy.
+
+    This is the mode-aware admission entry point: it does not fetch bytes,
+    only decides whether `artifact` may be admitted under `policy`. Callers
+    that resolve a source's policy from the canonical registry (e.g.
+    `assert_artifact_policy`, used by the raw store) get the full
+    canonical-equality protection against a forged policy object, because
+    `SOURCE_POLICIES.get(artifact.source_id)` is consulted whenever the
+    source ID is registered. A caller may also pass an entirely
+    test-injected `SourcePolicy` for a source ID that is not in the
+    canonical registry (e.g. a fixture proving the supplied-use pathway) --
+    that path is exercised only in tests, never by production code, because
+    every production call site resolves `policy` via `get_source_policy`/
+    `SOURCE_POLICIES` first and therefore never reaches an unregistered
+    source ID.
+    """
+
+    if artifact.source_id != policy.source_id:
+        raise SourcePolicyError("artifact source ID does not match the supplied policy")
+    canonical = SOURCE_POLICIES.get(artifact.source_id)
+    if canonical is not None and policy != canonical:
+        raise SourcePolicyError(f"artifact policy does not match canonical registry entry: {artifact.source_id}")
+    _assert_url_allowed_for_policy(policy, artifact.source_url)
+    if artifact.terms_url != policy.terms_url:
+        raise SourcePolicyError(f"artifact provenance does not match canonical source: {artifact.source_id}")
+    if artifact.acquisition_mode == "network":
+        _assert_network_permitted(policy)
+    elif artifact.acquisition_mode == "supplied":
+        _assert_supplied_use_permitted(policy)
+        expected_reference = policy.supplied_use_permission_reference
+        if not artifact.permission_record_id or artifact.permission_record_id != expected_reference:
+            raise SourcePolicyError(
+                f"supplied artifact does not cite the recorded supplied-use permission: {artifact.source_id}"
+            )
+    else:
+        raise SourcePolicyError(f"unsupported acquisition mode: {artifact.acquisition_mode}")
+    return artifact
 
 
 def assert_source_url_allowed(source_id: str, source_url: str) -> None:
@@ -100,12 +190,26 @@ def assert_source_url_allowed(source_id: str, source_url: str) -> None:
     canonical = SOURCE_POLICIES.get(source_id)
     if canonical is None:
         raise SourcePolicyError(f"source is not on the official allowlist: {source_id}")
+    _assert_url_allowed_for_policy(canonical, source_url)
+
+
+def _assert_url_allowed_for_policy(policy: SourcePolicy, source_url: str) -> None:
+    """Validate a URL against a specific policy's own approved prefixes.
+
+    Unlike `assert_source_url_allowed`, this never looks the policy up by
+    source ID in `SOURCE_POLICIES` -- it trusts the `policy` object the
+    caller already resolved (canonically, for production call sites; via an
+    injected test fixture otherwise). This lets `admit()` validate a
+    fixture policy for a source ID that is intentionally absent from the
+    canonical registry.
+    """
+
     from urllib.parse import urlsplit
 
     actual = urlsplit(source_url)
     if actual.scheme != "https" or not actual.netloc or actual.username or actual.password:
         raise SourcePolicyError(f"source URL must use an official HTTPS origin: {source_url}")
-    for prefix in canonical.approved_url_prefixes:
+    for prefix in policy.approved_url_prefixes:
         expected = urlsplit(prefix)
         if actual.netloc != expected.netloc or actual.scheme != expected.scheme:
             continue

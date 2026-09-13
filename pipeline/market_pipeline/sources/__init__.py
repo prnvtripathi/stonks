@@ -17,9 +17,11 @@ from market_pipeline.sources.registry import (
     OFFICIAL_SOURCE_IDS,
     SOURCE_POLICIES,
     SourcePolicyError,
+    admit,
     assert_adapter_enabled,
     assert_artifact_policy,
     assert_source_enabled,
+    assert_source_url_allowed,
     get_source_policy,
 )
 
@@ -39,8 +41,10 @@ __all__ = [
     "parse_nse_security_master",
     "read_nse_archive",
     "SourcePolicyError",
+    "admit",
     "assert_adapter_enabled",
     "assert_artifact_policy",
     "assert_source_enabled",
+    "assert_source_url_allowed",
     "get_source_policy",
 ]

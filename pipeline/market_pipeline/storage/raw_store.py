@@ -10,7 +10,7 @@ from typing import Protocol, cast
 
 from market_pipeline.domain.models import SourceArtifact
 from market_pipeline.sources.base import RawStore
-from market_pipeline.sources.registry import assert_artifact_policy
+from market_pipeline.sources.registry import admit, get_source_policy
 
 __all__ = ["ImmutableRawStoreError", "LocalRawStore", "ObjectClient", "R2RawStore", "RawStore"]
 
@@ -82,11 +82,7 @@ class LocalRawStore:
         self.root = Path(root)
 
     def put(self, artifact: SourceArtifact, body: bytes) -> str:
-        assert_artifact_policy(
-            source_id=artifact.source_id,
-            source_url=artifact.source_url,
-            terms_url=artifact.terms_url,
-        )
+        admit(artifact, get_source_policy(artifact.source_id))
         _check_body(artifact, body)
         key = _object_key(artifact)
         path = self.root / key
@@ -165,11 +161,7 @@ class R2RawStore:
         self.client = client
 
     def put(self, artifact: SourceArtifact, body: bytes) -> str:
-        assert_artifact_policy(
-            source_id=artifact.source_id,
-            source_url=artifact.source_url,
-            terms_url=artifact.terms_url,
-        )
+        admit(artifact, get_source_policy(artifact.source_id))
         _check_body(artifact, body)
         key = _object_key(artifact)
         metadata_key = _metadata_key(key)
