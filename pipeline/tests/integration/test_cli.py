@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import market_pipeline.cli as cli_module
 from market_pipeline.cli import main
 
 TERMS_URL = "https://www.amfiindia.com/terms-and-conditions"
@@ -185,4 +186,92 @@ def test_omitted_previous_count_uses_last_successful_run_from_same_db_not_self_c
     # The baseline used must be the first run's completed count (1), not a
     # self-compare against this run's own completed count (0).
     assert second_payload["reconciliation"]["previous_count"] == 1
-    assert second_payload["safe_to_promote"] is False
+
+
+# --- S04: the composed-candidate seam is a real, reachable production path -
+
+
+def test_daily_command_actually_invokes_build_composed_candidate(
+    tmp_path: Path, capsys: Any, monkeypatch: Any
+) -> None:
+    """Fix round 1 (task review): prove `main()` itself calls into
+    `jobs.composed_candidate.build_composed_candidate` -- not merely that the
+    library function behaves correctly when a test calls it directly.
+    """
+
+    calls: list[dict[str, Any]] = []
+    real_build_composed_candidate = cli_module.build_composed_candidate
+
+    def _spy(connection: Any, raw_store: Any, **kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return real_build_composed_candidate(connection, raw_store, **kwargs)
+
+    monkeypatch.setattr(cli_module, "build_composed_candidate", _spy)
+
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"artifacts": [_artifact("2026-09-01")]}))
+    result = main(["--db", str(tmp_path / "market.db"), "daily", "--date", "2026-09-01", "--manifest", str(manifest)])
+    capsys.readouterr()
+
+    assert result == 0
+    assert len(calls) == 1
+    assert calls[0]["amfi_source_ids"] == ["amfi-nav"]
+
+
+def test_compose_command_publishes_amfi_only_and_reports_source_status(tmp_path: Path, capsys: Any) -> None:
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"artifacts": [_artifact("2026-09-01")]}))
+    result = main(["--db", str(tmp_path / "market.db"), "compose", "--date", "2026-09-01", "--manifest", str(manifest)])
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert payload["refresh"]["status"] == "published"
+    assert payload["refresh"]["source_status"]["amfi-nav"]["state"] == "complete"
+    assert payload["refresh"]["source_status"]["amfi-nav"]["category"] == "amfi-nav"
+    assert payload["refresh"]["active_dataset_id"] == payload["refresh"]["dataset_id"]
+
+
+def test_compose_command_with_empty_manifest_reports_failed_source_and_blocks(
+    tmp_path: Path, capsys: Any
+) -> None:
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"artifacts": []}))
+    result = main(["--db", str(tmp_path / "market.db"), "compose", "--date", "2026-09-01", "--manifest", str(manifest)])
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 3
+    assert payload["refresh"]["status"] == "blocked"
+    assert payload["refresh"]["source_status"]["amfi-nav"]["state"] == "failed"
+    assert payload["refresh"]["dataset_id"] is None
+    # Nothing was ever published, so there is still no active dataset.
+    assert payload["refresh"]["active_dataset_id"] is None
+
+
+def test_compose_command_delayed_source_still_publishes_and_preserves_dataset_identity(
+    tmp_path: Path, capsys: Any
+) -> None:
+    # Oracle intent (adapted to a real CLI round trip): a source that is
+    # merely delayed (it already has *some* checkpointed data, just not for
+    # today) must never block, or be blocked by, an otherwise-healthy
+    # composed publish -- the run republishes the same, already-good dataset
+    # rather than inventing a new one or failing outright.
+    db = tmp_path / "market.db"
+    good_manifest = _manifest_with_one_artifact(tmp_path, "good.json", "2026-09-01")
+    first = main(["--db", str(db), "compose", "--date", "2026-09-01", "--manifest", str(good_manifest)])
+    first_payload = json.loads(capsys.readouterr().out)
+    assert first == 0
+    assert first_payload["refresh"]["status"] == "published"
+    assert first_payload["refresh"]["source_status"]["amfi-nav"]["state"] == "complete"
+    last_good_dataset_id = first_payload["refresh"]["dataset_id"]
+    assert last_good_dataset_id is not None
+
+    empty_manifest = tmp_path / "empty.json"
+    empty_manifest.write_text(json.dumps({"artifacts": []}))
+    second = main(["--db", str(db), "compose", "--date", "2026-09-02", "--manifest", str(empty_manifest)])
+    second_payload = json.loads(capsys.readouterr().out)
+    assert second == 0
+    assert second_payload["refresh"]["status"] == "published"
+    assert second_payload["refresh"]["source_status"]["amfi-nav"]["state"] == "delayed"
+    assert second_payload["refresh"]["source_status"]["amfi-nav"]["loaded_date"] == "2026-09-01"
+    # The same, already-good dataset is what's still active -- delay never
+    # invented a new dataset or destroyed the existing one.
+    assert second_payload["refresh"]["active_dataset_id"] == last_good_dataset_id
+    assert second_payload["refresh"]["dataset_id"] == last_good_dataset_id

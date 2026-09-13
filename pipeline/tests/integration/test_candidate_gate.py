@@ -140,7 +140,10 @@ def test_previous_count_cannot_mask_a_multisource_truncation(
     monkeypatch.setattr(
         cli, "run_daily", lambda *args, **kwargs: BackfillResult(date(2026, 9, 2), date(2026, 9, 2), 0, 0)
     )
-    monkeypatch.setattr(cli, "build_candidate", lambda *args, **kwargs: DatasetBuild(candidate, {}, {}, {}, ()))
+    # S04: cli.py now builds every candidate through
+    # jobs.composed_candidate.build_composed_candidate rather than calling
+    # build_candidate directly (see cli.py's own comment at that call site).
+    monkeypatch.setattr(cli, "build_composed_candidate", lambda *args, **kwargs: DatasetBuild(candidate, {}, {}, {}, ()))
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps({"artifacts": []}), encoding="utf-8")
 

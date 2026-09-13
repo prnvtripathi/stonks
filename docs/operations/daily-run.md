@@ -329,6 +329,54 @@ twelve-month return needs), and `history/` (published Parquet history and
 chart objects). `market.db` and `raw/` also have a durable fallback beyond
 that cache -- see "Durable checkpoint-archive recovery" above.
 
+## The `compose` subcommand (S04)
+
+`market-pipeline compose --date ... --manifest ...` is a third subcommand
+alongside `daily`/`backfill`, built by S04's `jobs/composed_candidate.py`. It
+is the real, reachable production entry point for that module's composed
+multi-source build (`build_composed_candidate`) and schedule-driven refresh
+(`run_scheduled_refresh`) -- previously that machinery existed only as a
+library function exercised by its own test suite, which a task review
+correctly flagged as not actually wired into anything runnable.
+
+What it does today: it checkpoints artifacts from the same manifest format
+`daily` uses (identical `--source`/`--manifest`/`--previous-count`/
+`--min-coverage-ratio` flags), builds an explicit per-source schedule from
+the requested `--source` list and this pipeline's own source calendar
+(`_expected_date`), and publishes through `run_scheduled_refresh` -- which
+persists each source's `SourceStatus` (`complete`/`delayed`/`failed`/
+`not_expected`, with its own `expected_date`/`loaded_date`) independently,
+so one source's delay never masks, or is blocked by, another source's
+health. Its JSON report's `refresh` key carries `status`
+(`"published"`/`"blocked"`/`"failed"`/`"skipped"` -- `"skipped"` only when
+nothing in the schedule is expected to publish that day at all, e.g. a
+weekend) and `source_status`, alongside the same `start`/`end`/`completed`/
+`missing_dates`/`warnings`/`budget` fields `daily`/`backfill` already report.
+
+Requesting only `--source amfi-nav` (the default, and today's only
+production source) behaves identically to `daily`'s own promotion outcome:
+both build through `build_composed_candidate`, whose AMFI-only path is a
+proven byte-for-byte passthrough of the pre-existing, unmodified
+`build_candidate` (see
+`pipeline/tests/integration/test_multi_source_publication.py::test_amfi_only_composition_is_a_pure_passthrough`).
+`daily`/`backfill` themselves were also changed to build every candidate
+through `build_composed_candidate` rather than calling `build_candidate`
+directly (again, an equivalent-for-amfi-only passthrough) -- see
+`pipeline/tests/integration/test_cli.py::test_daily_command_actually_invokes_build_composed_candidate`.
+
+**What remains pending**: this command cannot yet admit real NSE
+(`nse-eod`/`nse-filings-xbrl`) or compose a real filings/benchmark reference
+build, because those sources' `SOURCE_POLICIES` entries still have
+`supplied_use_allowed=False`/`automation_allowed=False` (unchanged by S04,
+correctly -- see `docs/operations/source-policy.md`). This command and the
+underlying `SourceInput`-based admission path (S01) are what a future change
+would wire real NSE inputs through, once an operator/owner records a real
+supplied-use permission or a verified official automatic download path; no
+such change is made here. `.github/workflows/daily-data.yml` still invokes
+`daily`/`backfill` only -- wiring the scheduled workflow itself to `compose`
+(and to a real multi-source manifest format) is deliberately left as a
+separate, larger, separately-reviewable change.
+
 ## Production Cloudflare publication: one-time operator setup
 
 This implementation made **no real Cloudflare API call, deployment, D1

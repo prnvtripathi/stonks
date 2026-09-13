@@ -14,17 +14,21 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from market_pipeline.domain.models import FetchedArtifact, SourceArtifact
-from market_pipeline.jobs.backfill import BackfillJob, CoverageError
+from market_pipeline.jobs.backfill import BackfillJob, BackfillResult, CoverageError
+from market_pipeline.jobs.composed_candidate import (
+    SourceScheduleEntry,
+    build_composed_candidate,
+    run_scheduled_refresh,
+)
 from market_pipeline.jobs.daily import run_daily
 from market_pipeline.jobs.publish import (
     PublicationInputError,
-    build_candidate,
     publish_checkpointed_dataset,
 )
 from market_pipeline.monitoring.budgets import budget_report
 from market_pipeline.sources.registry import SourcePolicyError
 from market_pipeline.storage.d1_publisher import D1Publisher
-from market_pipeline.storage.history_store import LocalHistoryStore
+from market_pipeline.storage.history_store import HistoryStore, LocalHistoryStore
 from market_pipeline.storage.raw_store import LocalRawStore
 from market_pipeline.validation.reconcile import (
     CandidateCoverage,
@@ -60,7 +64,7 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("backfill", "daily"):
+    for command in ("backfill", "daily", "compose"):
         sub = subparsers.add_parser(command)
         sub.add_argument("--date", type=_date, help="effective date (daily only)")
         sub.add_argument("--start", type=_date, help="inclusive backfill start")
@@ -233,6 +237,88 @@ def _candidate_coverage(
     return tuple(coverage)
 
 
+def _run_compose(
+    connection: sqlite3.Connection,
+    publisher: D1Publisher,
+    raw_store: LocalRawStore,
+    history_store: HistoryStore,
+    sources: Sequence[str],
+    result: BackfillResult,
+    args: argparse.Namespace,
+) -> int:
+    """S04's schedule-aware entry point: ``market-pipeline compose``.
+
+    This is a real, separately reachable production invocation of
+    ``jobs.composed_candidate.run_scheduled_refresh`` -- not only a library
+    function exercised by tests. Today, every requested source is admitted
+    as ``acquisition_mode="supplied"`` through this same manifest-based
+    checkpoint step ``daily``/``backfill`` already use (no NSE/reference
+    ``SourceInput`` can be supplied via this CLI yet -- that remains gated on
+    the still-pending NSE supplied-use permission, unchanged by this
+    command), so a schedule built purely from ``sources`` and this pipeline's
+    own explicit per-source calendar (:func:`_expected_date`) is the honest
+    schedule this CLI can express today. Requesting only ``amfi-nav`` behaves
+    identically to ``daily``'s own promotion outcome (both build through
+    :func:`~market_pipeline.jobs.composed_candidate.build_composed_candidate`,
+    whose AMFI-only path is a proven byte-for-byte passthrough of
+    ``build_candidate``) -- this command additionally reports the
+    per-source :class:`~market_pipeline.jobs.composed_candidate.SourceStatus`
+    the plan's daily-execution interface asks for.
+    """
+
+    schedule = [
+        SourceScheduleEntry(
+            source_id=source_id,
+            category=source_id,
+            acquisition_mode="supplied",
+            expected_date=_expected_date(source_id, result.end),
+        )
+        for source_id in sources
+    ]
+    refresh = run_scheduled_refresh(
+        connection,
+        publisher,
+        raw_store,
+        schedule,
+        result.end,
+        amfi_source_ids=sources,
+        history_store=history_store,
+        min_coverage_ratio=args.min_coverage_ratio,
+        previous_count=args.previous_count,
+    )
+    storage = publisher.budget_report()
+    storage_report = budget_report(
+        used=storage.used_bytes,
+        limit=storage.limit_bytes,
+        warning_threshold=storage.warning_threshold,
+        source="d1",
+    )
+    print(json.dumps({
+        "start": result.start.isoformat(),
+        "end": result.end.isoformat(),
+        "completed": result.completed,
+        "skipped": result.skipped,
+        "missing_dates": {
+            source: [item.isoformat() for item in dates]
+            for source, dates in result.missing_dates.items()
+        },
+        "errors": list(result.errors),
+        "warnings": list(result.warnings),
+        "budget": storage_report.as_dict(),
+        "refresh": refresh.as_dict(),
+    }, sort_keys=True))
+    connection.close()
+    if refresh.status == "skipped":
+        # Never silently label a no-op schedule a completed refresh, but a
+        # day with nothing scheduled is not itself a failure either.
+        return 0
+    if refresh.status == "blocked":
+        return 3
+    if refresh.status == "failed":
+        return 4
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     sources = args.sources or ["amfi-nav"]
@@ -257,9 +343,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     publisher = D1Publisher(connection, budget_limit_bytes=args.d1_budget_limit_bytes)
     publisher.initialize_schema()
     _ensure_run_history_table(connection)
-    if args.command == "daily":
+    if args.command in ("daily", "compose"):
         if args.date is None:
-            _parser().error("daily requires --date")
+            _parser().error(f"{args.command} requires --date")
         start = end = args.date
     else:
         start, end = args.start, args.end
@@ -277,7 +363,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # evaluation below is the actual blocking mechanism (via
         # evaluate_pre_promotion), so every configured source gets an
         # independent freshness verdict instead of one aborting the whole run.
-        if args.command == "daily":
+        if args.command in ("daily", "compose"):
             result = run_daily(connection, fetcher, sources, effective_date=start, raw_store=raw_store, strict_coverage=False, budget_sources=(publisher,))
         else:
             result = BackfillJob(connection, sources, fetcher, raw_store=raw_store, strict_coverage=False, budget_sources=(publisher,)).run(start, end)
@@ -286,11 +372,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps({"error": str(exc)}, sort_keys=True), file=sys.stderr)
         return 2
 
+    if args.command == "compose":
+        return _run_compose(connection, publisher, raw_store, history_store, sources, result, args)
+
     # Safety gate: before any future promotion step runs, reconcile the
     # candidate run's coverage against the last known-good baseline and check
     # storage budget.
     try:
-        build = build_candidate(connection, raw_store, sources, effective_date=result.end)
+        # S04: every daily/backfill candidate is now built through the
+        # composed-candidate seam (jobs/composed_candidate.py), not
+        # build_candidate directly. When only amfi-nav (or any set of
+        # sources with no admitted NSE/reference SourceInputs, which this
+        # command has no way to supply yet) is requested, this is a proven
+        # byte-for-byte passthrough of build_candidate's own output -- see
+        # jobs.composed_candidate.compose_datasets's own docstring and
+        # pipeline/tests/integration/test_multi_source_publication.py's
+        # `test_amfi_only_composition_is_a_pure_passthrough`. This is what
+        # gives the composed-build machinery a real, always-exercised
+        # production entry point rather than only a library function
+        # reachable from tests.
+        build = build_composed_candidate(connection, raw_store, amfi_source_ids=sources, effective_date=result.end)
         build_error = None
     except PublicationInputError as exc:
         build = None
