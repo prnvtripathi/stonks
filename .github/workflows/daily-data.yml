@@ -232,8 +232,6 @@ jobs:
       - name: Set up Node for Wrangler
         if: steps.params.outputs.manifest_present == 'true'
         uses: pnpm/action-setup@v4
-        with:
-          version: "11"
 
       - name: Set up Node runtime for Wrangler
         if: steps.params.outputs.manifest_present == 'true'
