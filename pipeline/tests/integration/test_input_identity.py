@@ -13,6 +13,7 @@ from typing import Any
 from market_pipeline.cli import main
 from market_pipeline.jobs import publish as publish_job
 from market_pipeline.publication.input_manifest import dataset_fingerprint
+from market_pipeline.storage.history_store import LocalHistoryStore
 
 
 def _artifact(effective: date, nav: float) -> dict[str, Any]:
@@ -118,7 +119,15 @@ def test_historical_backfill_changes_dataset_identity_and_metric_lineage(tmp_pat
     finally:
         connection.close()
     assert one_week is not None
-    assert len(metadata["input_manifest"]["inputs"]) == 6
-    assert {item["effective_date"] for item in metadata["input_manifest"]["inputs"]} == {
+    # R13/F16: the full manifest body is no longer embedded in
+    # `metadata_json` -- only its hash is. Dataset identity is unaffected
+    # (still R02's `dataset_fingerprint`); the full lineage record is
+    # resolved through that hash via the content-addressed manifest object.
+    assert "input_manifest" not in metadata
+    assert metadata["input_manifest_sha256"]
+    store = LocalHistoryStore(tmp_path / "history")
+    manifest_body = store.read_manifest(metadata["input_manifest_sha256"])
+    assert len(manifest_body["inputs"]) == 6
+    assert {item["effective_date"] for item in manifest_body["inputs"]} == {
         (latest - timedelta(days=offset)).isoformat() for offset in range(6)
     }

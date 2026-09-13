@@ -166,14 +166,16 @@ def test_manifest_flows_from_raw_artifact_to_a_promoted_queryable_dataset(tmp_pa
     # `compact_momentum_fixture.py` uses for the Worker-side decoder test).
     #
     # This uses its own small (70-day) manifest/database rather than the
-    # 300-artifact one above: exporting the full 300-artifact dataset here
-    # surfaces a separate, real defect -- R02's dataset-level input manifest
-    # (every contributing artifact's id/checksum/etc., embedded verbatim in
-    # `datasets.metadata_json`) grows past `_export_dataset_sql`'s 90,000
-    # byte per-statement D1 limit once artifact count is in the hundreds,
-    # which a genuine three-year daily backfill will be. That is reported
-    # separately (see the phase-gate report and launch checklist) as a new
-    # finding, not silently masked by shrinking this fixture's day count.
+    # 300-artifact one above purely to keep this sub-check fast and focused;
+    # it is no longer required for correctness. Exporting the full
+    # 300-artifact dataset here used to surface a separate, real defect --
+    # R02's dataset-level input manifest (every contributing artifact's
+    # id/checksum/etc., embedded verbatim in `datasets.metadata_json`) grew
+    # past `_export_dataset_sql`'s 90,000 byte per-statement D1 limit once
+    # artifact count was in the hundreds. R13 fixed that (see launch
+    # checklist's "Resolved finding" and
+    # `test_export_active_dataset_succeeds_for_a_realistic_three_year_backfill`
+    # below, which exercises the full ~750-artifact scale end to end).
     small_db = tmp_path / "small.db"
     small_raw = tmp_path / "small_raw"
     small_manifest = tmp_path / "small_manifest.json"
@@ -248,3 +250,56 @@ def test_blocked_run_never_replaces_the_last_known_good_dataset(tmp_path: Path, 
         ).fetchone()[0] > 0
     finally:
         connection.close()
+
+
+def test_export_active_dataset_succeeds_for_a_realistic_three_year_backfill(tmp_path: Path, capsys: Any) -> None:
+    """R13 regression: a genuine three-calendar-year AMFI backfill must export.
+
+    Before R13, ``jobs/publish.py`` embedded the *full* input manifest --
+    every contributing artifact's source_id/effective_date/artifact_id/
+    checksum/adapter_version/raw_object_key -- verbatim into
+    ``datasets.metadata_json``. The 300-artifact fixture above already
+    demonstrates real ~300-day scale but deliberately stops short of
+    exporting (see its own comment). At ~750 daily artifacts (the plan's own
+    three-calendar-year acceptance criterion), that embedded manifest pushed
+    the ``INSERT INTO datasets`` statement past `d1_export.py`'s pre-existing
+    90,000-byte per-statement D1 limit, so `export_active_dataset` raised
+    `DatasetExportError` on every export -- exactly what the phase-gate found
+    (see docs/operations/launch-checklist.md's "New finding" section and
+    `task-R13-brief.md`). Only the manifest's hash belongs on the dataset row
+    now; the full body lives in a separate content-addressed object, so this
+    must succeed regardless of how many artifacts contributed.
+    """
+
+    from market_pipeline.publication.d1_export import export_active_dataset
+
+    db = tmp_path / "market.db"
+    raw_root = tmp_path / "raw"
+    manifest = tmp_path / "manifest-750.json"
+    start, end = _write_manifest(manifest, date(2023, 9, 4), 750)
+
+    exit_code = main([
+        "--db", str(db), "--raw-store", str(raw_root),
+        "backfill", "--start", start.isoformat(), "--end", end.isoformat(),
+        "--manifest", str(manifest),
+    ])
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0, payload
+    assert payload["publication"]["promoted"] is True
+
+    connection = sqlite3.connect(db)
+    try:
+        metadata = json.loads(connection.execute(
+            "SELECT metadata_json FROM datasets WHERE dataset_id = ?",
+            (payload["publication"]["dataset_id"],),
+        ).fetchone()[0])
+    finally:
+        connection.close()
+    # The fix: only the (small) fingerprint lives on the dataset row itself.
+    assert metadata.get("input_manifest_sha256")
+    assert "input_manifest" not in metadata
+
+    export_path = tmp_path / "active-dataset-750.sql"
+    result = export_active_dataset(sqlite3.connect(db), export_path)
+    assert result == payload["publication"]["dataset_id"]
+    assert export_path.exists()

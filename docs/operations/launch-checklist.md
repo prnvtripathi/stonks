@@ -151,35 +151,54 @@ surfaces a genuine, previously-undetected defect (see "New finding" below),
 so the extension uses its own smaller manifest instead of masking that
 defect by construction.
 
-## New finding: dataset metadata can exceed the D1 per-statement export limit
+## Resolved finding: dataset metadata could exceed the D1 per-statement export limit (R13/F16)
 
-While building the cross-boundary fixture above, exporting the *existing*
-300-artifact end-to-end fixture (one artifact per calendar day) through the
-real `export_active_dataset` failed with `DatasetExportError: remote D1
-statement exceeds 90000 UTF-8 bytes`. Root cause: R02's dataset fingerprint
-(`market_pipeline/jobs/publish.py`'s `manifest_with_fingerprint`) embeds the
-**full** input manifest -- every contributing artifact's id, checksum,
-adapter version, and raw object key -- verbatim into
-`datasets.metadata_json`, and `d1_export.py`'s pre-existing
+**Status: resolved by R13.** While building the cross-boundary fixture above,
+exporting the *existing* 300-artifact end-to-end fixture (one artifact per
+calendar day) through the real `export_active_dataset` failed with
+`DatasetExportError: remote D1 statement exceeds 90000 UTF-8 bytes`. Root
+cause: R02's dataset fingerprint (`market_pipeline/jobs/publish.py`'s
+`manifest_with_fingerprint`) embedded the **full** input manifest -- every
+contributing artifact's id, checksum, adapter version, and raw object key --
+verbatim into `datasets.metadata_json`, and `d1_export.py`'s pre-existing
 `_MAX_D1_STATEMENT_BYTES = 90_000` guard (predates this remediation plan)
-rejects the resulting `INSERT ... INTO datasets` statement once artifact
-count is in the hundreds. A genuine three-calendar-year daily backfill
-(acceptance criterion 1, ~750+ daily AMFI artifacts) will contain far more
-artifacts than the 300 in this fixture and, on today's code, would very
-likely trip this same guard on every export -- blocking the exact backfill
-this dashboard exists to serve.
+rejected the resulting `INSERT ... INTO datasets` statement once artifact
+count was in the hundreds. A genuine three-calendar-year daily backfill
+(acceptance criterion 1, ~750+ daily AMFI artifacts) contains far more
+artifacts than the 300 in that fixture and, before this fix, tripped this
+same guard on every export -- blocking the exact backfill this dashboard
+exists to serve (measured: a 750-artifact backfill produced a
+259,547-byte `metadata_json`, well past the limit).
 
-This was found by this gate's own composition testing, is not one of
-R01-R12's tested scenarios, and was not introduced by this gate (the
-manifest-embedding behavior is R02's; the byte guard predates the whole
-remediation plan). Per the phase-gate brief ("do not re-implement
-functionality R01-R12 already built and tested" / this is a
-verification-and-documentation pass, not a new fix-loop), this gate does
-not attempt a fix here. **This is a blocking pre-launch defect against
-acceptance criterion 1** and must be resolved (for example: store only the
-manifest's hash plus a pointer to an R2-held manifest object, rather than
-the manifest body, in `datasets.metadata_json`) before a real three-year
-backfill is attempted. Tracked here rather than silently worked around.
+This was found by the phase acceptance gate's own composition testing, is
+not one of R01-R12's tested scenarios, and was not introduced by that gate
+(the manifest-embedding behavior was R02's; the byte guard predates the
+whole remediation plan). Per the plan's process rule, it was tracked as a
+new, separately named task (R13) rather than silently folded into another
+task or worked around.
+
+**Fix:** `market_pipeline/jobs/publish.py`'s `build_candidate` no longer puts
+the full manifest body in `candidate["metadata"]["input_manifest"]` -- only
+`input_manifest_sha256` (already computed, already small) stays on the
+dataset row. The full manifest body is carried through
+`DatasetBuild.input_manifest` and persisted by `publish_checkpointed_dataset`
+as a separate immutable, content-addressed object
+(`market_pipeline.storage.history_store.HistoryStore.write_manifest`, keyed
+`manifests/{fingerprint}.json`, following the same convention as this
+module's existing `history_key`/`chart_key` objects) before the candidate is
+staged -- a manifest that fails to persist blocks promotion exactly like a
+failed history/chart write. Nothing that resolves lineage through the hash
+(R07's `PublicationBundle.input_manifest_hash`, R10's checkpoint archive, or
+R11's restore path) read the embedded `inputs` list directly, so none of
+them needed to change; the one call site that did
+(`publish_checkpointed_dataset`'s bundle `source_dates` derivation) now reads
+`DatasetBuild.input_manifest` instead. Regression test:
+`pipeline/tests/integration/test_end_to_end_publication.py::test_export_active_dataset_succeeds_for_a_realistic_three_year_backfill`
+(a real ~750-day AMFI backfill through the full CLI, asserting
+`export_active_dataset` succeeds and that `metadata_json` carries only the
+hash). Dataset-identity semantics are unchanged: R02's fingerprinting tests
+(`pipeline/tests/integration/test_input_identity.py`) still pass, now
+resolving the full manifest body via `HistoryStore.read_manifest`.
 
 ## Workflow fragility fixed during this gate (no product behavior change)
 

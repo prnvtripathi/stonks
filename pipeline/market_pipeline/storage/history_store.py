@@ -139,6 +139,22 @@ def history_key(asset_class: str, instrument_id: str | UUID, year: int, sha256_h
     return f"history/{asset}/{instrument}/{year}/{digest}.parquet"
 
 
+def manifest_key(fingerprint: str) -> str:
+    """Return the content-addressed key for one input-manifest body (R13/F16).
+
+    The manifest's own fingerprint (see
+    :func:`market_pipeline.publication.input_manifest.dataset_fingerprint`)
+    already is a SHA-256 of its canonical bytes, so this key needs no
+    additional digest of its own: a corrected manifest always fingerprints
+    differently and can never collide with a previous body under this key.
+    """
+
+    digest = str(fingerprint).lower()
+    if not _SHA256_HEX.fullmatch(digest):
+        raise HistoryStoreError("input manifest fingerprint must be 64 lowercase hex characters")
+    return f"manifests/{digest}.json"
+
+
 def chart_key(dataset_id: str, instrument_id: str | UUID) -> str:
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", dataset_id):
         raise HistoryStoreError("dataset ID contains unsupported characters")
@@ -265,6 +281,30 @@ class HistoryStore:
         except (OSError, json.JSONDecodeError) as exc:
             raise HistoryStoreError(f"chart object is invalid: {key}") from exc
 
+    def write_manifest(self, fingerprint: str, manifest: Mapping[str, Any]) -> WrittenObject:
+        """Persist the full input-manifest body as an immutable object (R13/F16).
+
+        Only the manifest's fingerprint (already computed, already small)
+        belongs on a dataset's own ``metadata_json`` row -- see
+        ``jobs/publish.py``. The full ``inputs`` list (one entry per
+        contributing artifact) lives here instead, so real per-artifact
+        lineage stays retrievable without inflating every D1 export.
+        """
+
+        payload = json.dumps(_safe(manifest), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        key = self.put_if_absent(manifest_key(fingerprint), payload)
+        return WrittenObject(key=key, sha256=sha256(payload).hexdigest(), bytes=len(payload))
+
+    def read_manifest(self, fingerprint: str) -> Any:
+        key = manifest_key(fingerprint)
+        body = self.client.get(key)
+        if body is None:
+            raise KeyError(key)
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise HistoryStoreError(f"input manifest object is invalid: {key}") from exc
+
 
 class LocalHistoryStore(HistoryStore):
     """Filesystem-backed history store, useful for local jobs and tests."""
@@ -290,4 +330,5 @@ __all__ = [
     "WrittenObject",
     "chart_key",
     "history_key",
+    "manifest_key",
 ]

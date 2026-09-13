@@ -108,6 +108,12 @@ class DatasetBuild:
     source_artifact_ids: dict[str, str]
     histories: dict[str, tuple[str, tuple[tuple[date, Decimal], ...]]]
     warnings: tuple[str, ...]
+    # The full input manifest body (R13/F16): never embedded in
+    # ``candidate["metadata"]`` -- only its hash (``input_manifest_sha256``)
+    # is small enough to live on every dataset row. This field carries the
+    # full body through to ``publish_checkpointed_dataset``, which persists
+    # it as a separate immutable, content-addressed object.
+    input_manifest: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -385,7 +391,12 @@ def build_candidate(
             "generated_at": now,
             "artifact_dates": len(artifact_by_date),
             "unwired_sources": unwired,
-            "input_manifest": manifest,
+            # R13/F16: the full manifest body (one entry per contributing
+            # artifact) is never embedded here -- at real backfill scale
+            # (~750+ daily artifacts) that made every `datasets` row exceed
+            # d1_export.py's 90,000-byte per-statement D1 limit. Only the
+            # hash lives on the dataset; the body is persisted separately by
+            # `publish_checkpointed_dataset` (see `DatasetBuild.input_manifest`).
             "input_manifest_sha256": fingerprint,
         },
         "tables": {
@@ -410,7 +421,7 @@ def build_candidate(
         },
     }
     artifact_ids: dict[str, str] = {}
-    return DatasetBuild(candidate, scores, artifact_ids, histories, tuple(warnings))
+    return DatasetBuild(candidate, scores, artifact_ids, histories, tuple(warnings), input_manifest=manifest)
 
 
 def _write_history(
@@ -500,7 +511,21 @@ def publish_checkpointed_dataset(
         )
     history_objects = 0
     if history_store is not None:
+        metadata = candidate.setdefault("metadata", {})
+        input_manifest_hash = str(metadata.get("input_manifest_sha256") or "")
+        manifest_warnings: list[str] = []
+        if input_manifest_hash and build.input_manifest:
+            # R13/F16: the full manifest body never lives in `metadata` --
+            # persist it as its own immutable, content-addressed object
+            # before staging, using the same all-or-nothing failure
+            # semantics as the history/chart objects below (a manifest that
+            # failed to persist must never let the pointer move).
+            try:
+                history_store.write_manifest(input_manifest_hash, build.input_manifest)
+            except (HistoryStoreError, OSError) as exc:
+                manifest_warnings.append(f"input manifest object was not written ({exc})")
         history_objects, object_entries, history_warnings = _write_history(history_store, dataset_id, build)
+        history_warnings = manifest_warnings + history_warnings
         warnings.extend(history_warnings)
         if history_warnings:
             # History/chart objects are what the Worker serves alongside the
@@ -514,11 +539,9 @@ def publish_checkpointed_dataset(
                 reason="history publication failed; active dataset was left untouched",
                 warnings=tuple(warnings),
             )
-        metadata = candidate.setdefault("metadata", {})
-        input_manifest_hash = str(metadata.get("input_manifest_sha256") or "")
         source_dates = sorted({
             str(item.get("effective_date"))
-            for item in (metadata.get("input_manifest") or {}).get("inputs", [])
+            for item in build.input_manifest.get("inputs", [])
             if item.get("effective_date")
         })
         try:
