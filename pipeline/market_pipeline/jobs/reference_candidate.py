@@ -266,6 +266,17 @@ def _fundamental_period_dto(period: FundamentalPeriod, *, active: bool) -> dict[
         "period_type": period.period_type,
         "filing_id": period.filing_id,
         "filed_at": period.filed_at.isoformat(),
+        # D1's fundamental_periods.metrics_json column is NOT NULL (see
+        # db/migrations/0001_market_schema.sql) -- this was never caught by
+        # this module's own test suite because it never staged a period
+        # through a real D1Publisher; S04's cross-boundary composed test
+        # does, and surfaced the gap. Serialized as a plain dict so
+        # D1Publisher._db_value's own Mapping -> JSON handling applies,
+        # rather than double-encoding a JSON string here.
+        "metrics_json": {
+            field_name: {"value": str(metric.value), "unit": metric.unit}
+            for field_name, metric in period.metrics.items()
+        },
         "restates_id": str(period.restates_id) if period.restates_id is not None else None,
         "supersedes_id": str(period.supersedes_id) if period.supersedes_id is not None else None,
         "source_artifact_id": str(period.source_artifact_id) if period.source_artifact_id is not None else None,
