@@ -191,30 +191,38 @@ real credentials this environment does not have:
    Access" requirement this task exists to satisfy. `workers_dev` must stay
    `false` in both environments.
 
-### Known caveat: the smoke tests are not a full end-to-end auth check yet
+### Resolved (R12/F15): scoped service-token identity for the smoke tests
 
-`apps/api/src/middleware/access.ts`'s `verifyAccessRequest()` authorizes a
-request only if the Access JWT's `email` claim is in the allowlisted
-`ACCESS_ALLOWED_EMAILS`. Cloudflare Access **service token** JWTs (used by
-the CI smoke tests, since CI cannot complete an interactive login) carry a
-`common_name` claim instead of `email`. Access's edge will accept a valid
-service token and forward the request; this application's own code will
-then still return 401, because the service token has no allowlisted email.
+`apps/api/src/middleware/access.ts`'s `verifyAccessRequest()` authorizes an
+`email` claim against `ACCESS_ALLOWED_EMAILS` (the owner identity) OR a
+`common_name` claim -- how Cloudflare Access signs a Service Token JWT --
+against the separate, explicit `ACCESS_ALLOWED_SERVICE_TOKENS` allowlist
+(`apps/api/src/env.ts`). A matched service-token identity is authorized for
+exactly one route, `GET /api/v1/status`: it is never mapped to an owner
+email and any other route (including every mutation) returns 403 for that
+identity, even though the token itself verified cryptographically. See
+`apps/api/src/middleware/access.test.ts` for the regression coverage (exact
+identity, wrong audience, expired token, unknown identity, denied mutation).
 
-This is intentional under the current design -- there is no bypass route,
-and a service token is not silently treated as the owner. But it means
-`deploy.yml`'s smoke-test steps currently treat both `200` and `401` as
-"the deploy and Access wiring are healthy" (only a redirect to Access's
-login page, a 5xx, or a connection failure fails the step), rather than
-asserting a strict `200`. Getting to a strict `200` needs a small, explicit,
-narrowly-scoped follow-up: allowlisting the CI service token's `common_name`
-alongside the owner's `email` in `verifyAccessRequest()`. That is a real
-code change to Task 9's access-control module and was deliberately **not**
-made as part of this task, per this task's brief ("document that this step
-needs a Cloudflare Access Service Token secret ... without inventing
-implementation you can't verify"). See `docs/operations/launch-checklist.md`
-for how this is tracked as a manual pre-launch verification until that
-follow-up lands.
+`ACCESS_ALLOWED_SERVICE_TOKENS` is a Cloudflare Worker secret, like
+`ACCESS_ALLOWED_EMAILS`, set per environment
+(`wrangler secret put ACCESS_ALLOWED_SERVICE_TOKENS --env <env>`) to the
+`common_name` configured on that environment's CI Service Token in Zero
+Trust > Access > Service Auth. With it configured, `deploy.yml`'s
+smoke-test steps require a genuine `200` with valid status JSON from that
+service token -- `401` is no longer accepted as "healthy" the way it used
+to be before this allowlist existed.
+
+**Live-acceptance gate still pending:** this task (R12) implements and unit
+tests the scoped-identity verification logic and the workflow's strict-200
++ JSON-shape check entirely locally (no live Cloudflare Access application
+or deployed Worker is reachable from this environment). Confirming a real
+Access Service Token against a real deployed Worker returns a genuine `200`
+end-to-end remains a manual pre-launch verification step -- see
+`docs/operations/launch-checklist.md`. A service token proving Access's
+edge and this application's scoped check both work does **not** prove the
+*owner's* interactive Access login is configured correctly (a different
+credential path); keep the manual owner-authenticated check for that.
 
 ## What was actually verified here (no live Cloudflare account)
 

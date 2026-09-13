@@ -10,7 +10,7 @@ export * from "./middleware/access";
 export * from "./repositories";
 
 export interface ApiDependencies { readonly env: ApiEnv; readonly store: ResearchStore; readonly now?: () => Date; readonly accessVerifier?: AccessVerifier; readonly testAccessSecret?: string; }
-export interface Api { fetch(request: Request): Promise<Response>; issueTestToken(options: { readonly email: string; readonly exp?: number; readonly aud?: string }): Promise<string>; }
+export interface Api { fetch(request: Request): Promise<Response>; issueTestToken(options: { readonly email?: string; readonly commonName?: string; readonly exp?: number; readonly aud?: string }): Promise<string>; }
 
 const jsonHeaders = { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "private, no-store" };
 const json = (body: unknown, status = 200): Response => new Response(JSON.stringify(body), { status, headers: jsonHeaders });

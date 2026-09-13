@@ -23,10 +23,24 @@ on:
 # concurrently against the same D1 migration state or race a partially
 # rolled out Worker. Never cancel a deploy that is already applying
 # migrations or has already touched production.
-concurrency:
-  group: deploy
-  cancel-in-progress: false
-
+#
+# R12/F15: this used to be one workflow-level `group: deploy` covering both
+# jobs. It is now two job-level concurrency groups instead (GitHub Actions
+# allows only one concurrency block per *scope* -- workflow or job -- not
+# two workflow-level blocks in one file), so that:
+#   - `preview` still serializes against other `preview` runs (unchanged
+#     behavior: two pushes in quick succession still queue their preview
+#     jobs rather than racing the preview D1 database/Worker), under its
+#     own `deploy-preview` group.
+#   - `production` serializes against other `production` runs (unchanged),
+#     AND now ALSO against .github/workflows/daily-data.yml's `refresh`
+#     job, under the shared `production-d1-writer` group -- see that
+#     workflow's concurrency comment. Both jobs mutate the same production
+#     D1 database and were previously not mutually exclusive at all.
+# `preview` deliberately does NOT join `production-d1-writer`: it never
+# touches the production database, so a preview deploy queuing behind an
+# unrelated daily data refresh would be an unnecessary delay, not a needed
+# safety property.
 permissions:
   contents: read
 
@@ -42,6 +56,9 @@ jobs:
     name: Validate, test, and deploy preview
     runs-on: ubuntu-latest
     environment: preview
+    concurrency:
+      group: deploy-preview
+      cancel-in-progress: false
     outputs:
       preview_url: ${{ vars.PREVIEW_URL }}
     steps:
@@ -124,32 +141,31 @@ jobs:
         # CF-Access-Client-Id/Secret header pair for a verified Access JWT
         # before the request ever reaches this Worker.
         #
-        # KNOWN CAVEAT (see docs/operations/deploy.md and
-        # docs/operations/launch-checklist.md): apps/api/src/middleware/
-        # access.ts currently authorizes only by matching an allowlisted
-        # `email` claim, and Cloudflare Access service-token JWTs carry a
-        # `common_name` claim instead of `email`. Until the application adds
-        # an explicit, narrowly-scoped allowlist entry for this service
-        # token's `common_name` (a deliberate addition, not a bypass route:
-        # it is still a cryptographically verified, audience-scoped
-        # credential), the application layer will correctly return 401 even
-        # though Access's edge check passed. This step therefore checks that
-        # Access's own edge did not redirect to its login page (a non-2xx,
-        # non-401 response here would mean the service token itself is
-        # misconfigured); a full 200 additionally requires that follow-up
-        # allowlist change. See launch-checklist.md for the manual
-        # verification this step does not yet fully automate.
+        # R12/F15: Cloudflare Access service-token JWTs carry a
+        # `common_name` claim instead of `email`, so this service token is
+        # authorized through the separate, explicit allowlist in
+        # ACCESS_ALLOWED_SERVICE_TOKENS (see apps/api/src/env.ts and
+        # apps/api/src/middleware/access.ts's `authorizeIdentity`) rather
+        # than ACCESS_ALLOWED_EMAILS. That allowlist entry scopes this
+        # identity ONLY to `GET /api/v1/status` -- it is never mapped to an
+        # owner email and can never authorize a mutation (see
+        # apps/api/src/middleware/access.test.ts). With that in place this
+        # step requires a genuine 200 -- accepting 401 as "healthy" (as this
+        # step used to, before the common_name allowlist existed) is exactly
+        # the F15 gap this task closes, so a 401 here now fails the step. A
+        # bootstrap `datasetId: null` in the response body is an explicit
+        # healthy-empty state (no dataset published yet, e.g. right after
+        # first deploy) and is accepted here; the daily-data.yml
+        # reconciliation gate is the place that separately requires a real
+        # dataset ID once a first publish is expected.
         #
         # This step ALSO runs scripts/ci/assert-anonymous-denied.sh, a
         # second, credential-free check that sends a plain GET with no
-        # Access/Authorization headers at all and fails the step if that
-        # gets a bare 200. This is the fail-open half of the gate: it does
-        # not require the common_name follow-up above and catches a
-        # different, more dangerous class of bug -- Access itself
-        # misconfigured to allow anyone, or accessVerifier() accidentally
-        # removed from apps/api/src/index.ts -- which the 200-or-401
-        # authenticated check above cannot detect on its own (see that
-        # script's header comment for the full rationale).
+        # Access/Authorization headers at all. It now requires actual
+        # denial evidence (401, 403, or a redirect to Access's hosted login
+        # page) rather than accepting any non-200 as proof -- a 5xx, 404, or
+        # transport failure is treated as inconclusive, not "denied" (see
+        # that script's header comment for the full rationale).
         run: |
           set -euo pipefail
           status=$(curl -s -o /tmp/preview-smoke.json -w '%{http_code}' \
@@ -157,8 +173,14 @@ jobs:
             -H "CF-Access-Client-Secret: ${{ secrets.CF_ACCESS_SERVICE_TOKEN_SECRET }}" \
             "${{ vars.PREVIEW_URL }}/api/v1/status")
           echo "preview /api/v1/status responded $status"
-          if [ "$status" != "200" ] && [ "$status" != "401" ]; then
-            echo "::error::Unexpected status $status from preview smoke test (expected 200, or 401 pending the common_name allowlist follow-up documented above)"
+          if [ "$status" != "200" ]; then
+            echo "::error::Expected 200 from the approved Access service-token identity smoke check, got $status. See ACCESS_ALLOWED_SERVICE_TOKENS / apps/api/src/middleware/access.ts."
+            cat /tmp/preview-smoke.json || true
+            exit 1
+          fi
+          if ! jq -e 'has("datasetId") and has("sources") and (.sources | type == "array")' /tmp/preview-smoke.json > /dev/null; then
+            echo "::error::/api/v1/status response body is not valid status JSON (expected datasetId and sources fields)"
+            cat /tmp/preview-smoke.json
             exit 1
           fi
           bash "${GITHUB_WORKSPACE}/scripts/ci/assert-anonymous-denied.sh" "${{ vars.PREVIEW_URL }}/api/v1/status"
@@ -177,6 +199,9 @@ jobs:
     needs: preview
     runs-on: ubuntu-latest
     environment: production
+    concurrency:
+      group: production-d1-writer
+      cancel-in-progress: false
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -214,12 +239,22 @@ jobs:
 
       - name: Read-only production smoke test
         # GET only -- this step must never call a mutating route (no POST
-        # /api/v1/screens, no PUT, no /runs). Same known email-vs-common_name
-        # caveat as the preview smoke test above, and the same fail-open
-        # detector (scripts/ci/assert-anonymous-denied.sh) run against
-        # production -- this is the single most important place for that
-        # check to run, since a fail-open bug here means the live,
-        # already-launched application is serving anonymous requests.
+        # /api/v1/screens, no PUT, no /runs); the scoped service-token
+        # identity used here is authorized only for GET /api/v1/status
+        # anyway (see apps/api/src/middleware/access.ts), so a mutation
+        # attempt would be rejected with 403 even if one were added here by
+        # mistake. Same scoped-service-token identity and strict-200 +
+        # valid-JSON requirement as the preview smoke test above (R12/F15),
+        # and the same hardened fail-open detector
+        # (scripts/ci/assert-anonymous-denied.sh) run against production --
+        # this is the single most important place for that check to run,
+        # since a fail-open bug here means the live, already-launched
+        # application is serving anonymous requests. Note that a real 200
+        # here proves Access's edge and this application's own scoped
+        # service-token check both work; it does NOT prove the *owner's*
+        # interactive Access login is configured correctly, since a service
+        # token is a different credential path -- that still needs the
+        # manual owner-authenticated check in docs/operations/deploy.md.
         run: |
           set -euo pipefail
           status=$(curl -s -o /tmp/production-smoke.json -w '%{http_code}' \
@@ -227,8 +262,14 @@ jobs:
             -H "CF-Access-Client-Secret: ${{ secrets.CF_ACCESS_SERVICE_TOKEN_SECRET }}" \
             "${{ vars.PRODUCTION_URL }}/api/v1/status")
           echo "production /api/v1/status responded $status"
-          if [ "$status" != "200" ] && [ "$status" != "401" ]; then
-            echo "::error::Unexpected status $status from production smoke test (expected 200, or 401 pending the common_name allowlist follow-up documented above)"
+          if [ "$status" != "200" ]; then
+            echo "::error::Expected 200 from the approved Access service-token identity smoke check, got $status. See ACCESS_ALLOWED_SERVICE_TOKENS / apps/api/src/middleware/access.ts."
+            cat /tmp/production-smoke.json || true
+            exit 1
+          fi
+          if ! jq -e 'has("datasetId") and has("sources") and (.sources | type == "array")' /tmp/production-smoke.json > /dev/null; then
+            echo "::error::/api/v1/status response body is not valid status JSON (expected datasetId and sources fields)"
+            cat /tmp/production-smoke.json
             exit 1
           fi
           bash "${GITHUB_WORKSPACE}/scripts/ci/assert-anonymous-denied.sh" "${{ vars.PRODUCTION_URL }}/api/v1/status"

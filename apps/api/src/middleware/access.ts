@@ -3,11 +3,14 @@ import type { ApiEnv } from "../env";
 export interface AccessClaims {
   readonly iss: string;
   readonly aud: string | readonly string[];
-  readonly email: string;
+  /** Owner identity claim. Absent for a scoped service-token identity. */
+  readonly email?: string;
+  /** Cloudflare Access service-token identity claim. Absent for an owner. */
+  readonly commonName?: string;
   readonly exp: number;
   readonly [key: string]: unknown;
 }
-export class AccessError extends Error { public readonly status = 401; public constructor(message = "Unauthenticated") { super(message); this.name = "AccessError"; } }
+export class AccessError extends Error { public readonly status: number; public constructor(message = "Unauthenticated", status = 401) { super(message); this.name = "AccessError"; this.status = status; } }
 export type AccessVerifier = (request: Request, env: ApiEnv) => Promise<AccessClaims>;
 type RsaJwk = { readonly kty: "RSA"; readonly n: string; readonly e: string; readonly kid?: string; readonly alg?: string };
 type VerifyKey = Awaited<ReturnType<typeof crypto.subtle.importKey>>;
@@ -21,6 +24,41 @@ function issuer(env: ApiEnv): string { const value = env.accessIssuer ?? env.acc
 function sameAudience(actual: unknown, expected: string): boolean { return typeof actual === "string" ? actual === expected : Array.isArray(actual) && actual.includes(expected); }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
 function isJwk(value: unknown): value is RsaJwk { return isRecord(value) && value.kty === "RSA" && typeof value.n === "string" && typeof value.e === "string"; }
+function isStatusSmokeCheck(request: Request): boolean {
+  if (request.method !== "GET") return false;
+  const path = new URL(request.url).pathname.replace(/\/$/, "");
+  return path === "/api/v1/status";
+}
+
+/**
+ * Shared authorization decision for a verified (signature/issuer/audience/
+ * expiry already checked) set of claims, used by both the production RS256
+ * verifier and the HS256 test double so the two paths cannot drift.
+ *
+ * Two disjoint identity kinds:
+ *  - Owner: an `email` claim matched against `env.allowedEmails`. Authorized
+ *    for every route this Worker exposes.
+ *  - Service principal: a `common_name` claim (how Cloudflare Access signs
+ *    a Service Token JWT) matched against the separate, explicit
+ *    `env.allowedServiceTokenNames` allowlist. Authorized ONLY for
+ *    `GET /api/v1/status` -- never mapped to an owner email, never
+ *    authorized for any mutation or any other read route. An otherwise
+ *    valid, allowlisted service token used outside that one route is a 403
+ *    (a real, verified identity that is simply not in scope here), while an
+ *    unrecognized or unconfigured identity of either kind is a 401.
+ */
+function authorizeIdentity(claims: Record<string, unknown>, env: ApiEnv, request: Request): { readonly email?: string; readonly commonName?: string } {
+  const email = typeof claims.email === "string" ? claims.email.toLocaleLowerCase("en-US") : "";
+  if (email) {
+    if (!env.allowedEmails.some((allowed) => allowed.toLocaleLowerCase("en-US") === email)) throw new AccessError("Access identity is not allowlisted");
+    return { email };
+  }
+  const commonName = typeof claims.common_name === "string" ? claims.common_name : "";
+  const allowedServiceTokenNames = env.allowedServiceTokenNames ?? [];
+  if (!commonName || !allowedServiceTokenNames.includes(commonName)) throw new AccessError("Access identity is not allowlisted");
+  if (!isStatusSmokeCheck(request)) throw new AccessError("Service identity is not authorized for this route", 403);
+  return { commonName };
+}
 
 async function loadKeys(url: string, fetcher: typeof fetch, force = false): Promise<ReadonlyMap<string, VerifyKey>> {
   const cached = keyCache.get(url);
@@ -55,15 +93,14 @@ export async function verifyAccessRequest(request: Request, env: ApiEnv): Promis
   const expectedIssuer = issuer(env);
   if (claims.iss !== expectedIssuer || !sameAudience(claims.aud, env.accessAudience)) throw new AccessError("Invalid Access token");
   if (typeof claims.exp !== "number" || !Number.isFinite(claims.exp) || claims.exp <= Math.floor(Date.now() / 1000)) throw new AccessError("Expired Access token");
-  const email = typeof claims.email === "string" ? claims.email.toLocaleLowerCase("en-US") : "";
-  if (!email || !env.allowedEmails.some((allowed) => allowed.toLocaleLowerCase("en-US") === email)) throw new AccessError("Access identity is not allowlisted");
+  const identity = authorizeIdentity(claims, env, request);
   const jwksUrl = env.accessJwksUrl ?? `${expectedIssuer}/cdn-cgi/access/certs`;
   let keys = await loadKeys(jwksUrl, fetch);
   let key = keys.get(header.kid);
   if (!key) { keys = await loadKeys(jwksUrl, fetch, true); key = keys.get(header.kid); }
   if (!key) throw new AccessError("Unknown Access signing key");
   try { if (!await crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, decode(encodedSignature), new TextEncoder().encode(`${encodedHeader}.${encodedClaims}`))) throw new AccessError("Invalid Access token"); } catch (cause) { if (cause instanceof AccessError) throw cause; throw new AccessError("Invalid Access token"); }
-  return { ...claims, iss: expectedIssuer, aud: claims.aud as string | readonly string[], email, exp: claims.exp };
+  return { ...claims, iss: expectedIssuer, aud: claims.aud as string | readonly string[], ...identity, exp: claims.exp };
 }
 
 /** Test-only deterministic verifier, injected into createApi and never used by the Worker entrypoint. */
@@ -77,19 +114,30 @@ export function createTestAccessVerifier(secret: string): AccessVerifier {
     if (!encodedHeader || !encodedClaims || !encodedSignature) throw new AccessError("Invalid Access token");
     const header = decodeJson(encodedHeader); const claims = decodeJson(encodedClaims);
     if (header.alg !== "HS256" || claims.iss !== issuer(env) || !sameAudience(claims.aud, env.accessAudience) || typeof claims.exp !== "number" || claims.exp <= Math.floor(Date.now() / 1000)) throw new AccessError("Invalid Access token");
-    const email = typeof claims.email === "string" ? claims.email.toLocaleLowerCase("en-US") : "";
-    if (!env.allowedEmails.some((allowed) => allowed.toLocaleLowerCase("en-US") === email)) throw new AccessError("Access identity is not allowlisted");
+    const identity = authorizeIdentity(claims, env, request);
     const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
     const expected = base64Url(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`${encodedHeader}.${encodedClaims}`)));
     if (expected !== encodedSignature) throw new AccessError("Invalid Access token");
-    return { ...claims, iss: issuer(env), aud: claims.aud as string | readonly string[], email, exp: claims.exp };
+    return { ...claims, iss: issuer(env), aud: claims.aud as string | readonly string[], ...identity, exp: claims.exp };
   };
 }
 
-export interface TestTokenOptions { readonly email: string; readonly exp?: number; readonly aud?: string; }
+/**
+ * Exactly one of `email` (owner identity) or `commonName` (Access
+ * service-token identity, carried as the `common_name` claim) must be set --
+ * mirrors the real Access token shapes this test double stands in for.
+ */
+export interface TestTokenOptions { readonly email?: string; readonly commonName?: string; readonly exp?: number; readonly aud?: string; }
 export async function issueTestAccessToken(env: ApiEnv, secret: string, options: TestTokenOptions): Promise<string> {
   const encode = (value: unknown): string => base64Url(new TextEncoder().encode(JSON.stringify(value)).buffer);
-  const header = encode({ alg: "HS256", typ: "JWT" }); const claims = encode({ iss: issuer(env), aud: options.aud ?? env.accessAudience, email: options.email, exp: options.exp ?? Math.floor(Date.now() / 1000) + 3600 });
+  const header = encode({ alg: "HS256", typ: "JWT" });
+  const claims = encode({
+    iss: issuer(env),
+    aud: options.aud ?? env.accessAudience,
+    ...(options.email !== undefined ? { email: options.email } : {}),
+    ...(options.commonName !== undefined ? { common_name: options.commonName } : {}),
+    exp: options.exp ?? Math.floor(Date.now() / 1000) + 3600,
+  });
   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   return `${header}.${claims}.${base64Url(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`${header}.${claims}`)))}`;
 }

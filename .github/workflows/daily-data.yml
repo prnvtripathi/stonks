@@ -59,8 +59,23 @@ on:
 # against the same database/dataset: queue, do not run concurrently, and
 # never cancel a run that is already in progress (a cancelled mid-write run
 # is exactly the kind of partial state reconciliation exists to catch).
+#
+# R12/F15: this workflow's `refresh` job and .github/workflows/deploy.yml's
+# `production` job both write to the same production D1 database (this
+# workflow through market-pipeline's publication path, deploy.yml through
+# `wrangler d1 migrations apply ... --env production`), but until now each
+# workflow had its own independent concurrency group -- a manually
+# dispatched daily-data run and an in-flight deploy.yml production
+# migration/deploy were never mutually exclusive against each other, only
+# against runs of their own workflow. `production-d1-writer` is the same
+# group name deploy.yml's `production` job now declares (job-level, not
+# workflow-level, there -- see that file's comment for why), so this run
+# queues behind an in-flight production deploy and vice versa. deploy.yml's
+# `preview` job intentionally does NOT share this group: it never touches
+# the production database, so there is no reason for a preview deploy to
+# queue behind a daily data refresh.
 concurrency:
-  group: daily-data
+  group: production-d1-writer
   cancel-in-progress: false
 
 permissions:
@@ -117,16 +132,80 @@ jobs:
       # weekday forever. See docs/operations/daily-run.md.
       - name: Resolve run parameters
         id: params
+        # R12/F15: the free-form workflow_dispatch string inputs below
+        # (date, start, end, manifest_path, previous_count,
+        # min_coverage_ratio -- everything except `mode`, which is a
+        # `type: choice` and already enum-constrained by GitHub Actions)
+        # used to be interpolated directly into this script's *text* via
+        # `"${{ inputs.X }}"`, the classic Actions script-injection pattern:
+        # a value containing shell metacharacters (e.g. `"; rm -rf . #`)
+        # becomes part of the generated script rather than staying a
+        # quoted argument. They are now passed through `env:` (GitHub
+        # Actions writes env values as literal environment variable
+        # content, not interpolated script text) and referenced as shell
+        # variables, plus validated against an expected format before use
+        # anywhere -- including before being re-exposed as this step's own
+        # outputs, which a later step also consumes by direct
+        # interpolation (see "Run market-pipeline refresh" below).
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_DATE: ${{ inputs.date }}
+          INPUT_START: ${{ inputs.start }}
+          INPUT_END: ${{ inputs.end }}
+          INPUT_MANIFEST_PATH: ${{ inputs.manifest_path }}
+          INPUT_PREVIOUS_COUNT: ${{ inputs.previous_count }}
+          INPUT_MIN_COVERAGE_RATIO: ${{ inputs.min_coverage_ratio }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "schedule" ]; then
+          date_re='^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+          if [ "$EVENT_NAME" = "schedule" ]; then
             mode="daily"
             date="$(TZ=Asia/Kolkata date +%Y-%m-%d)"
             manifest="manifests/daily.json"
+            start=""
+            end=""
+            previous_count=""
+            min_coverage_ratio="0.90"
           else
-            mode="${{ inputs.mode }}"
-            date="${{ inputs.date }}"
-            manifest="${{ inputs.manifest_path }}"
+            mode="$INPUT_MODE"
+            date="$INPUT_DATE"
+            start="$INPUT_START"
+            end="$INPUT_END"
+            manifest="$INPUT_MANIFEST_PATH"
+            previous_count="$INPUT_PREVIOUS_COUNT"
+            min_coverage_ratio="${INPUT_MIN_COVERAGE_RATIO:-0.90}"
+
+            if [ "$mode" != "daily" ] && [ "$mode" != "backfill" ]; then
+              echo "::error::mode must be 'daily' or 'backfill', got '$mode'"
+              exit 1
+            fi
+            if [ -n "$date" ] && ! [[ "$date" =~ $date_re ]]; then
+              echo "::error::date must match YYYY-MM-DD, got '$date'"
+              exit 1
+            fi
+            if [ -n "$start" ] && ! [[ "$start" =~ $date_re ]]; then
+              echo "::error::start must match YYYY-MM-DD, got '$start'"
+              exit 1
+            fi
+            if [ -n "$end" ] && ! [[ "$end" =~ $date_re ]]; then
+              echo "::error::end must match YYYY-MM-DD, got '$end'"
+              exit 1
+            fi
+            if [ -n "$previous_count" ] && ! [[ "$previous_count" =~ ^[0-9]+$ ]]; then
+              echo "::error::previous_count must be a non-negative integer, got '$previous_count'"
+              exit 1
+            fi
+            if ! [[ "$min_coverage_ratio" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+              echo "::error::min_coverage_ratio must be numeric, got '$min_coverage_ratio'"
+              exit 1
+            fi
+            case "$manifest" in
+              /*|*..*)
+                echo "::error::manifest_path must be a relative path within the checked-out repo (no leading / and no '..'), got '$manifest'"
+                exit 1
+                ;;
+            esac
           fi
           if [ -n "$manifest" ] && [ -r "$manifest" ]; then
             echo "manifest_present=true" >> "$GITHUB_OUTPUT"
@@ -144,11 +223,11 @@ jobs:
           fi
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
           echo "date=$date" >> "$GITHUB_OUTPUT"
-          echo "start=${{ inputs.start }}" >> "$GITHUB_OUTPUT"
-          echo "end=${{ inputs.end }}" >> "$GITHUB_OUTPUT"
+          echo "start=$start" >> "$GITHUB_OUTPUT"
+          echo "end=$end" >> "$GITHUB_OUTPUT"
           echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
-          echo "previous_count=${{ inputs.previous_count }}" >> "$GITHUB_OUTPUT"
-          echo "min_coverage_ratio=${{ inputs.min_coverage_ratio || '0.90' }}" >> "$GITHUB_OUTPUT"
+          echo "previous_count=$previous_count" >> "$GITHUB_OUTPUT"
+          echo "min_coverage_ratio=$min_coverage_ratio" >> "$GITHUB_OUTPUT"
 
       - name: Set up Node for Wrangler
         if: steps.params.outputs.manifest_present == 'true'
@@ -244,18 +323,31 @@ jobs:
       - name: Run market-pipeline refresh
         id: run
         if: steps.params.outputs.manifest_present == 'true'
+        # Same script-injection concern as "Resolve run parameters" above:
+        # these values are already validated by that step, but they are
+        # still passed through `env:` here rather than interpolated
+        # directly into the script text, so this step never re-introduces
+        # the pattern even if the validation above is ever loosened.
+        env:
+          PARAM_MODE: ${{ steps.params.outputs.mode }}
+          PARAM_DATE: ${{ steps.params.outputs.date }}
+          PARAM_START: ${{ steps.params.outputs.start }}
+          PARAM_END: ${{ steps.params.outputs.end }}
+          PARAM_MANIFEST: ${{ steps.params.outputs.manifest }}
+          PARAM_PREVIOUS_COUNT: ${{ steps.params.outputs.previous_count }}
+          PARAM_MIN_COVERAGE_RATIO: ${{ steps.params.outputs.min_coverage_ratio }}
         run: |
           set -euo pipefail
           args=(--db market.db daily)
-          if [ "${{ steps.params.outputs.mode }}" = "backfill" ]; then
-            args=(--db market.db backfill --start "${{ steps.params.outputs.start }}" --end "${{ steps.params.outputs.end }}")
+          if [ "$PARAM_MODE" = "backfill" ]; then
+            args=(--db market.db backfill --start "$PARAM_START" --end "$PARAM_END")
           else
-            args+=(--date "${{ steps.params.outputs.date }}")
+            args+=(--date "$PARAM_DATE")
           fi
-          args+=(--manifest "${{ steps.params.outputs.manifest }}")
-          args+=(--min-coverage-ratio "${{ steps.params.outputs.min_coverage_ratio }}")
-          if [ -n "${{ steps.params.outputs.previous_count }}" ]; then
-            args+=(--previous-count "${{ steps.params.outputs.previous_count }}")
+          args+=(--manifest "$PARAM_MANIFEST")
+          args+=(--min-coverage-ratio "$PARAM_MIN_COVERAGE_RATIO")
+          if [ -n "$PARAM_PREVIOUS_COUNT" ]; then
+            args+=(--previous-count "$PARAM_PREVIOUS_COUNT")
           fi
           set +e
           uv run market-pipeline "${args[@]}" > run-report.json 2> run-error.json
