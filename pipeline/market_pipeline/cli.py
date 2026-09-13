@@ -16,7 +16,11 @@ from typing import Any, Sequence
 from market_pipeline.domain.models import FetchedArtifact, SourceArtifact
 from market_pipeline.jobs.backfill import BackfillJob, CoverageError
 from market_pipeline.jobs.daily import run_daily
-from market_pipeline.jobs.publish import PublicationInputError, build_candidate, publish_checkpointed_dataset
+from market_pipeline.jobs.publish import (
+    PublicationInputError,
+    build_candidate,
+    publish_checkpointed_dataset,
+)
 from market_pipeline.monitoring.budgets import budget_report
 from market_pipeline.sources.registry import SourcePolicyError
 from market_pipeline.storage.d1_publisher import D1Publisher

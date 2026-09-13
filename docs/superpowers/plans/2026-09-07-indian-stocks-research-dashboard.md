@@ -605,6 +605,20 @@ git commit -m "ops: secure and verify production deployment"
 
 ### Task 15: Cloudflare Publication Bridge and Free-Tier Safety
 
+**Superseded, 9 September 2026:** the 9 September 2026 implementation audit
+(`docs/reviews/2026-09-09-implementation-audit.md`) found this task's tracked
+plan, ignored brief, and report described different scopes, and that its
+own progress ledger had no recorded review rounds. Do not treat the
+checkmarks below as acceptance evidence. This task's actual completion
+record is the twelve-task
+[Correctness and publication remediation](2026-09-09-correctness-and-publication-remediation.md)
+plan (tasks R07-R12 specifically cover this task's publication-bridge and
+free-tier-safety scope) and its phase acceptance gate, tracked in
+`docs/reviews/2026-09-09-remediation-progress.md` and
+`.superpowers/sdd/2026-09-09-correctness-and-publication-remediation/progress.md`.
+The checkmarks below are left as-is, as a historical record of this task's
+own (superseded) self-assessment.
+
 **Why this task was added:** Final whole-branch review found that the scheduled
 pipeline promoted only its local SQLite database while the deployed Worker
 would read Cloudflare D1. It also found that history/chart objects could be

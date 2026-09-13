@@ -15,7 +15,6 @@ from pydantic import BaseModel, ConfigDict, model_validator
 from market_pipeline.domain.models import INSTRUMENT_NAMESPACE, AssetClass
 from market_pipeline.sources.amfi_nav import AmfiNavRow
 
-
 NORMALIZATION_VERSION = "amfi-normalization-v1"
 
 

@@ -30,7 +30,8 @@ This module fixes both problems:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace as _replace
+from dataclasses import dataclass
+from dataclasses import replace as _replace
 from datetime import date
 from hashlib import sha256
 from typing import Any, Mapping, Sequence

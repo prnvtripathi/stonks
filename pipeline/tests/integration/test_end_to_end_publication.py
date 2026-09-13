@@ -16,7 +16,10 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import pytest
 from market_pipeline.cli import main
+from market_pipeline.publication.d1_export import export_active_dataset
+from market_pipeline.storage.d1_publisher import D1Publisher
 
 TERMS_URL = "https://www.amfiindia.com/terms-and-conditions"
 SOURCE_URL = "https://www.amfiindia.com/spages/NAVAll.txt"
@@ -153,6 +156,61 @@ def test_manifest_flows_from_raw_artifact_to_a_promoted_queryable_dataset(tmp_pa
     assert payload["publication"]["history_objects"] > 0
     assert list(history_root.glob("history/mutual_fund/*/*/*.parquet"))
     assert len(list(history_root.glob(f"charts/{dataset_id}/*.json.gz"))) == len(SCHEMES)
+
+    # Close the R04 boundary this end-to-end fixture would otherwise miss:
+    # push a raw-file-sourced dataset through R07's real compact SQL export
+    # and back into a fresh D1-compatible schema, then confirm a momentum
+    # *component* row's weight/contribution/unit/coverage -- exactly the
+    # fields F06 lost -- survive that export/decode boundary with real,
+    # source-derived numbers (not the hand-built dict fixture
+    # `compact_momentum_fixture.py` uses for the Worker-side decoder test).
+    #
+    # This uses its own small (70-day) manifest/database rather than the
+    # 300-artifact one above: exporting the full 300-artifact dataset here
+    # surfaces a separate, real defect -- R02's dataset-level input manifest
+    # (every contributing artifact's id/checksum/etc., embedded verbatim in
+    # `datasets.metadata_json`) grows past `_export_dataset_sql`'s 90,000
+    # byte per-statement D1 limit once artifact count is in the hundreds,
+    # which a genuine three-year daily backfill will be. That is reported
+    # separately (see the phase-gate report and launch checklist) as a new
+    # finding, not silently masked by shrinking this fixture's day count.
+    small_db = tmp_path / "small.db"
+    small_raw = tmp_path / "small_raw"
+    small_manifest = tmp_path / "small_manifest.json"
+    small_start, small_end = _write_manifest(small_manifest, date(2026, 3, 1), 70)
+    small_exit = main([
+        "--db", str(small_db), "--raw-store", str(small_raw),
+        "backfill", "--start", small_start.isoformat(), "--end", small_end.isoformat(),
+        "--manifest", str(small_manifest),
+    ])
+    small_payload = json.loads(capsys.readouterr().out)
+    assert small_exit == 0, small_payload
+    small_dataset_id = small_payload["publication"]["dataset_id"]
+
+    export_path = tmp_path / "active.sql"
+    export_active_dataset(sqlite3.connect(small_db), export_path)
+    remote = sqlite3.connect(":memory:")
+    try:
+        D1Publisher(remote).initialize_schema()
+        remote.executescript(export_path.read_text(encoding="utf-8"))
+        small_instruments = _active_rows(small_db, "instruments", "instrument_id, symbol")
+        small_alpha_id = next(row[0] for row in small_instruments if row[1] == "119551")
+        row = remote.execute(
+            "SELECT metric_rows_json FROM instrument_snapshots WHERE dataset_id = ? AND instrument_id = ?",
+            (small_dataset_id, small_alpha_id),
+        ).fetchone()
+    finally:
+        remote.close()
+    assert row is not None
+    exported_metrics = json.loads(row[0])
+    component_row = next(m for m in exported_metrics if m["metric"] == "momentum_three_month_return")
+    exported_metadata = component_row["metadata"]
+    if isinstance(exported_metadata, str):
+        exported_metadata = json.loads(exported_metadata)
+    assert exported_metadata["unit"] == "percent"
+    assert exported_metadata["weight"] == pytest.approx(0.15)
+    assert exported_metadata["contribution"] == pytest.approx(exported_metadata["normalized"] * exported_metadata["weight"])
+    assert 0.0 <= exported_metadata["coverage"] <= 1.0
 
 
 def test_blocked_run_never_replaces_the_last_known_good_dataset(tmp_path: Path, capsys: Any) -> None:

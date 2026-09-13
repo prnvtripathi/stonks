@@ -146,7 +146,7 @@ jobs:
         # variables, plus validated against an expected format before use
         # anywhere -- including before being re-exposed as this step's own
         # outputs, which a later step also consumes by direct
-        # interpolation (see "Run market-pipeline refresh" below).
+        # interpolation (see the pipeline invocation step further below).
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_MODE: ${{ inputs.mode }}
