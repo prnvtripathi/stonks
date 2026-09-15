@@ -5,7 +5,8 @@
   "type": "module",
   "dependencies": {
     "@stonks/contracts": "workspace:*",
-    "@stonks/query": "workspace:*"
+    "@stonks/query": "workspace:*",
+    "jose": "^6.2.12"
   },
   "devDependencies": {
     "wrangler": "4.129.0"

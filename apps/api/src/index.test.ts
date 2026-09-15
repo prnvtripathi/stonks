@@ -449,8 +449,8 @@ describe("private research API", () => {
     const encode = (value: unknown) => btoa(String.fromCharCode(...new TextEncoder().encode(JSON.stringify(value)))).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
     const secondKeyPair = await crypto.subtle.generateKey(rsaKeyParams, true, ["sign", "verify"]);
     const secondPublicJwk = await crypto.subtle.exportKey("jwk", secondKeyPair.publicKey);
-    const sign = async (kid: string, options: { readonly email?: string; readonly exp?: number; readonly iss?: string; readonly aud?: string; readonly signingKey?: typeof keyPair.privateKey } = {}) => {
-      const header = encode({ alg: "RS256", typ: "JWT", kid });
+    const sign = async (kid: string, options: { readonly email?: string; readonly exp?: number; readonly iss?: string; readonly aud?: string; readonly includeTyp?: boolean; readonly signingKey?: typeof keyPair.privateKey } = {}) => {
+      const header = encode({ alg: "RS256", ...(options.includeTyp === false ? {} : { typ: "JWT" }), kid });
       const claims = encode({ iss: options.iss ?? "https://access.example.com", aud: options.aud ?? "audience", email: options.email ?? "owner@example.com", exp: options.exp ?? Math.floor(Date.now() / 1000) + 300 });
       const signature = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", options.signingKey ?? keyPair.privateKey, new TextEncoder().encode(`${header}.${claims}`));
       return `${header}.${claims}.${btoa(String.fromCharCode(...new Uint8Array(signature))).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "")}`;
@@ -464,6 +464,8 @@ describe("private research API", () => {
     const validToken = await sign("kid-1");
     const claims = await verifyAccessRequest(new Request("https://dashboard.example.com/api/v1/status", { headers: { "Cf-Access-Jwt-Assertion": validToken } }), envWithKeys);
     expect(claims.email).toBe("owner@example.com");
+    const claimsWithoutOptionalTyp = await verifyAccessRequest(new Request("https://dashboard.example.com/api/v1/status", { headers: { "Cf-Access-Jwt-Assertion": await sign("kid-1", { includeTyp: false }) } }), envWithKeys);
+    expect(claimsWithoutOptionalTyp.email).toBe("owner@example.com");
     for (const invalidToken of [
       await sign("kid-1", { iss: "https://other.example.com" }),
       await sign("kid-1", { aud: "wrong-audience" }),
