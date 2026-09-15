@@ -28,16 +28,31 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-09-07",
   "workers_dev": false,
-  "d1_databases": [{ "binding": "DB", "database_name": "stonks-research", "database_id": "replace-in-deployment", "migrations_dir": "../../db/migrations" }],
-  "r2_buckets": [{ "binding": "CHARTS", "bucket_name": "stonks-private-history" }],
-  "vars": { "MAX_BODY_BYTES": 16384 },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "stonks-research",
+      "database_id": "7cc82bfb-c91a-4d12-b298-beee827cc118",
+      "migrations_dir": "../../db/migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "CHARTS",
+      "bucket_name": "stonks-private-history"
+    }
+  ],
+  "vars": {
+    "MAX_BODY_BYTES": 16384
+  },
   "assets": {
     "directory": "../web/dist",
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/api/*"]
+    "run_worker_first": [
+      "/api/*"
+    ]
   },
-
   "env": {
     // Preview: a distinct Worker, D1 database, R2 bucket, and Access
     // application/audience so a preview deploy can never read or write
@@ -47,6 +62,12 @@
     "preview": {
       "name": "stonks-research-api-preview",
       "workers_dev": false,
+      "routes": [
+        {
+          "pattern": "preview-stonks.pranavtripathi.me",
+          "custom_domain": true
+        }
+      ],
       // REQUIRED before the first deploy: a `routes` entry bound to a zone
       // already on this Cloudflare account. `workers_dev: false` with no
       // `routes` means this Worker is bound to NO reachable hostname at
@@ -59,66 +80,91 @@
       // ungated `*.workers.dev` endpoint, which is exactly the private-app
       // requirement this task exists to enforce. Register (or reuse) a
       // zone, add a preview subdomain here, e.g.:
-      //   "routes": [{ "pattern": "preview.stonks-research.example", "custom_domain": true }]
+      //   "routes": [{ "pattern": "preview-stonks.pranavtripathi.me", "custom_domain": true }]
       // then create the preview Access application against that same
       // hostname (see security-checklist.md) and set PREVIEW_URL to
-      // `https://preview.stonks-research.example`.
+      // `https://preview-stonks.pranavtripathi.me`.
       "d1_databases": [
-        { "binding": "DB", "database_name": "stonks-research-preview", "database_id": "replace-in-deployment-preview", "migrations_dir": "../../db/migrations" }
+        {
+          "binding": "DB",
+          "database_name": "stonks-research-preview",
+          "database_id": "ab43914c-86dd-48a7-8a73-969d4dd16628",
+          "migrations_dir": "../../db/migrations"
+        }
       ],
       "r2_buckets": [
-        { "binding": "CHARTS", "bucket_name": "stonks-private-history-preview" }
+        {
+          "binding": "CHARTS",
+          "bucket_name": "stonks-private-history-preview"
+        }
       ],
       "assets": {
         "directory": "../web/dist",
         "binding": "ASSETS",
         "not_found_handling": "single-page-application",
-        "run_worker_first": ["/api/*"]
+        "run_worker_first": [
+          "/api/*"
+        ]
       },
       "vars": {
-        "ACCESS_TEAM_DOMAIN": "replace-in-deployment.cloudflareaccess.com",
-        "ACCESS_AUD": "replace-in-deployment-preview-access-aud",
-        "ALLOWED_ORIGIN": "https://preview.stonks-research.example",
+        "ACCESS_TEAM_DOMAIN": "pranav-stonks.cloudflareaccess.com",
+        "ACCESS_AUD": "62e8e7dda6b6ef7c77d5ff07aef11d123f865528273696299cfe8ecd51694d2b",
+        "ALLOWED_ORIGIN": "https://preview-stonks.pranavtripathi.me",
         "MAX_BODY_BYTES": 16384
       }
       // ACCESS_ALLOWED_EMAILS is a secret, not a var: set once via
       // `wrangler secret put ACCESS_ALLOWED_EMAILS --env preview`. It is
       // never written to this file (see security-checklist.md).
     },
-
     // Production: the one environment end users (the owner) reach. Deployed
     // only after preview deploys cleanly and its authenticated smoke test
     // passes (see deploy.yml and deploy.md for the exact gate order).
     "production": {
       "name": "stonks-research-api",
       "workers_dev": false,
+      "routes": [
+        {
+          "pattern": "stonks.pranavtripathi.me",
+          "custom_domain": true
+        }
+      ],
       // REQUIRED before the first deploy -- same reasoning as env.preview
       // above: `workers_dev: false` with no `routes` leaves this Worker
       // reachable at NO hostname at all, and Access can never gate a
       // `*.workers.dev` URL (it is not a zone on this account). Register a
       // zone/subdomain for the production hostname and add its route here
       // before deploying, e.g.:
-      //   "routes": [{ "pattern": "stonks-research.example", "custom_domain": true }]
+      //   "routes": [{ "pattern": "stonks.pranavtripathi.me", "custom_domain": true }]
       // then create the production Access application against that same
-      // hostname and set PRODUCTION_URL to `https://stonks-research.example`.
+      // hostname and set PRODUCTION_URL to `https://stonks.pranavtripathi.me`.
       // Flipping `workers_dev` to `true` instead would make the API and SPA
       // publicly reachable with no Access gate at all -- never do this.
       "d1_databases": [
-        { "binding": "DB", "database_name": "stonks-research", "database_id": "replace-in-deployment", "migrations_dir": "../../db/migrations" }
+        {
+          "binding": "DB",
+          "database_name": "stonks-research",
+          "database_id": "7cc82bfb-c91a-4d12-b298-beee827cc118",
+          "migrations_dir": "../../db/migrations"
+        }
       ],
       "r2_buckets": [
-        { "binding": "CHARTS", "bucket_name": "stonks-private-history" }
+        {
+          "binding": "CHARTS",
+          "bucket_name": "stonks-private-history"
+        }
       ],
       "assets": {
         "directory": "../web/dist",
         "binding": "ASSETS",
         "not_found_handling": "single-page-application",
-        "run_worker_first": ["/api/*"]
+        "run_worker_first": [
+          "/api/*"
+        ]
       },
       "vars": {
-        "ACCESS_TEAM_DOMAIN": "replace-in-deployment.cloudflareaccess.com",
-        "ACCESS_AUD": "replace-in-deployment-production-access-aud",
-        "ALLOWED_ORIGIN": "https://stonks-research.example",
+        "ACCESS_TEAM_DOMAIN": "pranav-stonks.cloudflareaccess.com",
+        "ACCESS_AUD": "c0260734467a1443f87dcadd80ac9fc75796b535024af1877afcbddeef667abc",
+        "ALLOWED_ORIGIN": "https://stonks.pranavtripathi.me",
         "MAX_BODY_BYTES": 16384
       }
       // ACCESS_ALLOWED_EMAILS is a secret: `wrangler secret put ACCESS_ALLOWED_EMAILS --env production`.
