@@ -370,7 +370,7 @@ describe("runScreen creation is bounded", () => {
     // Warmed local baseline: measured ~40-65ms locally. Ten seconds is a
     // smoke-test ceiling to catch a gross regression, not a target.
     expect(runElapsedMs).toBeLessThan(10_000);
-    console.info(`[R06 baseline] runScreen over 12,000 instruments: ${runElapsedMs.toFixed(2)}ms, ${probe.statementCount} statements`);
+    process.stdout.write(`[R06 baseline] runScreen over 12,000 instruments: ${runElapsedMs.toFixed(2)}ms, ${probe.statementCount} statements\n`);
 
     // The representative query is the current-match `INSERT ... SELECT`
     // (identified by its ROW_NUMBER() window function). Its query plan must
@@ -381,7 +381,7 @@ describe("runScreen creation is bounded", () => {
     expect(representative).toBeDefined();
     const plan = explainQueryPlan(sqlite, representative!);
     const planText = plan.map((row) => row.detail).join("\n");
-    console.info(`[R06 baseline] EXPLAIN QUERY PLAN:\n${planText}`);
+    process.stdout.write(`[R06 baseline] EXPLAIN QUERY PLAN:\n${planText}\n`);
     expect(planText).toContain("USING INDEX idx_instrument_snapshots_active");
     expect(planText).not.toContain("SCAN screen_runs");
     expect(planText).not.toMatch(/SCAN i\b/); // full scan of instrument_snapshots, as opposed to a SEARCH via the index
@@ -391,7 +391,7 @@ describe("runScreen creation is bounded", () => {
     const pageElapsedMs = performance.now() - pageStarted;
     expect(page.matches).toHaveLength(25);
     expect(pageElapsedMs).toBeLessThan(1_000);
-    console.info(`[R06 baseline] pageRunMatches over 12,000 matches: ${pageElapsedMs.toFixed(2)}ms`);
+    process.stdout.write(`[R06 baseline] pageRunMatches over 12,000 matches: ${pageElapsedMs.toFixed(2)}ms\n`);
   });
 });
 
